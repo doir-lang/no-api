@@ -284,7 +284,15 @@ void init_vulkan(render_state& state) {
 
 	auto queue = gpuCreateQueue(*vk);
 	if(!queue) throw std::runtime_error("Failed to create noapi queue");
-	state.graphics_queue = *queue;
+	state.graphics_queue = std::move(*queue);
+
+	struct vec4{
+		float x, y, z, w;
+	};
+	auto buffer = gpuMalloc<vec4>(state.graphics_queue);
+	gpu* buffer_gpu = gpuHostToDevicePointer(state.graphics_queue, buffer);
+
+	gpuFree(state.graphics_queue, buffer);
 
 	create_swapchain(state, WIDTH, HEIGHT);
 	{ // create_render_pass();
