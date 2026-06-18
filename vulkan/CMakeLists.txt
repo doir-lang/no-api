@@ -34,8 +34,8 @@ if (NOT volk_FOUND)
     FetchContent_MakeAvailable(volk)
 endif()
 
-add_library(noapi-vulkan INTERFACE)
-target_link_libraries(noapi-vulkan INTERFACE
+add_library(noapi-vulkan STATIC noapi.cpp)
+target_link_libraries(noapi-vulkan PUBLIC
 	volk::volk
 	vk-bootstrap::vk-bootstrap
 	GPUOpen::VulkanMemoryAllocator
@@ -43,3 +43,4 @@ target_link_libraries(noapi-vulkan INTERFACE
 	glslang::glslang-default-resource-limits
 	glslang::SPIRV
 )
+target_include_directories(noapi-vulkan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

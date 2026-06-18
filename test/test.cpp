@@ -1,15 +1,11 @@
 #include <glslang/Public/ShaderLang.h>
 #include <glslang/Public/ResourceLimits.h>
 #include <glslang/SPIRV/GlslangToSpv.h>
-#define VOLK_IMPLEMENTATION
 #include <volk.h>
 #include <VkBootstrap.h>
 
 #include <vulkan/noapi.hpp>
-
-#define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
-#define VMA_IMPLEMENTATION
-#include <vk_mem_alloc.h>
+#include <vulkan/vulkan_core.h>
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -64,12 +60,7 @@ struct render_state {
 	VkInstance instance = {};
 	VkDebugUtilsMessengerEXT debug_messenger = {};
 	VkSurfaceKHR surface = {};
-	VkPhysicalDevice gpu = {};
-	VkDevice device = {};
-	VkQueue graphics_queue = {};
-	uint32_t graphics_family = {};
-
-	VmaAllocator allocator = {};
+	GpuQueue graphics_queue = {};
 
 	VkSwapchainKHR swapchain = {};
 	VkFormat swapchain_format = {};
@@ -152,12 +143,12 @@ static VkShaderModule create_shader_module(render_state& state, const std::vecto
 		.pCode = spv.data(),
 	};
 	VkShaderModule out;
-	VK_CHECK(vkCreateShaderModule(state.device, &info, nullptr, &out));
+	VK_CHECK(vkCreateShaderModule(state.graphics_queue.device, &info, nullptr, &out));
 	return out;
 }
 
 void create_swapchain(render_state& state, int width, int height) {
-	vkb::SwapchainBuilder builder{state.gpu, state.device, state.surface, state.graphics_family};
+	vkb::SwapchainBuilder builder{state.graphics_queue.gpu, state.graphics_queue.device, state.surface, state.graphics_queue.queue_family};
 	auto swap = builder
 		.set_old_swapchain(state.swapchain)
 		.use_default_present_mode_selection()
@@ -176,7 +167,7 @@ void create_swapchain(render_state& state, int width, int height) {
 	VkSemaphoreCreateInfo semaphore_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
 	state.swapchain_render_finished_semaphore.resize(state.swapchain_images.size());
 	for (auto& sema : state.swapchain_render_finished_semaphore)
-		VK_CHECK(vkCreateSemaphore(state.device, &semaphore_info, nullptr, &sema));
+		VK_CHECK(vkCreateSemaphore(state.graphics_queue.device, &semaphore_info, nullptr, &sema));
 }
 
 void create_pipeline(render_state& state) {
@@ -241,7 +232,7 @@ void create_pipeline(render_state& state) {
 	VkPipelineLayoutCreateInfo layoutInfo = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
 	};
-	VK_CHECK(vkCreatePipelineLayout(state.device, &layoutInfo, nullptr, &state.pipeline_layout));
+	VK_CHECK(vkCreatePipelineLayout(state.graphics_queue.device, &layoutInfo, nullptr, &state.pipeline_layout));
 
 	VkGraphicsPipelineCreateInfo pipeInfo = {
 		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
@@ -257,11 +248,11 @@ void create_pipeline(render_state& state) {
 		.renderPass = state.render_pass,
 		.subpass = 0,
 	};
-	VK_CHECK(vkCreateGraphicsPipelines(state.device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &state.pipeline));
+	VK_CHECK(vkCreateGraphicsPipelines(state.graphics_queue.device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &state.pipeline));
 
 	// Shader modules are only needed during pipeline creation
-	vkDestroyShaderModule(state.device, vertex_module, nullptr);
-	vkDestroyShaderModule(state.device, fragment_module, nullptr);
+	vkDestroyShaderModule(state.graphics_queue.device, vertex_module, nullptr);
+	vkDestroyShaderModule(state.graphics_queue.device, fragment_module, nullptr);
 }
 
 void create_framebuffers(render_state& state) {
@@ -276,69 +267,24 @@ void create_framebuffers(render_state& state) {
 			.height = state.swapchain_extent.height,
 			.layers = 1,
 		};
-		VK_CHECK(vkCreateFramebuffer(state.device, &fbInfo, nullptr, &state.framebuffers[i]));
+		VK_CHECK(vkCreateFramebuffer(state.graphics_queue.device, &fbInfo, nullptr, &state.framebuffers[i]));
 	}
 }
 
 void init_vulkan(render_state& state) {
-	// Instance
-	VK_CHECK(volkInitialize());
+	auto vk = gpuSetupDefaultVulkan([&state](VkInstance instance) -> VkSurfaceKHR{
+		VkSurfaceKHR out;
+		VK_CHECK(glfwCreateWindowSurface(instance, state.window, nullptr, &out));
+		return out;
+	});
+	if(!vk) throw std::runtime_error(vk.error());
+	state.instance = vk->instance;
+	state.debug_messenger = vk->messenger;
+	state.surface = vk->surface;
 
-	vkb::InstanceBuilder instance_builder;
-	auto inst = instance_builder
-		.set_app_name("VulkanTriangle")
-		.request_validation_layers(true)
-		.use_default_debug_messenger()
-		.require_api_version(1, 3, 0)
-		.build();
-	if (!inst) throw std::runtime_error(inst.error().message());
-	auto instance = inst.value();
-	state.instance = instance.instance;
-	state.debug_messenger = instance.debug_messenger;
-
-	volkLoadInstance(state.instance);
-
-	// Surface
-	VK_CHECK(glfwCreateWindowSurface(state.instance, state.window, nullptr, &state.surface));
-
-	// Physical Device
-	vkb::PhysicalDeviceSelector gpu_selector{instance};
-	auto phys = gpu_selector
-		.set_surface(state.surface)
-		.set_minimum_version(1, 3)
-		.select();
-	if (!phys) throw std::runtime_error(phys.error().message());
-	auto gpu = phys.value();
-	state.gpu = gpu.physical_device;
-
-	// Logical Device
-	vkb::DeviceBuilder device_builder{gpu};
-	auto dev = device_builder.build();
-	if (!dev) throw std::runtime_error(dev.error().message());
-	auto device = dev.value();
-	state.device = device.device;
-
-	state.graphics_queue = device.get_queue(vkb::QueueType::graphics).value();
-	state.graphics_family = device.get_queue_index(vkb::QueueType::graphics).value();
-	// state.present_queue = state.vkb_device.get_queue(vkb::QueueType::present).value();
-	// state.present_family = state.vkb_device.get_queue_index(vkb::QueueType::present).value();
-
-	volkLoadDevice(state.device);
-
-	// VMA
-	VmaVulkanFunctions functions = {
-		.vkGetInstanceProcAddr = vkGetInstanceProcAddr,
-		.vkGetDeviceProcAddr = vkGetDeviceProcAddr,
-	};
-
-	VmaAllocatorCreateInfo vma_info = {
-		.physicalDevice = state.gpu,
-		.device = state.device,
-		.pVulkanFunctions = &functions,
-		.instance = state.instance,
-		.vulkanApiVersion = VK_API_VERSION_1_3,
-	};
-	VK_CHECK(vmaCreateAllocator(&vma_info, &state.allocator));
+	auto queue = gpuCreateQueue(*vk);
+	if(!queue) throw std::runtime_error("Failed to create noapi queue");
+	state.graphics_queue = *queue;
 
 	create_swapchain(state, WIDTH, HEIGHT);
 	{ // create_render_pass();
@@ -379,7 +325,7 @@ void init_vulkan(render_state& state) {
 			.dependencyCount = 1,
 			.pDependencies = &dep,
 		};
-		VK_CHECK(vkCreateRenderPass(state.device, &rpInfo, nullptr, &state.render_pass));
+		VK_CHECK(vkCreateRenderPass(state.graphics_queue.device, &rpInfo, nullptr, &state.render_pass));
 	}
 	create_pipeline(state);
 	create_framebuffers(state);
@@ -387,9 +333,9 @@ void init_vulkan(render_state& state) {
 		VkCommandPoolCreateInfo info = {
 			.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 			.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-			.queueFamilyIndex = state.graphics_family,
+			.queueFamilyIndex = state.graphics_queue.queue_family,
 		};
-		VK_CHECK(vkCreateCommandPool(state.device, &info, nullptr, &state.command_pool));
+		VK_CHECK(vkCreateCommandPool(state.graphics_queue.device, &info, nullptr, &state.command_pool));
 	}{ // allocate_command_buffers();
 		VkCommandBufferAllocateInfo info = {
 			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -397,7 +343,7 @@ void init_vulkan(render_state& state) {
 			.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 			.commandBufferCount = FRAMES_IN_FLIGHT,
 		};
-		VK_CHECK(vkAllocateCommandBuffers(state.device, &info, state.command_buffers.data()));
+		VK_CHECK(vkAllocateCommandBuffers(state.graphics_queue.device, &info, state.command_buffers.data()));
 	}{ // create_sync_objects();
 		VkSemaphoreCreateInfo sema{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
 		VkFenceCreateInfo fence{
@@ -406,19 +352,19 @@ void init_vulkan(render_state& state) {
 		};
 
 		for (int i = 0; i < FRAMES_IN_FLIGHT; ++i) {
-			VK_CHECK(vkCreateSemaphore(state.device, &sema, nullptr, &state.image_available_semaphore[i]));
-			VK_CHECK(vkCreateFence (state.device, &fence, nullptr, &state.render_fence[i]));
+			VK_CHECK(vkCreateSemaphore(state.graphics_queue.device, &sema, nullptr, &state.image_available_semaphore[i]));
+			VK_CHECK(vkCreateFence (state.graphics_queue.device, &fence, nullptr, &state.render_fence[i]));
 		}
 	}
 }
 
 void cleanup_swapchain(render_state& state) {
 	for (auto sema : state.swapchain_render_finished_semaphore)
-		vkDestroySemaphore(state.device, sema, nullptr);
+		vkDestroySemaphore(state.graphics_queue.device, sema, nullptr);
 	state.swapchain_render_finished_semaphore.clear();
-	for (auto fb : state.framebuffers) vkDestroyFramebuffer(state.device, fb, nullptr);
+	for (auto fb : state.framebuffers) vkDestroyFramebuffer(state.graphics_queue.device, fb, nullptr);
 	state.framebuffers.clear();
-	for (auto iv : state.swapchain_views) vkDestroyImageView(state.device, iv, nullptr);
+	for (auto iv : state.swapchain_views) vkDestroyImageView(state.graphics_queue.device, iv, nullptr);
 	state.swapchain_views.clear();
 }
 
@@ -429,7 +375,7 @@ void recreate_swapchain(render_state& state) {
 		glfwGetFramebufferSize(state.window, &w, &h);
 		glfwWaitEvents();
 	}
-	vkDeviceWaitIdle(state.device);
+	vkDeviceWaitIdle(state.graphics_queue.device);
 	cleanup_swapchain(state);
 	create_swapchain(state, w, h);
 	create_framebuffers(state);
@@ -437,17 +383,17 @@ void recreate_swapchain(render_state& state) {
 
 void cleanup(render_state& state) {
 	for (int i = 0; i < FRAMES_IN_FLIGHT; ++i) {
-		vkDestroySemaphore(state.device, state.image_available_semaphore[i], nullptr);
-		vkDestroyFence (state.device, state.render_fence[i], nullptr);
+		vkDestroySemaphore(state.graphics_queue.device, state.image_available_semaphore[i], nullptr);
+		vkDestroyFence (state.graphics_queue.device, state.render_fence[i], nullptr);
 	}
-	vkDestroyCommandPool (state.device, state.command_pool, nullptr);
+	vkDestroyCommandPool (state.graphics_queue.device, state.command_pool, nullptr);
 	cleanup_swapchain(state);
-	vkDestroyPipeline (state.device, state.pipeline, nullptr);
-	vkDestroyPipelineLayout(state.device, state.pipeline_layout, nullptr);
-	vkDestroyRenderPass (state.device, state.render_pass, nullptr);
-	vmaDestroyAllocator(state.allocator);
+	vkDestroyPipeline (state.graphics_queue.device, state.pipeline, nullptr);
+	vkDestroyPipelineLayout(state.graphics_queue.device, state.pipeline_layout, nullptr);
+	vkDestroyRenderPass (state.graphics_queue.device, state.render_pass, nullptr);
+	vmaDestroyAllocator(state.graphics_queue.allocator);
 	vkb::destroy_swapchain(state.vkb_swapchain);
-	vkDestroyDevice(state.device, nullptr);
+	vkDestroyDevice(state.graphics_queue.device, nullptr);
 	vkDestroySurfaceKHR (state.instance, state.surface, nullptr);
 	vkDestroyDebugUtilsMessengerEXT(state.instance, state.debug_messenger, nullptr);
 	vkDestroyInstance(state.instance, nullptr);
@@ -460,15 +406,15 @@ void cleanup(render_state& state) {
 void draw_frame(render_state& state) {
 	size_t frame_index = state.current_frame % FRAMES_IN_FLIGHT;
 	VkFence fence = state.render_fence[frame_index];
-	vkWaitForFences(state.device, 1, &fence, VK_TRUE, UINT64_MAX);
+	vkWaitForFences(state.graphics_queue.device, 1, &fence, VK_TRUE, UINT64_MAX);
 
 	uint32_t image_index = {};
-	VkResult result = vkAcquireNextImageKHR(state.device, state.swapchain, UINT64_MAX, state.image_available_semaphore[frame_index], VK_NULL_HANDLE, &image_index);
+	VkResult result = vkAcquireNextImageKHR(state.graphics_queue.device, state.swapchain, UINT64_MAX, state.image_available_semaphore[frame_index], VK_NULL_HANDLE, &image_index);
 	if (result == VK_ERROR_OUT_OF_DATE_KHR) { recreate_swapchain(state); return; }
 	if ( !(result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) )
 		throw std::runtime_error("vkAcquireNextImageKHR failed");
 
-	vkResetFences(state.device, 1, &fence);
+	vkResetFences(state.graphics_queue.device, 1, &fence);
 
 	VkCommandBuffer cmd = state.command_buffers[frame_index];
 	vkResetCommandBuffer(cmd, 0);
@@ -505,7 +451,7 @@ void draw_frame(render_state& state) {
 			.signalSemaphoreCount = 1,
 			.pSignalSemaphores = &state.swapchain_render_finished_semaphore[image_index],
 		};
-		VK_CHECK(vkQueueSubmit(state.graphics_queue, 1, &info, fence));
+		VK_CHECK(vkQueueSubmit(state.graphics_queue.queue, 1, &info, fence));
 	}{ // Present
 		VkPresentInfoKHR presentInfo = {
 			.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -516,11 +462,10 @@ void draw_frame(render_state& state) {
 			.pImageIndices = &image_index,
 		};
 
-		result = vkQueuePresentKHR(state.graphics_queue, &presentInfo);
+		result = vkQueuePresentKHR(state.graphics_queue.queue, &presentInfo);
 		if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
 			recreate_swapchain(state);
-		else if (result != VK_SUCCESS)
-			throw std::runtime_error("vkQueuePresentKHR failed");
+		else VK_CHECK(result);
 	}
 
 	state.current_frame++;
@@ -538,10 +483,10 @@ int main() {
 			glfwPollEvents();
 			draw_frame(state);
 		}
-		vkDeviceWaitIdle(state.device);
+		vkDeviceWaitIdle(state.graphics_queue.device);
 		cleanup(state);
 	} catch (const std::exception& e) {
-		std::println(std::cerr, "Fatal: %s\n", e.what());
+		std::println(std::cerr, "Fatal: {}\n", e.what());
 		return EXIT_FAILURE;
 	}
 	return EXIT_SUCCESS;
