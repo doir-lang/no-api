@@ -65,6 +65,12 @@ struct GpuQueue {
 	// Mappings between cpu and gpu pointers
 	std::unordered_map<void*, VkDeviceAddress> host2gpu;
 	std::unordered_map<VkDeviceAddress, void*> gpu2host;
+
+	VkCommandPool command_pool = VK_NULL_HANDLE;
+	VkSemaphore command_submission_timeline_semaphore = VK_NULL_HANDLE;
+	uint64_t command_submission_timeline_semaphore_next_value = 1;
+	std::vector<std::pair<VkCommandBuffer, uint64_t>> command_buffers_pending_free;
+
 	VkPipelineLayout pipeline_layout = VK_NULL_HANDLE; // TODO: Needs to be freed! // TODO: Do we need seperate ones for compute and graphics?
 };
 std::optional<GpuQueue> gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue = VK_NULL_HANDLE, uint32_t queue_family = -1, VkAllocationCallbacks* callbacks = nullptr, bool is_graphics_queue = true);
@@ -75,4 +81,10 @@ inline std::optional<GpuQueue> gpuCreateQueue(const GpuVulkanDefault& vulkan, Vk
 struct GpuPipeline {
 	// VkShaderModule compute_module; // TODO: Do we have a need to carry this around?
 	VkPipeline pipeline;
+};
+
+struct GpuCommandBuffer {
+	GpuQueue* queue;
+	VkCommandBuffer command_buffer;
+	bool ended = false;
 };
