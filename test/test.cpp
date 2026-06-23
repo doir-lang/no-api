@@ -286,13 +286,54 @@ void init_vulkan(render_state& state) {
 	if(!queue) throw std::runtime_error("Failed to create noapi queue");
 	state.graphics_queue = std::move(*queue);
 
-	struct vec4{
-		float x, y, z, w;
-	};
-	auto buffer = gpuMalloc<vec4>(state.graphics_queue);
-	gpu* buffer_gpu = gpuHostToDevicePointer(state.graphics_queue, buffer);
+	auto upload = gpuMalloc<float>(state.graphics_queue, 16);
+	gpu* upload_gpu = gpuHostToDevicePointer(state.graphics_queue, upload);
+	for(size_t i = 0; i < 16; ++i)
+		upload[i] = i;
 
-	gpuFree(state.graphics_queue, buffer);
+	auto download = gpuMalloc<float>(state.graphics_queue, 16, MEMORY_READBACK);
+	gpu* download_gpu = gpuHostToDevicePointer(state.graphics_queue, download);
+
+	auto glsl = compile_glsl(EShLangCompute, R"glsl(
+		#version 460
+		#extension GL_EXT_shader_explicit_arithmetic_types : require
+
+		layout(push_constant) uniform PushConstants {
+			uint64_t compute_data;
+		} pc;
+		// End prologue
+
+		#extension GL_EXT_buffer_reference : require
+
+		layout(local_size_x = 16) in;
+
+		layout(buffer_reference, std430) buffer Floats {
+			float data[];
+		};
+
+		void main() {
+			Floats floats = Floats(pc.compute_data);
+
+			uint i = gl_GlobalInvocationID.x;
+			floats.data[i] *= 5;
+		}
+	)glsl");
+
+	GpuPipeline pipeline = gpuCreateComputePipeline(state.graphics_queue, {(std::byte*)glsl.data(), glsl.size() * sizeof(glsl[0])});
+	GpuCommandBuffer cmd = gpuStartCommandRecording(state.graphics_queue);
+
+	gpuSetPipeline(cmd, pipeline);
+	gpuDispatch(cmd, upload_gpu, {1, 1, 1});
+	// gpuMemCpy(cmd, download_gpu, upload_gpu, 16 * sizeof(float));
+
+	gpuSubmit(state.graphics_queue, {&cmd, 1});
+
+	vkDeviceWaitIdle(state.graphics_queue.device);
+	auto dbg_up = upload[5];
+	auto dbg_down = download[5];
+	gpuDestroyPipeline(state.graphics_queue, pipeline);
+	gpuFree(state.graphics_queue, upload);
+	gpuFree(state.graphics_queue, download);
 
 	create_swapchain(state, WIDTH, HEIGHT);
 	{ // create_render_pass();
@@ -399,7 +440,7 @@ void cleanup(render_state& state) {
 	vkDestroyPipeline (state.graphics_queue.device, state.pipeline, nullptr);
 	vkDestroyPipelineLayout(state.graphics_queue.device, state.pipeline_layout, nullptr);
 	vkDestroyRenderPass (state.graphics_queue.device, state.render_pass, nullptr);
-	vmaDestroyAllocator(state.graphics_queue.allocator);
+	gpuDestroyQueue(state.graphics_queue);
 	vkb::destroy_swapchain(state.vkb_swapchain);
 	vkDestroyDevice(state.graphics_queue.device, nullptr);
 	vkDestroySurfaceKHR (state.instance, state.surface, nullptr);

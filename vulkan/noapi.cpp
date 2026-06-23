@@ -284,3 +284,126 @@ GpuPipeline gpuCreateComputePipeline(GpuQueue& queue, std::span<const std::byte>
 void gpuDestroyPipeline(GpuQueue& queue, GpuPipeline& pipeline) {
 	vkDestroyPipeline(queue.device, pipeline.pipeline, queue.callbacks);
 }
+
+GpuCommandBuffer gpuStartCommandRecording(GpuQueue& queue) {
+	if(!queue.command_pool) {
+		VkCommandPoolCreateInfo info{
+			.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+			.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+			.queueFamilyIndex = queue.queue_family
+		};
+		VK_CHECK(vkCreateCommandPool(queue.device, &info, queue.callbacks, &queue.command_pool));
+	}
+
+	// Check the current value of the submission count timeline semaphore and free any buffers who's submission has finished
+	if(!queue.command_buffers_pending_free.empty()) {
+		uint64_t current_finished_submission;
+		vkGetSemaphoreCounterValue(queue.device, queue.command_submission_timeline_semaphore, &current_finished_submission);
+
+		// TODO: Would it be worth the effort to deduplicate?
+
+		std::vector<VkCommandBuffer> to_free; to_free.reserve(queue.command_buffers_pending_free.size());
+		for(auto [cmd, submit]: queue.command_buffers_pending_free)
+			if(submit <= current_finished_submission)
+				to_free.push_back(cmd);
+
+		if(!to_free.empty())
+			vkFreeCommandBuffers(queue.device, queue.command_pool, to_free.size(), to_free.data());
+	}
+
+	GpuCommandBuffer out {.queue = &queue};
+	VkCommandBufferAllocateInfo info {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		.commandPool = queue.command_pool,
+		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		.commandBufferCount = 1
+	};
+	VK_CHECK(vkAllocateCommandBuffers(queue.device, &info, &out.command_buffer));
+
+	VkCommandBufferBeginInfo begin {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+	};
+	VK_CHECK(vkBeginCommandBuffer(out.command_buffer, &begin));
+	return out;
+}
+
+void gpuDestoryCommandBuffer(GpuCommandBuffer& cmd) {
+	vkFreeCommandBuffers(cmd.queue->device, cmd.queue->command_pool, 1, &cmd.command_buffer);
+}
+
+void gpuSubmitNoDestroy(GpuQueue& queue, std::span<GpuCommandBuffer> commandBuffers, std::optional<GpuSemaphore&> semaphore /* = std::nullopt */, uint64_t signalValue /* = 0 */) {
+	std::vector<VkCommandBufferSubmitInfo> submits; submits.reserve(commandBuffers.size());
+	for(auto& cmd: commandBuffers) {
+		if(!cmd.ended) {
+			vkEndCommandBuffer(cmd.command_buffer);
+			cmd.ended = true;
+		}
+		submits.emplace_back(VkCommandBufferSubmitInfo{
+			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+			.commandBuffer = cmd.command_buffer
+		});
+	}
+
+	std::array<VkSemaphoreSubmitInfo, 2> signals {
+		VkSemaphoreSubmitInfo{
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+			.semaphore = queue.command_submission_timeline_semaphore,
+			.value = queue.command_submission_timeline_semaphore_next_value++,
+			.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+		}
+	};
+	VkSubmitInfo2 info {
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+		.commandBufferInfoCount = static_cast<uint32_t>(submits.size()),
+		.pCommandBufferInfos = submits.data(),
+		.signalSemaphoreInfoCount = 1,
+		.pSignalSemaphoreInfos = signals.data(),
+	};
+	VK_CHECK(vkQueueSubmit2(queue.queue, 1, &info, nullptr));
+}
+
+void gpuSubmit(GpuQueue& queue, std::span<GpuCommandBuffer> commandBuffers, std::optional<GpuSemaphore&> semaphore /* = std::nullopt */, uint64_t signalValue /* = 0 */) {
+	gpuSubmitNoDestroy(queue, commandBuffers, semaphore, signalValue);
+
+	for(auto& cmd: commandBuffers)
+		queue.command_buffers_pending_free.emplace_back(cmd.command_buffer, queue.command_submission_timeline_semaphore_next_value - 1); // -1 since it was incremented in the no destroy call
+}
+
+void gpuMemCpy(GpuCommandBuffer& cmd, gpu* dest_, gpu* src_, size_t bytes, bool no_offsets /* = false*/) {
+	auto& queue = *cmd.queue;
+	auto dest = (VkDeviceAddress)dest_, src = (VkDeviceAddress)src_;
+	VkDeviceAddress closest_dest = 0, closest_src = 0; // TODO: There are probably edge cases around setting these to zero!
+	if(no_offsets) {
+		closest_dest = dest;
+		closest_src = src;
+	} else for(auto [key, _]: queue.allocations) {
+		if(closest_dest - dest > key - dest)
+			closest_dest = key;
+		if(closest_src - src > key - src)
+			closest_src = key;
+	}
+	VkBuffer dest_buffer = queue.allocations[closest_dest].first;
+	size_t dest_offset = closest_dest - dest;
+	VkBuffer src_buffer = queue.allocations[closest_src].first;
+	size_t src_offset = closest_src - src;
+
+	VkBufferCopy region {
+		.srcOffset = src_offset,
+		.dstOffset = dest_offset,
+		.size = bytes
+	};
+	vkCmdCopyBuffer(cmd.command_buffer, src_buffer, dest_buffer, 1, &region);
+}
+
+void gpuSetPipeline(GpuCommandBuffer& cmd, GpuPipeline pipeline) {
+	vkCmdBindPipeline(cmd.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+}
+
+void gpuDispatch(GpuCommandBuffer& cmd, gpu* dataGpu, uvec3 gridDimensions) {
+	ComputePipelinePushConstants data {
+		.data = dataGpu
+	};
+	vkCmdPushConstants(cmd.command_buffer, cmd.queue->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ComputePipelinePushConstants), &data);
+	vkCmdDispatch(cmd.command_buffer, gridDimensions.x, gridDimensions.y, gridDimensions.z);
+}
