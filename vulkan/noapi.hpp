@@ -16,7 +16,20 @@
 
 		VkResultExecption(VkResult result) : result(result) {}
 	};
+
+	#define VK_CHECK(expr) do {\
+		auto res = expr;\
+		if(res != VK_SUCCESS)\
+			throw VkResultExecption(res);\
+	} while(false)
+#else
+	#define VK_CHECK(expr) do {\
+		auto res = expr;\
+		if(res != VK_SUCCESS)\
+			std::exit((int)res);\
+	} while(false)
 #endif
+
 
 struct GpuVulkanDefault {
 	VkInstance instance = VK_NULL_HANDLE;
@@ -87,4 +100,8 @@ struct GpuCommandBuffer {
 	GpuQueue* queue;
 	VkCommandBuffer command_buffer;
 	bool ended = false;
+};
+
+struct GpuSemaphore {
+	VkSemaphore semaphore;
 };
