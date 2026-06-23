@@ -2,7 +2,7 @@
 #include <volk.h>
 
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
-#define VMA_IMPLEMENTATION
+// #define VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>
 
 #include "noapi.hpp"
@@ -11,19 +11,6 @@
 
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added
 
-#ifndef NOAPI_NO_EXCEPTIONS
-	#define VK_CHECK(expr) do {\
-		auto res = expr;\
-		if(res != VK_SUCCESS)\
-			throw VkResultExecption(res);\
-	} while(false)
-#else
-	#define VK_CHECK(expr) do {\
-		auto res = expr;\
-		if(res != VK_SUCCESS)\
-			std::exit((int)res);\
-	} while(false)
-#endif
 
 std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkan(std::function_ref<VkSurfaceKHR(VkInstance)> surface_loader, std::span<const char*> extra_extensions /* = {} */, std::span<const char*> extra_layers /* = {} */, bool debug /* = true */) {
 	GpuVulkanDefault out;
@@ -122,19 +109,7 @@ std::optional<GpuQueue> gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu
 	if(vmaCreateAllocator(&vma_info, &out.allocator) != VK_SUCCESS)
 		return {};
 
-	{
-		VkSemaphoreTypeCreateInfo semaphore_type{};
-		semaphore_type.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
-		semaphore_type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-		semaphore_type.initialValue = 0; // Starting timeline value
-
-		VkSemaphoreCreateInfo info{};
-		info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-		info.pNext = &semaphore_type;
-
-		if(vkCreateSemaphore(out.device, &info, out.callbacks, &out.command_submission_timeline_semaphore) != VK_SUCCESS)
-			return {};
-	}
+	out.command_submission_timeline_semaphore = gpuCreateSemaphore(out, 0).semaphore;
 
 	return out;
 }
@@ -149,140 +124,6 @@ void gpuDestroyQueue(GpuQueue& queue) {
 
 	if(queue.allocator)
 		vmaDestroyAllocator(queue.allocator);
-}
-
-void* gpuMalloc(GpuQueue& queue, size_t bytes, size_t align /* = 16 */, MEMORY memory /* = MEMORY_DEFAULT */) {
-	constexpr static auto memory_to_allocation_usage = [](MEMORY memory) {
-		switch (memory) {
-		case MEMORY_GPU:
-		case MEMORY_TEXTURE:
-			return VMA_MEMORY_USAGE_GPU_ONLY;
-		case MEMORY_READBACK:
-		case MEMORY_TEXTURE_READBACK:
-			return VMA_MEMORY_USAGE_GPU_TO_CPU;
-		default:
-			return VMA_MEMORY_USAGE_CPU_TO_GPU;
-		}
-	};
-
-	VkBufferCreateInfo buffer_info {
-		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-		.size = bytes,
-		.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-		.sharingMode = VK_SHARING_MODE_EXCLUSIVE // TODO: Should be concurrent?
-	};
-	VmaAllocationCreateInfo alloc_info {
-		.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-	};
-	if( !(memory == MEMORY_GPU || memory == MEMORY_TEXTURE) ) alloc_info.flags |= VMA_ALLOCATION_CREATE_MAPPED_BIT;
-	if(memory == MEMORY_DEFAULT) alloc_info.flags |= VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-	if(memory == MEMORY_READBACK || memory == MEMORY_TEXTURE_READBACK) alloc_info.flags |= VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
-	if(memory == MEMORY_TEXTURE || memory == MEMORY_TEXTURE_READBACK) alloc_info.flags |= VMA_ALLOCATION_CREATE_CAN_ALIAS_BIT; // We can create a texture that is aliased with the buffer
-	VkBuffer buffer;
-	VmaAllocation allocation;
-	VK_CHECK(vmaCreateBufferWithAlignment(queue.allocator, &buffer_info, &alloc_info, align, &buffer, &allocation, nullptr));
-
-	VkBufferDeviceAddressInfo address_info {
-		.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
-		.buffer = buffer
-	};
-	auto gpu_ptr = vkGetBufferDeviceAddress(queue.device, &address_info);
-
-	queue.allocations[gpu_ptr] = {buffer, allocation};
-
-	if(memory == MEMORY_GPU || memory == MEMORY_TEXTURE)
-		return (void*)gpu_ptr;
-
-	void* cpu_ptr = allocation->GetMappedData();
-	queue.host2gpu[cpu_ptr] = gpu_ptr;
-	queue.gpu2host[gpu_ptr] = cpu_ptr;
-	return cpu_ptr;
-}
-
-void gpuFree(GpuQueue& queue, void* ptr) {
-	if(queue.host2gpu.contains(ptr)) {
-		gpuFree(queue, (gpu*)queue.host2gpu[ptr]);
-	}
-}
-void gpuFree(GpuQueue& queue, gpu* ptr) {
-	auto gpu_ptr = (VkDeviceAddress)ptr;
-	if(!queue.allocations.contains(gpu_ptr)) return;
-
-	auto [buffer, allocation] = queue.allocations[gpu_ptr];
-	queue.allocations.erase(gpu_ptr);
-
-	if(queue.gpu2host.contains(gpu_ptr)) {
-		auto host = queue.gpu2host[gpu_ptr];
-		queue.gpu2host.erase(gpu_ptr);
-		queue.host2gpu.erase(host);
-	}
-
-	vmaDestroyBuffer(queue.allocator, buffer, allocation);
-}
-
-gpu* gpuHostToDevicePointer(GpuQueue& queue, void* ptr) {
-	if(queue.host2gpu.contains(ptr))
-		return (gpu*)queue.host2gpu[ptr];
-	return nullptr;
-}
-
-void* gpuDeviceToHostPointer(GpuQueue& queue, gpu* ptr) {
-	auto gpu_ptr = (VkDeviceAddress)ptr;
-	if(queue.gpu2host.contains(gpu_ptr))
-		return queue.gpu2host[gpu_ptr];
-	return nullptr;
-}
-
-struct ComputePipelinePushConstants {
-	gpu* data;
-	// gpu* textures; // TODO: how do we do descriptor heaps?
-};
-
-GpuPipeline gpuCreateComputePipeline(GpuQueue& queue, std::span<const std::byte> computeIR) {
-	GpuPipeline out;
-
-	if(queue.pipeline_layout == VK_NULL_HANDLE) {
-		VkPushConstantRange push_constant {
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-			.offset = 0,
-			.size = sizeof(ComputePipelinePushConstants)
-		};
-		VkPipelineLayoutCreateInfo layout_info{
-			.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-			.pushConstantRangeCount = 1,
-			.pPushConstantRanges = &push_constant
-		};
-		VK_CHECK(vkCreatePipelineLayout(queue.device, &layout_info, queue.callbacks, &queue.pipeline_layout));
-	}
-
-	VkShaderModule compute_module;
-	{
-		VkShaderModuleCreateInfo info {
-			.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-			.codeSize = computeIR.size(),
-			.pCode = (uint32_t*)computeIR.data(),
-		};
-		VK_CHECK(vkCreateShaderModule(queue.device, &info, queue.callbacks, &compute_module));
-	}{
-		VkComputePipelineCreateInfo info {
-			.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-			.stage = {
-				.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-				.stage = VK_SHADER_STAGE_COMPUTE_BIT,
-				.module = compute_module,
-				.pName = "main"
-			},
-			.layout = queue.pipeline_layout
-		};
-		VK_CHECK(vkCreateComputePipelines(queue.device, nullptr, 1, &info, queue.callbacks, &out.pipeline));
-	}
-
-	vkDestroyShaderModule(queue.device, compute_module, queue.callbacks);
-	return out;
-}
-
-void gpuDestroyPipeline(GpuQueue& queue, GpuPipeline& pipeline) {
-	vkDestroyPipeline(queue.device, pipeline.pipeline, queue.callbacks);
 }
 
 GpuCommandBuffer gpuStartCommandRecording(GpuQueue& queue) {
@@ -353,11 +194,19 @@ void gpuSubmitNoDestroy(GpuQueue& queue, std::span<GpuCommandBuffer> commandBuff
 			.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
 		}
 	};
+	if(semaphore) {
+		signals[1] = VkSemaphoreSubmitInfo{
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+			.semaphore = semaphore->semaphore,
+			.value = signalValue,
+			.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+		};
+	}
 	VkSubmitInfo2 info {
 		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
 		.commandBufferInfoCount = static_cast<uint32_t>(submits.size()),
 		.pCommandBufferInfos = submits.data(),
-		.signalSemaphoreInfoCount = 1,
+		.signalSemaphoreInfoCount = static_cast<uint32_t>(semaphore ? 2 : 1),
 		.pSignalSemaphoreInfos = signals.data(),
 	};
 	VK_CHECK(vkQueueSubmit2(queue.queue, 1, &info, nullptr));
@@ -370,40 +219,39 @@ void gpuSubmit(GpuQueue& queue, std::span<GpuCommandBuffer> commandBuffers, std:
 		queue.command_buffers_pending_free.emplace_back(cmd.command_buffer, queue.command_submission_timeline_semaphore_next_value - 1); // -1 since it was incremented in the no destroy call
 }
 
-void gpuMemCpy(GpuCommandBuffer& cmd, gpu* dest_, gpu* src_, size_t bytes, bool no_offsets /* = false*/) {
-	auto& queue = *cmd.queue;
-	auto dest = (VkDeviceAddress)dest_, src = (VkDeviceAddress)src_;
-	VkDeviceAddress closest_dest = 0, closest_src = 0; // TODO: There are probably edge cases around setting these to zero!
-	if(no_offsets) {
-		closest_dest = dest;
-		closest_src = src;
-	} else for(auto [key, _]: queue.allocations) {
-		if(closest_dest - dest > key - dest)
-			closest_dest = key;
-		if(closest_src - src > key - src)
-			closest_src = key;
+GpuSemaphore gpuCreateSemaphore(GpuQueue& queue, uint64_t initValue) {
+	GpuSemaphore out;
+
+	VkSemaphoreTypeCreateInfo semaphore_type{};
+	semaphore_type.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+	semaphore_type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+	semaphore_type.initialValue = initValue; // Starting timeline value
+
+	VkSemaphoreCreateInfo info{};
+	info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+	info.pNext = &semaphore_type;
+	VK_CHECK(vkCreateSemaphore(queue.device, &info, queue.callbacks, &out.semaphore));
+	return out;
+}
+
+uint64_t gpuWaitSemaphore(GpuQueue& queue, GpuSemaphore& semaphore, uint64_t value, uint64_t timeout /* = UINT64_MAX */) {
+	if(value == GPU_GET_VALUE) {
+		uint64_t currentValue;
+		VK_CHECK(vkGetSemaphoreCounterValue(queue.device, semaphore.semaphore, &currentValue));
+		return currentValue;
 	}
-	VkBuffer dest_buffer = queue.allocations[closest_dest].first;
-	size_t dest_offset = closest_dest - dest;
-	VkBuffer src_buffer = queue.allocations[closest_src].first;
-	size_t src_offset = closest_src - src;
 
-	VkBufferCopy region {
-		.srcOffset = src_offset,
-		.dstOffset = dest_offset,
-		.size = bytes
-	};
-	vkCmdCopyBuffer(cmd.command_buffer, src_buffer, dest_buffer, 1, &region);
+	VkSemaphoreWaitInfo waitInfo{};
+	waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+	waitInfo.flags = 0;
+	waitInfo.semaphoreCount = 1;
+	waitInfo.pSemaphores = &semaphore.semaphore;
+	waitInfo.pValues = &value;
+
+	VK_CHECK(vkWaitSemaphores(queue.device, &waitInfo, timeout));
+	return value;
 }
 
-void gpuSetPipeline(GpuCommandBuffer& cmd, GpuPipeline pipeline) {
-	vkCmdBindPipeline(cmd.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
-}
-
-void gpuDispatch(GpuCommandBuffer& cmd, gpu* dataGpu, uvec3 gridDimensions) {
-	ComputePipelinePushConstants data {
-		.data = dataGpu
-	};
-	vkCmdPushConstants(cmd.command_buffer, cmd.queue->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ComputePipelinePushConstants), &data);
-	vkCmdDispatch(cmd.command_buffer, gridDimensions.x, gridDimensions.y, gridDimensions.z);
+void gpuDestroySemaphore(GpuQueue& queue, GpuSemaphore& semaphore) {
+	vkDestroySemaphore(queue.device, semaphore.semaphore, queue.callbacks);
 }

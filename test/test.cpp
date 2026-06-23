@@ -126,16 +126,6 @@ static std::vector<uint32_t> compile_glsl(EShLanguage stage, const char* source)
 	return spv;
 }
 
-// ─── Vulkan helpers ───────────────────────────────────────────────────────────
-#define VK_CHECK(expr) \
-	do { \
-		VkResult _r = (expr); \
-		if (_r != VK_SUCCESS) { \
-			std::println(std::cerr, "Vulkan error %d at %s:%d", (int)_r, __FILE__, __LINE__); \
-			std::abort(); \
-		} \
-	} while(0)
-
 static VkShaderModule create_shader_module(render_state& state, const std::vector<uint32_t>& spv) {
 	VkShaderModuleCreateInfo info = {
 		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
