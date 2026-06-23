@@ -11,6 +11,20 @@
 
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added
 
+#ifndef NOAPI_NO_EXCEPTIONS
+	#define VK_CHECK(expr) do {\
+		auto res = expr;\
+		if(res != VK_SUCCESS)\
+			throw VkResultExecption(res);\
+	} while(false)
+#else
+	#define VK_CHECK(expr) do {\
+		auto res = expr;\
+		if(res != VK_SUCCESS)\
+			std::exit((int)res);\
+	} while(false)
+#endif
+
 std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkan(std::function_ref<VkSurfaceKHR(VkInstance)> surface_loader, std::span<const char*> extra_extensions /* = {} */, std::span<const char*> extra_layers /* = {} */, bool debug /* = true */) {
 	GpuVulkanDefault out;
 
@@ -35,7 +49,9 @@ std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkan(std::function
 	// Physical Device
 	vkb::PhysicalDeviceSelector gpu_selector{instance};
 	auto phys = gpu_selector
+		.set_required_features(gpuEnableRequiredVulkanFeatures({}))
 		.set_required_features_12(gpuEnableRequiredVulkan12Features({}))
+		.set_required_features_13(gpuEnableRequiredVulkan13Features({}))
 		.set_surface(out.surface)
 		.set_minimum_version(1, 3)
 		.select();
@@ -56,13 +72,14 @@ std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkan(std::function
 	return out;
 }
 
-std::optional<GpuQueue> gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue /* = VK_NULL_HANDLE */, uint32_t queue_family /* = -1 */, bool is_graphics_queue /* = true */) {
+std::optional<GpuQueue> gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue /* = VK_NULL_HANDLE */, uint32_t queue_family /* = -1 */, VkAllocationCallbacks* callbacks /* = nullptr */, bool is_graphics_queue /* = true */) {
 	GpuQueue out {
 		.gpu = gpu,
 		.device = device,
 		.queue = queue,
 		.queue_family = queue_family,
-		.is_graphics_queue = is_graphics_queue
+		.is_graphics_queue = is_graphics_queue,
+		.callbacks = callbacks
 	};
 
 	if(volkInitialize() != VK_SUCCESS)
@@ -97,6 +114,7 @@ std::optional<GpuQueue> gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu
 		.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
 		.physicalDevice = out.gpu,
 		.device = out.device,
+		.pAllocationCallbacks = out.callbacks,
 		.pVulkanFunctions = &functions,
 		.instance = instance,
 		.vulkanApiVersion = VK_API_VERSION_1_3,
@@ -104,7 +122,33 @@ std::optional<GpuQueue> gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu
 	if(vmaCreateAllocator(&vma_info, &out.allocator) != VK_SUCCESS)
 		return {};
 
+	{
+		VkSemaphoreTypeCreateInfo semaphore_type{};
+		semaphore_type.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+		semaphore_type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+		semaphore_type.initialValue = 0; // Starting timeline value
+
+		VkSemaphoreCreateInfo info{};
+		info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+		info.pNext = &semaphore_type;
+
+		if(vkCreateSemaphore(out.device, &info, out.callbacks, &out.command_submission_timeline_semaphore) != VK_SUCCESS)
+			return {};
+	}
+
 	return out;
+}
+
+void gpuDestroyQueue(GpuQueue& queue) {
+	if(queue.command_pool)
+		vkDestroyCommandPool(queue.device, queue.command_pool, queue.callbacks);
+	if(queue.command_submission_timeline_semaphore)
+		vkDestroySemaphore(queue.device, queue.command_submission_timeline_semaphore, queue.callbacks);
+	if(queue.pipeline_layout)
+		vkDestroyPipelineLayout(queue.device, queue.pipeline_layout, queue.callbacks);
+
+	if(queue.allocator)
+		vmaDestroyAllocator(queue.allocator);
 }
 
 void* gpuMalloc(GpuQueue& queue, size_t bytes, size_t align /* = 16 */, MEMORY memory /* = MEMORY_DEFAULT */) {
@@ -136,8 +180,7 @@ void* gpuMalloc(GpuQueue& queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 	if(memory == MEMORY_TEXTURE || memory == MEMORY_TEXTURE_READBACK) alloc_info.flags |= VMA_ALLOCATION_CREATE_CAN_ALIAS_BIT; // We can create a texture that is aliased with the buffer
 	VkBuffer buffer;
 	VmaAllocation allocation;
-	if(vmaCreateBufferWithAlignment(queue.allocator, &buffer_info, &alloc_info, align, &buffer, &allocation, nullptr) != VK_SUCCESS)
-		return nullptr;
+	VK_CHECK(vmaCreateBufferWithAlignment(queue.allocator, &buffer_info, &alloc_info, align, &buffer, &allocation, nullptr));
 
 	VkBufferDeviceAddressInfo address_info {
 		.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
@@ -188,4 +231,56 @@ void* gpuDeviceToHostPointer(GpuQueue& queue, gpu* ptr) {
 	if(queue.gpu2host.contains(gpu_ptr))
 		return queue.gpu2host[gpu_ptr];
 	return nullptr;
+}
+
+struct ComputePipelinePushConstants {
+	gpu* data;
+	// gpu* textures; // TODO: how do we do descriptor heaps?
+};
+
+GpuPipeline gpuCreateComputePipeline(GpuQueue& queue, std::span<const std::byte> computeIR) {
+	GpuPipeline out;
+
+	if(queue.pipeline_layout == VK_NULL_HANDLE) {
+		VkPushConstantRange push_constant {
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.offset = 0,
+			.size = sizeof(ComputePipelinePushConstants)
+		};
+		VkPipelineLayoutCreateInfo layout_info{
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+			.pushConstantRangeCount = 1,
+			.pPushConstantRanges = &push_constant
+		};
+		VK_CHECK(vkCreatePipelineLayout(queue.device, &layout_info, queue.callbacks, &queue.pipeline_layout));
+	}
+
+	VkShaderModule compute_module;
+	{
+		VkShaderModuleCreateInfo info {
+			.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+			.codeSize = computeIR.size(),
+			.pCode = (uint32_t*)computeIR.data(),
+		};
+		VK_CHECK(vkCreateShaderModule(queue.device, &info, queue.callbacks, &compute_module));
+	}{
+		VkComputePipelineCreateInfo info {
+			.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+			.stage = {
+				.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+				.stage = VK_SHADER_STAGE_COMPUTE_BIT,
+				.module = compute_module,
+				.pName = "main"
+			},
+			.layout = queue.pipeline_layout
+		};
+		VK_CHECK(vkCreateComputePipelines(queue.device, nullptr, 1, &info, queue.callbacks, &out.pipeline));
+	}
+
+	vkDestroyShaderModule(queue.device, compute_module, queue.callbacks);
+	return out;
+}
+
+void gpuDestroyPipeline(GpuQueue& queue, GpuPipeline& pipeline) {
+	vkDestroyPipeline(queue.device, pipeline.pipeline, queue.callbacks);
 }
