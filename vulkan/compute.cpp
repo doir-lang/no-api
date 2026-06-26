@@ -8,25 +8,10 @@
 
 struct ComputePipelinePushConstants {
 	gpu* data;
-	// gpu* textures; // TODO: how do we do descriptor heaps?
 };
 
 GpuPipeline gpuCreateComputePipeline(GpuQueue& queue, std::span<const std::byte> computeIR) {
 	GpuPipeline out;
-
-	if(queue.pipeline_layout == VK_NULL_HANDLE) {
-		VkPushConstantRange push_constant {
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-			.offset = 0,
-			.size = sizeof(ComputePipelinePushConstants)
-		};
-		VkPipelineLayoutCreateInfo layout_info{
-			.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-			.pushConstantRangeCount = 1,
-			.pPushConstantRanges = &push_constant
-		};
-		VK_CHECK(vkCreatePipelineLayout(queue.device, &layout_info, queue.callbacks, &queue.pipeline_layout));
-	}
 
 	VkShaderModule compute_module;
 	{
@@ -37,15 +22,19 @@ GpuPipeline gpuCreateComputePipeline(GpuQueue& queue, std::span<const std::byte>
 		};
 		VK_CHECK(vkCreateShaderModule(queue.device, &info, queue.callbacks, &compute_module));
 	}{
+		VkPipelineCreateFlags2CreateInfo create_flags {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
+			.flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT
+		};
 		VkComputePipelineCreateInfo info {
 			.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+			.pNext = &create_flags,
 			.stage = {
 				.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
 				.stage = VK_SHADER_STAGE_COMPUTE_BIT,
 				.module = compute_module,
 				.pName = "main"
 			},
-			.layout = queue.pipeline_layout
 		};
 		VK_CHECK(vkCreateComputePipelines(queue.device, nullptr, 1, &info, queue.callbacks, &out.pipeline));
 	}
@@ -58,7 +47,7 @@ void gpuDestroyPipeline(GpuQueue& queue, GpuPipeline& pipeline) {
 	vkDestroyPipeline(queue.device, pipeline.pipeline, queue.callbacks);
 }
 
-inline std::pair<VkBuffer, VkDeviceSize> closest_buffer(GpuQueue& queue, gpu* addr, bool no_offsets) {
+inline std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress> closest_buffer(GpuQueue& queue, gpu* addr, bool no_offsets) {
 	auto address = (VkDeviceAddress)addr;
 	VkDeviceAddress closest = 0; // TODO: There are probably edge cases around setting these to zero!
 	if(no_offsets)
@@ -67,10 +56,10 @@ inline std::pair<VkBuffer, VkDeviceSize> closest_buffer(GpuQueue& queue, gpu* ad
 		if(closest - address > key - address)
 			closest = key;
 	}
-	return {queue.allocations[closest].first, closest - address};
+	return {std::get<VkBuffer>(queue.allocations[closest]), closest - address, address};
 }
 
-inline std::array<std::pair<VkBuffer, VkDeviceSize>, 2> closest_buffer(GpuQueue& queue, gpu* addrA, gpu* addrB, bool no_offsets) {
+inline std::array<std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress>, 2> closest_buffer(GpuQueue& queue, gpu* addrA, gpu* addrB, bool no_offsets) {
 	auto a = (VkDeviceAddress)addrA, b = (VkDeviceAddress)addrB;
 	VkDeviceAddress closestA = 0, closestB = 0; // TODO: There are probably edge cases around setting these to zero!
 	if(no_offsets) {
@@ -83,15 +72,14 @@ inline std::array<std::pair<VkBuffer, VkDeviceSize>, 2> closest_buffer(GpuQueue&
 			closestB = key;
 	}
 	return {
-		std::pair<VkBuffer, size_t>{queue.allocations[closestA].first, closestA - a}, 
-		std::pair<VkBuffer, size_t>{queue.allocations[closestB].first, closestB - b}
+		std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress>{std::get<VkBuffer>(queue.allocations[closestA]), closestA - a, a}, 
+		std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress>{std::get<VkBuffer>(queue.allocations[closestB]), closestB - b, b}
 	};
 }
 
 void gpuMemCpy(GpuCommandBuffer& cmd, gpu* dest_, gpu* src_, size_t bytes, bool no_offsets /* = false*/) {
-	auto& queue = *cmd.queue;
 	auto [dest, src] = closest_buffer(*cmd.queue, dest_, src_, no_offsets);
-	auto [dest_buffer, dest_offset] = dest; auto [src_buffer, src_offset] = src;
+	auto [dest_buffer, dest_offset, dest_addr] = dest; auto [src_buffer, src_offset, src_addr] = src;
 
 	VkBufferCopy region {
 		.srcOffset = src_offset,
@@ -99,6 +87,56 @@ void gpuMemCpy(GpuCommandBuffer& cmd, gpu* dest_, gpu* src_, size_t bytes, bool 
 		.size = bytes
 	};
 	vkCmdCopyBuffer(cmd.command_buffer, src_buffer, dest_buffer, 1, &region);
+}
+
+void gpuSetActiveTextureHeapPtr(GpuCommandBuffer& cmd, gpu* textureHeap, bool no_offsets /* = false */) {
+	auto& queue = *cmd.queue;
+
+	auto [source_buffer, offset, source_address] = closest_buffer(queue, textureHeap, no_offsets);
+	auto source_size = std::get<VkDeviceSize>(queue.allocations[source_address]);
+	
+	if(!queue.descriptor_heaps.contains(source_address)) {
+		auto size = std::max<VkDeviceSize>(source_size, queue.minimum_descriptor_heap_size);
+		VkBufferCreateInfo buffer_info {
+			.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+			.size = size,
+			.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+		};
+		VmaAllocationCreateInfo alloc_info {
+			.usage = VMA_MEMORY_USAGE_AUTO,
+			.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+		};
+
+		auto& [buffer, allocation, heap_size, heap_address] = queue.descriptor_heaps[source_address];
+		heap_size = size;
+		VK_CHECK(vmaCreateBuffer(queue.allocator, &buffer_info, &alloc_info, &buffer, &allocation, nullptr));
+
+		VkBufferDeviceAddressInfo address_info {
+			.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+			.buffer = buffer
+		};
+		heap_address = vkGetBufferDeviceAddress(queue.device, &address_info);
+	}
+
+	auto [heap_buffer, _allocation, heap_size, heap_address] = queue.descriptor_heaps[source_address];
+	VkBufferCopy copy {
+		.srcOffset = offset,
+		.dstOffset = offset,
+		.size = source_size - offset
+	};
+	vkCmdCopyBuffer(cmd.command_buffer, source_buffer, heap_buffer, 1, &copy);
+
+	// TODO: Do we need a barrier here?
+
+	VkBindHeapInfoEXT heap_info {
+		.sType = VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT,
+		.heapRange = {
+			.address = heap_address + offset,
+			.size = heap_size - offset
+		},
+		.reservedRangeSize = queue.minimum_descriptor_heap_size
+	};
+	vkCmdBindResourceHeapEXT(cmd.command_buffer, &heap_info);
 }
 
 inline VkPipelineStageFlags2KHR stage2vulkan(STAGE stage) {
@@ -213,7 +251,15 @@ void gpuDispatch(GpuCommandBuffer& cmd, gpu* dataGpu, uvec3 gridDimensions) {
 	ComputePipelinePushConstants data {
 		.data = dataGpu
 	};
-	vkCmdPushConstants(cmd.command_buffer, cmd.queue->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ComputePipelinePushConstants), &data);
+	VkPushDataInfoEXT info {
+		.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
+		.offset = 0,
+		.data = {
+			.address = &data,
+			.size = sizeof(ComputePipelinePushConstants)
+		}
+	};
+	vkCmdPushDataEXT(cmd.command_buffer, &info);
 	vkCmdDispatch(cmd.command_buffer, gridDimensions.x, gridDimensions.y, gridDimensions.z);
 }
 
@@ -221,8 +267,16 @@ void gpuDispatchIndirect(GpuCommandBuffer& cmd, gpu* dataGpu, gpu* gridDimension
 	ComputePipelinePushConstants data {
 		.data = dataGpu
 	};
-	vkCmdPushConstants(cmd.command_buffer, cmd.queue->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ComputePipelinePushConstants), &data);
+	VkPushDataInfoEXT info {
+		.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
+		.offset = 0,
+		.data = {
+			.address = &data,
+			.size = sizeof(ComputePipelinePushConstants)
+		}
+	};
+	vkCmdPushDataEXT(cmd.command_buffer, &info);
 
-	auto [buffer, offset] = closest_buffer(*cmd.queue, gridDimensionsGpu, no_offsets);
+	auto [buffer, offset, _address] = closest_buffer(*cmd.queue, gridDimensionsGpu, no_offsets);
 	vkCmdDispatchIndirect(cmd.command_buffer, buffer, offset);
 }

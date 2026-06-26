@@ -12,16 +12,16 @@
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added
 
 
-std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkan(std::function_ref<VkSurfaceKHR(VkInstance)> surface_loader, std::span<const char*> extra_extensions /* = {} */, std::span<const char*> extra_layers /* = {} */, bool debug /* = true */) {
+std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkan(std::function_ref<VkSurfaceKHR(VkInstance)> surface_loader, std::span<const char*> instance_extensions /* = {} */, std::span<const char*> extra_layers /* = {} */, std::span<const char*> device_extensions /* = {} */, bool debug /* = true */) {
 	GpuVulkanDefault out;
 
 	// Instance
 	vkb::InstanceBuilder instance_builder;
 	instance_builder.set_app_name("noapi")
 		.set_engine_name("noapi")
-		.enable_extensions(extra_extensions.size(), extra_extensions.data())
+		.enable_extensions(instance_extensions.size(), instance_extensions.data())
 		.request_validation_layers(debug)
-		.require_api_version(1, 3, 0);
+		.require_api_version(1, 4, 0);
 	for(auto layer: extra_layers)
 		instance_builder.enable_layer(layer);
 	if(debug) instance_builder.use_default_debug_messenger();
@@ -33,14 +33,18 @@ std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkan(std::function
 
 	out.surface = surface_loader(out.instance);
 
+	auto extensions = gpuRequiredVulkanDeviceExtensions();
+	extensions.insert(extensions.end(), device_extensions.begin(), device_extensions.end());
+
 	// Physical Device
 	vkb::PhysicalDeviceSelector gpu_selector{instance};
 	auto phys = gpu_selector
 		.set_required_features(gpuEnableRequiredVulkanFeatures({}))
 		.set_required_features_12(gpuEnableRequiredVulkan12Features({}))
 		.set_required_features_13(gpuEnableRequiredVulkan13Features({}))
+		.add_required_extensions(extensions)
 		.set_surface(out.surface)
-		.set_minimum_version(1, 3)
+		.set_minimum_version(1, 4)
 		.select();
 	if (!phys) return std::unexpected(phys.error().message());
 	auto gpu = phys.value();
@@ -48,7 +52,7 @@ std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkan(std::function
 
 	// Logical Device
 	vkb::DeviceBuilder device_builder{gpu};
-	auto dev = device_builder.build();
+	auto dev = device_builder.add_pNext(gpuRequiredVulkanDeviceCreateInfoPnext()).build();
 	if (!dev) return std::unexpected(dev.error().message());
 	auto device = dev.value();
 	out.device = device.device;
@@ -111,6 +115,16 @@ std::optional<GpuQueue> gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu
 
 	out.command_submission_timeline_semaphore = gpuCreateSemaphore(out, 0).semaphore;
 
+	VkPhysicalDeviceDescriptorHeapPropertiesEXT heap_properties {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT,
+	};
+	VkPhysicalDeviceProperties2 properties {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+		.pNext = &heap_properties
+	};
+	vkGetPhysicalDeviceProperties2(gpu, &properties);
+	out.minimum_descriptor_heap_size = heap_properties.minResourceHeapReservedRange;
+
 	return out;
 }
 
@@ -119,8 +133,6 @@ void gpuDestroyQueue(GpuQueue& queue) {
 		vkDestroyCommandPool(queue.device, queue.command_pool, queue.callbacks);
 	if(queue.command_submission_timeline_semaphore)
 		vkDestroySemaphore(queue.device, queue.command_submission_timeline_semaphore, queue.callbacks);
-	if(queue.pipeline_layout)
-		vkDestroyPipelineLayout(queue.device, queue.pipeline_layout, queue.callbacks);
 
 	if(queue.allocator)
 		vmaDestroyAllocator(queue.allocator);

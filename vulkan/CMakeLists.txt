@@ -7,7 +7,7 @@ if (NOT vk-bootstrap_FOUND)
 	include(FetchContent)
 	FetchContent_Declare(vk-bootstrap
 		GIT_REPOSITORY https://github.com/charles-lunarg/vk-bootstrap
-		GIT_TAG v1.3.295
+		GIT_TAG v1.4.354
 	)
 	FetchContent_MakeAvailable(vk-bootstrap)
 endif()

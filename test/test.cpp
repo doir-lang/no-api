@@ -284,6 +284,18 @@ void init_vulkan(render_state& state) {
 	auto download = gpuMalloc<float>(state.graphics_queue, 16, MEMORY_READBACK);
 	gpu* download_gpu = gpuHostToDevicePointer(state.graphics_queue, download);
 
+	auto texture_heap = gpuMalloc<GpuTextureDescriptor>(state.graphics_queue);
+	auto texture_heap_gpu = gpuHostToDevicePointer(state.graphics_queue, texture_heap);
+
+	GpuTextureDesc descriptor {
+		.dimensions = {800, 600, 1},
+		.format = FORMAT_RGBA8_UNORM,
+		.usage = USAGE_STORAGE,
+	};
+	auto texture_gpu = (gpu*)gpuMalloc(state.graphics_queue, gpuTextureSizeAlign(state.graphics_queue, descriptor));
+	auto texture = gpuCreateTexture(state.graphics_queue, descriptor, texture_gpu);
+	*texture_heap = gpuRWTextureViewDescriptor(state.graphics_queue, texture, {});
+
 	auto glsl = compile_glsl(EShLangCompute, R"glsl(
 		#version 460
 		#extension GL_EXT_shader_explicit_arithmetic_types : require
@@ -294,8 +306,11 @@ void init_vulkan(render_state& state) {
 		// End prologue
 
 		#extension GL_EXT_buffer_reference : require
+		#extension GL_EXT_descriptor_heap : require
 
 		layout(local_size_x = 16) in;
+
+		layout(descriptor_heap, rgba8) uniform image2D images[];
 
 		layout(buffer_reference, std430) buffer Floats {
 			float data[];
@@ -306,15 +321,17 @@ void init_vulkan(render_state& state) {
 
 			uint i = gl_GlobalInvocationID.x;
 			floats.data[i] *= 5;
+			imageStore(images[0], ivec2(0), vec4(0));
 		}
 	)glsl");
 
 	GpuPipeline pipeline = gpuCreateComputePipeline(state.graphics_queue, {(std::byte*)glsl.data(), glsl.size() * sizeof(glsl[0])});
 	GpuCommandBuffer cmd = gpuStartCommandRecording(state.graphics_queue);
 
+	gpuSetActiveTextureHeapPtr(cmd, texture_heap_gpu, true);
 	gpuSetPipeline(cmd, pipeline);
 	gpuDispatch(cmd, upload_gpu, {1, 1, 1});
-	// gpuMemCpy(cmd, download_gpu, upload_gpu, 16 * sizeof(float));
+	gpuMemCpy(cmd, download_gpu, upload_gpu, 16 * sizeof(float));
 
 	gpuSubmit(state.graphics_queue, {&cmd, 1});
 
@@ -324,6 +341,9 @@ void init_vulkan(render_state& state) {
 	gpuDestroyPipeline(state.graphics_queue, pipeline);
 	gpuFree(state.graphics_queue, upload);
 	gpuFree(state.graphics_queue, download);
+
+	gpuFree(state.graphics_queue, texture_gpu);
+	gpuFree(state.graphics_queue, texture_heap);
 
 	create_swapchain(state, WIDTH, HEIGHT);
 	{ // create_render_pass();
