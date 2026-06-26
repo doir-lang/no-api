@@ -41,7 +41,7 @@ struct GpuVulkanDefault {
 	uint32_t graphics_queue_family;
 };
 std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkan(
-	std::function_ref<VkSurfaceKHR(VkInstance)> surface_loader, std::span<const char*> extra_extensions = {}, std::span<const char*> extra_layers = {}, bool debug = true
+	std::function_ref<VkSurfaceKHR(VkInstance)> surface_loader, std::span<const char*> instance_extensions = {}, std::span<const char*> extra_layers = {}, std::span<const char*> device_extensions = {}, bool debug = true
 );
 
 inline VkPhysicalDeviceFeatures gpuEnableRequiredVulkanFeatures(VkPhysicalDeviceFeatures features) {
@@ -62,6 +62,29 @@ inline VkPhysicalDeviceVulkan13Features gpuEnableRequiredVulkan13Features(VkPhys
 	return features;
 }
 
+inline VkPhysicalDeviceVulkan14Features gpuEnableRequiredVulkan14Features(VkPhysicalDeviceVulkan14Features features) {
+	features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
+	features.pushDescriptor = true;
+	return features;
+}
+
+inline std::vector<const char*> gpuRequiredVulkanDeviceExtensions() {
+	return {"VK_EXT_descriptor_heap", "VK_KHR_shader_untyped_pointers"};
+}
+
+inline void* gpuRequiredVulkanDeviceCreateInfoPnext() {
+	static VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptor_heap_info {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT,
+		.descriptorHeap = true
+	};
+	static VkPhysicalDeviceShaderUntypedPointersFeaturesKHR untyped_pointers_info {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR,
+		.pNext = &descriptor_heap_info,
+		.shaderUntypedPointers = true
+	};
+	return &untyped_pointers_info;
+}
+
 struct GpuQueue {
 	VkPhysicalDevice gpu;
 	VkDevice device;
@@ -74,17 +97,19 @@ struct GpuQueue {
 	// Memory Allocator
 	VmaAllocator allocator = VK_NULL_HANDLE;
 	// Mapping from gpu* (Device Addresses) to buffer allocations
-	std::unordered_map<VkDeviceAddress, std::pair<VkBuffer, VmaAllocation>> allocations;
+	std::unordered_map<VkDeviceAddress, std::tuple<VkBuffer, VmaAllocation, VkDeviceSize>> allocations;
+	// Mapping from gpu* (Device Addresses) to a mapped descriptor heap
+	std::unordered_map<VkDeviceAddress, std::tuple<VkBuffer, VmaAllocation, VkDeviceSize, VkDeviceAddress>> descriptor_heaps;
+	VkDeviceSize minimum_descriptor_heap_size = 0;
 	// Mappings between cpu and gpu pointers
 	std::unordered_map<void*, VkDeviceAddress> host2gpu;
 	std::unordered_map<VkDeviceAddress, void*> gpu2host;
+	std::unordered_map<VkDeviceAddress, VkImage> gpu2image;
 
 	VkCommandPool command_pool = VK_NULL_HANDLE;
 	VkSemaphore command_submission_timeline_semaphore = VK_NULL_HANDLE;
 	uint64_t command_submission_timeline_semaphore_next_value = 1;
 	std::vector<std::pair<VkCommandBuffer, uint64_t>> command_buffers_pending_free;
-
-	VkPipelineLayout pipeline_layout = VK_NULL_HANDLE; // TODO: Needs to be freed! // TODO: Do we need seperate ones for compute and graphics?
 };
 std::optional<GpuQueue> gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue = VK_NULL_HANDLE, uint32_t queue_family = -1, VkAllocationCallbacks* callbacks = nullptr, bool is_graphics_queue = true);
 inline std::optional<GpuQueue> gpuCreateQueue(const GpuVulkanDefault& vulkan, VkAllocationCallbacks* callbacks = nullptr) {
@@ -94,6 +119,11 @@ inline std::optional<GpuQueue> gpuCreateQueue(const GpuVulkanDefault& vulkan, Vk
 struct GpuPipeline {
 	// VkShaderModule compute_module; // TODO: Do we have a need to carry this around?
 	VkPipeline pipeline;
+};
+
+struct GpuTexture {
+	VkImage image;
+	GpuTextureDesc descriptor;
 };
 
 struct GpuCommandBuffer {
