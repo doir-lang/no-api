@@ -60,7 +60,7 @@ struct render_state {
 	VkInstance instance = {};
 	VkDebugUtilsMessengerEXT debug_messenger = {};
 	VkSurfaceKHR surface = {};
-	GpuQueue graphics_queue = {};
+	GpuQueue* graphics_queue = {};
 
 	VkSwapchainKHR swapchain = {};
 	VkFormat swapchain_format = {};
@@ -133,12 +133,12 @@ static VkShaderModule create_shader_module(render_state& state, const std::vecto
 		.pCode = spv.data(),
 	};
 	VkShaderModule out;
-	VK_CHECK(vkCreateShaderModule(state.graphics_queue.device, &info, nullptr, &out));
+	VK_CHECK(vkCreateShaderModule(state.graphics_queue->device, &info, nullptr, &out), nullptr);
 	return out;
 }
 
 void create_swapchain(render_state& state, int width, int height) {
-	vkb::SwapchainBuilder builder{state.graphics_queue.gpu, state.graphics_queue.device, state.surface, state.graphics_queue.queue_family};
+	vkb::SwapchainBuilder builder{state.graphics_queue->gpu, state.graphics_queue->device, state.surface, state.graphics_queue->queue_family};
 	auto swap = builder
 		.set_old_swapchain(state.swapchain)
 		.use_default_present_mode_selection()
@@ -157,7 +157,7 @@ void create_swapchain(render_state& state, int width, int height) {
 	VkSemaphoreCreateInfo semaphore_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
 	state.swapchain_render_finished_semaphore.resize(state.swapchain_images.size());
 	for (auto& sema : state.swapchain_render_finished_semaphore)
-		VK_CHECK(vkCreateSemaphore(state.graphics_queue.device, &semaphore_info, nullptr, &sema));
+		VK_CHECK(vkCreateSemaphore(state.graphics_queue->device, &semaphore_info, nullptr, &sema), /*nothing*/);
 }
 
 void create_pipeline(render_state& state) {
@@ -222,7 +222,7 @@ void create_pipeline(render_state& state) {
 	VkPipelineLayoutCreateInfo layoutInfo = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
 	};
-	VK_CHECK(vkCreatePipelineLayout(state.graphics_queue.device, &layoutInfo, nullptr, &state.pipeline_layout));
+	VK_CHECK(vkCreatePipelineLayout(state.graphics_queue->device, &layoutInfo, nullptr, &state.pipeline_layout), /*nothing*/);
 
 	VkGraphicsPipelineCreateInfo pipeInfo = {
 		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
@@ -238,11 +238,11 @@ void create_pipeline(render_state& state) {
 		.renderPass = state.render_pass,
 		.subpass = 0,
 	};
-	VK_CHECK(vkCreateGraphicsPipelines(state.graphics_queue.device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &state.pipeline));
+	VK_CHECK(vkCreateGraphicsPipelines(state.graphics_queue->device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &state.pipeline), /*nothing*/);
 
 	// Shader modules are only needed during pipeline creation
-	vkDestroyShaderModule(state.graphics_queue.device, vertex_module, nullptr);
-	vkDestroyShaderModule(state.graphics_queue.device, fragment_module, nullptr);
+	vkDestroyShaderModule(state.graphics_queue->device, vertex_module, nullptr);
+	vkDestroyShaderModule(state.graphics_queue->device, fragment_module, nullptr);
 }
 
 void create_framebuffers(render_state& state) {
@@ -257,14 +257,14 @@ void create_framebuffers(render_state& state) {
 			.height = state.swapchain_extent.height,
 			.layers = 1,
 		};
-		VK_CHECK(vkCreateFramebuffer(state.graphics_queue.device, &fbInfo, nullptr, &state.framebuffers[i]));
+		VK_CHECK(vkCreateFramebuffer(state.graphics_queue->device, &fbInfo, nullptr, &state.framebuffers[i]), /*nothing*/);
 	}
 }
 
 void init_vulkan(render_state& state) {
 	auto vk = gpuSetupDefaultVulkan([&state](VkInstance instance) -> VkSurfaceKHR{
 		VkSurfaceKHR out;
-		VK_CHECK(glfwCreateWindowSurface(instance, state.window, nullptr, &out));
+		VK_CHECK(glfwCreateWindowSurface(instance, state.window, nullptr, &out), nullptr);
 		return out;
 	});
 	if(!vk) throw std::runtime_error(vk.error());
@@ -274,7 +274,7 @@ void init_vulkan(render_state& state) {
 
 	auto queue = gpuCreateQueue(*vk);
 	if(!queue) throw std::runtime_error("Failed to create noapi queue");
-	state.graphics_queue = std::move(*queue);
+	state.graphics_queue = queue;
 
 	auto upload = gpuMalloc<float>(state.graphics_queue, 16);
 	gpu* upload_gpu = gpuHostToDevicePointer(state.graphics_queue, upload);
@@ -325,17 +325,17 @@ void init_vulkan(render_state& state) {
 		}
 	)glsl");
 
-	GpuPipeline pipeline = gpuCreateComputePipeline(state.graphics_queue, {(std::byte*)glsl.data(), glsl.size() * sizeof(glsl[0])});
-	GpuCommandBuffer cmd = gpuStartCommandRecording(state.graphics_queue);
+	GpuPipeline* pipeline = gpuCreateComputePipeline(state.graphics_queue, {(std::byte*)glsl.data(), glsl.size() * sizeof(glsl[0])});
+	GpuCommandBuffer* cmd = gpuStartCommandRecording(state.graphics_queue);
 
 	gpuSetActiveTextureHeapPtr(cmd, texture_heap_gpu, true);
 	gpuSetPipeline(cmd, pipeline);
 	gpuDispatch(cmd, upload_gpu, {1, 1, 1});
 	gpuMemCpy(cmd, download_gpu, upload_gpu, 16 * sizeof(float));
 
-	gpuSubmit(state.graphics_queue, {&cmd, 1});
+	auto submission_index = gpuSubmit(state.graphics_queue, {&cmd, 1});
+	gpuWaitSemaphore(state.graphics_queue, gpuGetSubmissionTimelineSemaphore(state.graphics_queue), submission_index);
 
-	vkDeviceWaitIdle(state.graphics_queue.device);
 	auto dbg_up = upload[5];
 	auto dbg_down = download[5];
 	gpuDestroyPipeline(state.graphics_queue, pipeline);
@@ -384,7 +384,7 @@ void init_vulkan(render_state& state) {
 			.dependencyCount = 1,
 			.pDependencies = &dep,
 		};
-		VK_CHECK(vkCreateRenderPass(state.graphics_queue.device, &rpInfo, nullptr, &state.render_pass));
+		VK_CHECK(vkCreateRenderPass(state.graphics_queue->device, &rpInfo, nullptr, &state.render_pass), /*nothing*/);
 	}
 	create_pipeline(state);
 	create_framebuffers(state);
@@ -392,9 +392,9 @@ void init_vulkan(render_state& state) {
 		VkCommandPoolCreateInfo info = {
 			.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 			.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-			.queueFamilyIndex = state.graphics_queue.queue_family,
+			.queueFamilyIndex = state.graphics_queue->queue_family,
 		};
-		VK_CHECK(vkCreateCommandPool(state.graphics_queue.device, &info, nullptr, &state.command_pool));
+		VK_CHECK(vkCreateCommandPool(state.graphics_queue->device, &info, nullptr, &state.command_pool), /*nothing*/);
 	}{ // allocate_command_buffers();
 		VkCommandBufferAllocateInfo info = {
 			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -402,7 +402,7 @@ void init_vulkan(render_state& state) {
 			.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 			.commandBufferCount = FRAMES_IN_FLIGHT,
 		};
-		VK_CHECK(vkAllocateCommandBuffers(state.graphics_queue.device, &info, state.command_buffers.data()));
+		VK_CHECK(vkAllocateCommandBuffers(state.graphics_queue->device, &info, state.command_buffers.data()), /*nothing*/);
 	}{ // create_sync_objects();
 		VkSemaphoreCreateInfo sema{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
 		VkFenceCreateInfo fence{
@@ -411,19 +411,19 @@ void init_vulkan(render_state& state) {
 		};
 
 		for (int i = 0; i < FRAMES_IN_FLIGHT; ++i) {
-			VK_CHECK(vkCreateSemaphore(state.graphics_queue.device, &sema, nullptr, &state.image_available_semaphore[i]));
-			VK_CHECK(vkCreateFence (state.graphics_queue.device, &fence, nullptr, &state.render_fence[i]));
+			VK_CHECK(vkCreateSemaphore(state.graphics_queue->device, &sema, nullptr, &state.image_available_semaphore[i]), /*nothing*/);
+			VK_CHECK(vkCreateFence (state.graphics_queue->device, &fence, nullptr, &state.render_fence[i]), /*nothing*/);
 		}
 	}
 }
 
 void cleanup_swapchain(render_state& state) {
 	for (auto sema : state.swapchain_render_finished_semaphore)
-		vkDestroySemaphore(state.graphics_queue.device, sema, nullptr);
+		vkDestroySemaphore(state.graphics_queue->device, sema, nullptr);
 	state.swapchain_render_finished_semaphore.clear();
-	for (auto fb : state.framebuffers) vkDestroyFramebuffer(state.graphics_queue.device, fb, nullptr);
+	for (auto fb : state.framebuffers) vkDestroyFramebuffer(state.graphics_queue->device, fb, nullptr);
 	state.framebuffers.clear();
-	for (auto iv : state.swapchain_views) vkDestroyImageView(state.graphics_queue.device, iv, nullptr);
+	for (auto iv : state.swapchain_views) vkDestroyImageView(state.graphics_queue->device, iv, nullptr);
 	state.swapchain_views.clear();
 }
 
@@ -434,7 +434,7 @@ void recreate_swapchain(render_state& state) {
 		glfwGetFramebufferSize(state.window, &w, &h);
 		glfwWaitEvents();
 	}
-	vkDeviceWaitIdle(state.graphics_queue.device);
+	vkDeviceWaitIdle(state.graphics_queue->device);
 	cleanup_swapchain(state);
 	create_swapchain(state, w, h);
 	create_framebuffers(state);
@@ -442,17 +442,17 @@ void recreate_swapchain(render_state& state) {
 
 void cleanup(render_state& state) {
 	for (int i = 0; i < FRAMES_IN_FLIGHT; ++i) {
-		vkDestroySemaphore(state.graphics_queue.device, state.image_available_semaphore[i], nullptr);
-		vkDestroyFence (state.graphics_queue.device, state.render_fence[i], nullptr);
+		vkDestroySemaphore(state.graphics_queue->device, state.image_available_semaphore[i], nullptr);
+		vkDestroyFence (state.graphics_queue->device, state.render_fence[i], nullptr);
 	}
-	vkDestroyCommandPool (state.graphics_queue.device, state.command_pool, nullptr);
+	vkDestroyCommandPool (state.graphics_queue->device, state.command_pool, nullptr);
 	cleanup_swapchain(state);
-	vkDestroyPipeline (state.graphics_queue.device, state.pipeline, nullptr);
-	vkDestroyPipelineLayout(state.graphics_queue.device, state.pipeline_layout, nullptr);
-	vkDestroyRenderPass (state.graphics_queue.device, state.render_pass, nullptr);
+	vkDestroyPipeline (state.graphics_queue->device, state.pipeline, nullptr);
+	vkDestroyPipelineLayout(state.graphics_queue->device, state.pipeline_layout, nullptr);
+	vkDestroyRenderPass (state.graphics_queue->device, state.render_pass, nullptr);
 	gpuDestroyQueue(state.graphics_queue);
 	vkb::destroy_swapchain(state.vkb_swapchain);
-	vkDestroyDevice(state.graphics_queue.device, nullptr);
+	vkDestroyDevice(state.graphics_queue->device, nullptr);
 	vkDestroySurfaceKHR (state.instance, state.surface, nullptr);
 	vkDestroyDebugUtilsMessengerEXT(state.instance, state.debug_messenger, nullptr);
 	vkDestroyInstance(state.instance, nullptr);
@@ -465,22 +465,22 @@ void cleanup(render_state& state) {
 void draw_frame(render_state& state) {
 	size_t frame_index = state.current_frame % FRAMES_IN_FLIGHT;
 	VkFence fence = state.render_fence[frame_index];
-	vkWaitForFences(state.graphics_queue.device, 1, &fence, VK_TRUE, UINT64_MAX);
+	vkWaitForFences(state.graphics_queue->device, 1, &fence, VK_TRUE, UINT64_MAX);
 
 	uint32_t image_index = {};
-	VkResult result = vkAcquireNextImageKHR(state.graphics_queue.device, state.swapchain, UINT64_MAX, state.image_available_semaphore[frame_index], VK_NULL_HANDLE, &image_index);
+	VkResult result = vkAcquireNextImageKHR(state.graphics_queue->device, state.swapchain, UINT64_MAX, state.image_available_semaphore[frame_index], VK_NULL_HANDLE, &image_index);
 	if (result == VK_ERROR_OUT_OF_DATE_KHR) { recreate_swapchain(state); return; }
 	if ( !(result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) )
 		throw std::runtime_error("vkAcquireNextImageKHR failed");
 
-	vkResetFences(state.graphics_queue.device, 1, &fence);
+	vkResetFences(state.graphics_queue->device, 1, &fence);
 
 	VkCommandBuffer cmd = state.command_buffers[frame_index];
 	vkResetCommandBuffer(cmd, 0);
 
 	VkCommandBufferBeginInfo cmd_begin = {};
 	cmd_begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	VK_CHECK(vkBeginCommandBuffer(cmd, &cmd_begin));
+	VK_CHECK(vkBeginCommandBuffer(cmd, &cmd_begin), /*nothing*/);
 
 	VkClearValue clear_color{{{0.0f, 0.0f, 0.0f, 1.0f}}};
 	VkRenderPassBeginInfo rp_begin = {
@@ -496,7 +496,7 @@ void draw_frame(render_state& state) {
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, state.pipeline);
 	vkCmdDraw(cmd, 3, 1, 0, 0);
 	vkCmdEndRenderPass(cmd);
-	VK_CHECK(vkEndCommandBuffer(cmd));
+	VK_CHECK(vkEndCommandBuffer(cmd), /*nothing*/);
 
 	{ // Submit queue
 		VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -510,7 +510,7 @@ void draw_frame(render_state& state) {
 			.signalSemaphoreCount = 1,
 			.pSignalSemaphores = &state.swapchain_render_finished_semaphore[image_index],
 		};
-		VK_CHECK(vkQueueSubmit(state.graphics_queue.queue, 1, &info, fence));
+		VK_CHECK(vkQueueSubmit(state.graphics_queue->queue, 1, &info, fence), /*nothing*/);
 	}{ // Present
 		VkPresentInfoKHR presentInfo = {
 			.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -521,10 +521,10 @@ void draw_frame(render_state& state) {
 			.pImageIndices = &image_index,
 		};
 
-		result = vkQueuePresentKHR(state.graphics_queue.queue, &presentInfo);
+		result = vkQueuePresentKHR(state.graphics_queue->queue, &presentInfo);
 		if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
 			recreate_swapchain(state);
-		else VK_CHECK(result);
+		else VK_CHECK(result, /*nothing*/);
 	}
 
 	state.current_frame++;
@@ -542,7 +542,7 @@ int main() {
 			glfwPollEvents();
 			draw_frame(state);
 		}
-		vkDeviceWaitIdle(state.graphics_queue.device);
+		vkDeviceWaitIdle(state.graphics_queue->device);
 		cleanup(state);
 	} catch (const std::exception& e) {
 		std::println(std::cerr, "Fatal: {}\n", e.what());

@@ -6,12 +6,20 @@
 #include <VkBootstrap.h>
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added
 
+const GpuSemaphore* gpuGetSubmissionTimelineSemaphore(GpuQueue* queue) {
+	return (GpuSemaphore*)&queue->command_submission_timeline_semaphore;
+}
+
+void gpuWaitIdle(GpuQueue* queue) {
+	vkDeviceWaitIdle(queue->device);
+}
+
 struct ComputePipelinePushConstants {
 	gpu* data;
 };
 
-GpuPipeline gpuCreateComputePipeline(GpuQueue& queue, std::span<const std::byte> computeIR) {
-	GpuPipeline out;
+GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, std::span<const std::byte> computeIR) {
+	auto out = (GpuPipeline*)queue->cpu_allocator(nullptr, sizeof(GpuPipeline));
 
 	VkShaderModule compute_module;
 	{
@@ -20,7 +28,7 @@ GpuPipeline gpuCreateComputePipeline(GpuQueue& queue, std::span<const std::byte>
 			.codeSize = computeIR.size(),
 			.pCode = (uint32_t*)computeIR.data(),
 		};
-		VK_CHECK(vkCreateShaderModule(queue.device, &info, queue.callbacks, &compute_module));
+		VK_CHECK(vkCreateShaderModule(queue->device, &info, queue->callbacks, &compute_module), nullptr);
 	}{
 		VkPipelineCreateFlags2CreateInfo create_flags {
 			.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
@@ -36,49 +44,50 @@ GpuPipeline gpuCreateComputePipeline(GpuQueue& queue, std::span<const std::byte>
 				.pName = "main"
 			},
 		};
-		VK_CHECK(vkCreateComputePipelines(queue.device, nullptr, 1, &info, queue.callbacks, &out.pipeline));
+		VK_CHECK(vkCreateComputePipelines(queue->device, nullptr, 1, &info, queue->callbacks, &out->pipeline), nullptr);
 	}
 
-	vkDestroyShaderModule(queue.device, compute_module, queue.callbacks);
+	vkDestroyShaderModule(queue->device, compute_module, queue->callbacks);
 	return out;
 }
 
-void gpuDestroyPipeline(GpuQueue& queue, GpuPipeline& pipeline) {
-	vkDestroyPipeline(queue.device, pipeline.pipeline, queue.callbacks);
+void gpuDestroyPipeline(GpuQueue* queue, GpuPipeline* pipeline) {
+	vkDestroyPipeline(queue->device, pipeline->pipeline, queue->callbacks);
+	queue->cpu_allocator(pipeline, 0);
 }
 
-inline std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress> closest_buffer(GpuQueue& queue, gpu* addr, bool no_offsets) {
+inline std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress> closest_buffer(GpuQueue* queue, gpu* addr, bool no_offsets) {
 	auto address = (VkDeviceAddress)addr;
 	VkDeviceAddress closest = 0; // TODO: There are probably edge cases around setting these to zero!
 	if(no_offsets)
 		closest = address;
-	else for(auto [key, _]: queue.allocations) {
+	else for(auto [key, _]: queue->allocations) {
 		if(closest - address > key - address)
 			closest = key;
 	}
-	return {std::get<VkBuffer>(queue.allocations[closest]), closest - address, address};
+	return {std::get<VkBuffer>(queue->allocations[closest]), closest - address, address};
 }
 
-inline std::array<std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress>, 2> closest_buffer(GpuQueue& queue, gpu* addrA, gpu* addrB, bool no_offsets) {
+inline std::array<std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress>, 2> closest_buffer(GpuQueue* queue, gpu* addrA, gpu* addrB, bool no_offsets) {
 	auto a = (VkDeviceAddress)addrA, b = (VkDeviceAddress)addrB;
 	VkDeviceAddress closestA = 0, closestB = 0; // TODO: There are probably edge cases around setting these to zero!
 	if(no_offsets) {
 		closestA = a;
 		closestB = b;
-	} else for(auto [key, _]: queue.allocations) {
+	} else for(auto [key, _]: queue->allocations) {
 		if(closestA - a > key - a)
 			closestA = key;
 		if(closestB - b > key - b)
 			closestB = key;
 	}
 	return {
-		std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress>{std::get<VkBuffer>(queue.allocations[closestA]), closestA - a, a}, 
-		std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress>{std::get<VkBuffer>(queue.allocations[closestB]), closestB - b, b}
+		std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress>{std::get<VkBuffer>(queue->allocations[closestA]), closestA - a, a}, 
+		std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress>{std::get<VkBuffer>(queue->allocations[closestB]), closestB - b, b}
 	};
 }
 
-void gpuMemCpy(GpuCommandBuffer& cmd, gpu* dest_, gpu* src_, size_t bytes, bool no_offsets /* = false*/) {
-	auto [dest, src] = closest_buffer(*cmd.queue, dest_, src_, no_offsets);
+void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes, bool no_offsets /* = false*/) {
+	auto [dest, src] = closest_buffer(cmd->queue, dest_, src_, no_offsets);
 	auto [dest_buffer, dest_offset, dest_addr] = dest; auto [src_buffer, src_offset, src_addr] = src;
 
 	VkBufferCopy region {
@@ -86,17 +95,15 @@ void gpuMemCpy(GpuCommandBuffer& cmd, gpu* dest_, gpu* src_, size_t bytes, bool 
 		.dstOffset = dest_offset,
 		.size = bytes
 	};
-	vkCmdCopyBuffer(cmd.command_buffer, src_buffer, dest_buffer, 1, &region);
+	vkCmdCopyBuffer(cmd->command_buffer, src_buffer, dest_buffer, 1, &region);
 }
 
-void gpuSetActiveTextureHeapPtr(GpuCommandBuffer& cmd, gpu* textureHeap, bool no_offsets /* = false */) {
-	auto& queue = *cmd.queue;
-
-	auto [source_buffer, offset, source_address] = closest_buffer(queue, textureHeap, no_offsets);
-	auto source_size = std::get<VkDeviceSize>(queue.allocations[source_address]);
+void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap, bool no_offsets /* = false */) {
+	auto [source_buffer, offset, source_address] = closest_buffer(cmd->queue, texture_heap, no_offsets);
+	auto source_size = std::get<VkDeviceSize>(cmd->queue->allocations[source_address]);
 	
-	if(!queue.descriptor_heaps.contains(source_address)) {
-		auto size = std::max<VkDeviceSize>(source_size, queue.minimum_descriptor_heap_size);
+	if(!cmd->queue->descriptor_heaps.contains(source_address)) {
+		auto size = std::max<VkDeviceSize>(source_size, cmd->queue->minimum_descriptor_heap_size);
 		VkBufferCreateInfo buffer_info {
 			.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
 			.size = size,
@@ -107,24 +114,24 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer& cmd, gpu* textureHeap, bool no
 			.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
 		};
 
-		auto& [buffer, allocation, heap_size, heap_address] = queue.descriptor_heaps[source_address];
+		auto& [buffer, allocation, heap_size, heap_address] = cmd->queue->descriptor_heaps[source_address];
 		heap_size = size;
-		VK_CHECK(vmaCreateBuffer(queue.allocator, &buffer_info, &alloc_info, &buffer, &allocation, nullptr));
+		VK_CHECK(vmaCreateBuffer(cmd->queue->gpu_allocator, &buffer_info, &alloc_info, &buffer, &allocation, nullptr), /*nothing*/);
 
 		VkBufferDeviceAddressInfo address_info {
 			.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
 			.buffer = buffer
 		};
-		heap_address = vkGetBufferDeviceAddress(queue.device, &address_info);
+		heap_address = vkGetBufferDeviceAddress(cmd->queue->device, &address_info);
 	}
 
-	auto [heap_buffer, _allocation, heap_size, heap_address] = queue.descriptor_heaps[source_address];
+	auto [heap_buffer, _allocation, heap_size, heap_address] = cmd->queue->descriptor_heaps[source_address];
 	VkBufferCopy copy {
 		.srcOffset = offset,
 		.dstOffset = offset,
 		.size = source_size - offset
 	};
-	vkCmdCopyBuffer(cmd.command_buffer, source_buffer, heap_buffer, 1, &copy);
+	vkCmdCopyBuffer(cmd->command_buffer, source_buffer, heap_buffer, 1, &copy);
 
 	// TODO: Do we need a barrier here?
 
@@ -134,9 +141,9 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer& cmd, gpu* textureHeap, bool no
 			.address = heap_address + offset,
 			.size = heap_size - offset
 		},
-		.reservedRangeSize = queue.minimum_descriptor_heap_size
+		.reservedRangeSize = cmd->queue->minimum_descriptor_heap_size
 	};
-	vkCmdBindResourceHeapEXT(cmd.command_buffer, &heap_info);
+	vkCmdBindResourceHeapEXT(cmd->command_buffer, &heap_info);
 }
 
 inline VkPipelineStageFlags2KHR stage2vulkan(STAGE stage) {
@@ -208,7 +215,7 @@ inline std::pair<VkAccessFlags2KHR, VkAccessFlags2KHR> hazard2access(HAZARD_FLAG
 	return {src_access, dst_access};
 }
 
-void gpuBarrier(GpuCommandBuffer& cmd, STAGE before, STAGE after, HAZARD_FLAGS hazards) {
+void gpuBarrier(GpuCommandBuffer* cmd, STAGE before, STAGE after, HAZARD_FLAGS hazards) {
 	VkPipelineStageFlags2KHR src_stage = stage2vulkan(before);
 	VkPipelineStageFlags2KHR dst_stage = stage2vulkan(after);
 	auto [src_access, dst_access] = hazard2access(hazards);
@@ -232,22 +239,22 @@ void gpuBarrier(GpuCommandBuffer& cmd, STAGE before, STAGE after, HAZARD_FLAGS h
 		.imageMemoryBarrierCount = 0,
 		.pImageMemoryBarriers = nullptr,
 	};
-	vkCmdPipelineBarrier2KHR(cmd.command_buffer, &dependency);
+	vkCmdPipelineBarrier2KHR(cmd->command_buffer, &dependency);
 }
 
-void gpuSignalAfter(GpuCommandBuffer& cmd, STAGE before, void* ptrGpu, uint64_t value, SIGNAL signal) {
+void gpuSignalAfter(GpuCommandBuffer* cmd, STAGE before, void* ptrGpu, uint64_t value, SIGNAL signal) {
 	throw std::runtime_error("Not implemented yet!");
 }
 
-void gpuWaitBefore(GpuCommandBuffer& cmd, STAGE after, void* ptrGpu, uint64_t value, OP op, HAZARD_FLAGS hazards /* = (HAZARD_FLAGS)0 */, uint64_t mask /* = ~uint64_t(0) */) {
+void gpuWaitBefore(GpuCommandBuffer* cmd, STAGE after, void* ptrGpu, uint64_t value, OP op, HAZARD_FLAGS hazards /* = (HAZARD_FLAGS)0 */, uint64_t mask /* = ~uint64_t(0) */) {
 	throw std::runtime_error("Not implemented yet!");
 }
 
-void gpuSetPipeline(GpuCommandBuffer& cmd, GpuPipeline pipeline) {
-	vkCmdBindPipeline(cmd.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline) {
+	vkCmdBindPipeline(cmd->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
 }
 
-void gpuDispatch(GpuCommandBuffer& cmd, gpu* dataGpu, uvec3 gridDimensions) {
+void gpuDispatch(GpuCommandBuffer* cmd, gpu* dataGpu, uvec3 gridDimensions) {
 	ComputePipelinePushConstants data {
 		.data = dataGpu
 	};
@@ -259,11 +266,11 @@ void gpuDispatch(GpuCommandBuffer& cmd, gpu* dataGpu, uvec3 gridDimensions) {
 			.size = sizeof(ComputePipelinePushConstants)
 		}
 	};
-	vkCmdPushDataEXT(cmd.command_buffer, &info);
-	vkCmdDispatch(cmd.command_buffer, gridDimensions.x, gridDimensions.y, gridDimensions.z);
+	vkCmdPushDataEXT(cmd->command_buffer, &info);
+	vkCmdDispatch(cmd->command_buffer, gridDimensions.x, gridDimensions.y, gridDimensions.z);
 }
 
-void gpuDispatchIndirect(GpuCommandBuffer& cmd, gpu* dataGpu, gpu* gridDimensionsGpu, bool no_offsets /* = false*/) {
+void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* dataGpu, gpu* gridDimensionsGpu, bool no_offsets /* = false*/) {
 	ComputePipelinePushConstants data {
 		.data = dataGpu
 	};
@@ -275,8 +282,8 @@ void gpuDispatchIndirect(GpuCommandBuffer& cmd, gpu* dataGpu, gpu* gridDimension
 			.size = sizeof(ComputePipelinePushConstants)
 		}
 	};
-	vkCmdPushDataEXT(cmd.command_buffer, &info);
+	vkCmdPushDataEXT(cmd->command_buffer, &info);
 
-	auto [buffer, offset, _address] = closest_buffer(*cmd.queue, gridDimensionsGpu, no_offsets);
-	vkCmdDispatchIndirect(cmd.command_buffer, buffer, offset);
+	auto [buffer, offset, _address] = closest_buffer(cmd->queue, gridDimensionsGpu, no_offsets);
+	vkCmdDispatchIndirect(cmd->command_buffer, buffer, offset);
 }

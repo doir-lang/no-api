@@ -63,8 +63,12 @@ std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkan(std::function
 	return out;
 }
 
-std::optional<GpuQueue> gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue /* = VK_NULL_HANDLE */, uint32_t queue_family /* = -1 */, VkAllocationCallbacks* callbacks /* = nullptr */, bool is_graphics_queue /* = true */) {
-	GpuQueue out {
+std::optional<GpuSemaphore> gpuCreateSemaphoreImpl(GpuQueue* queue, uint64_t init_value);
+
+GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue /* = VK_NULL_HANDLE */, uint32_t queue_family /* = -1 */, GpuAllocatorFunc allocator /* = default_::gpu_allocator */, VkAllocationCallbacks* callbacks /* = nullptr */, bool is_graphics_queue /* = true */) {
+	auto out = (GpuQueue*)allocator(nullptr, sizeof(GpuQueue));
+	new(out) GpuQueue {
+		.cpu_allocator = allocator,
 		.gpu = gpu,
 		.device = device,
 		.queue = queue,
@@ -73,26 +77,25 @@ std::optional<GpuQueue> gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu
 		.callbacks = callbacks
 	};
 
-	if(volkInitialize() != VK_SUCCESS)
-		return {};
+	VK_CHECK(volkInitialize(), nullptr);
 	volkLoadInstance(instance);
-	volkLoadDevice(out.device);
+	volkLoadDevice(out->device);
 
 	// Find queue if one wasn't already provided
-	if(!out.queue) {
+	if(!out->queue) {
 		uint32_t count;
 		vkGetPhysicalDeviceQueueFamilyProperties(gpu, &count, nullptr);
 		std::vector<VkQueueFamilyProperties> families(count);
 		vkGetPhysicalDeviceQueueFamilyProperties(gpu, &count, families.data());
 
 		vkb::Device device;
-		device.device = out.device;
+		device.device = out->device;
 		device.queue_families = std::move(families);
 
 		if(auto r = device.get_queue_index(is_graphics_queue ? vkb::QueueType::graphics : vkb::QueueType::compute); r.has_value())
-			out.queue_family = r.value();
+			out->queue_family = r.value();
 		else return {};
-		vkGetDeviceQueue(out.device, out.queue_family, 0, &out.queue);
+		vkGetDeviceQueue(out->device, out->queue_family, 0, &out->queue);
 	}
 
 	// VMA
@@ -103,17 +106,17 @@ std::optional<GpuQueue> gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu
 
 	VmaAllocatorCreateInfo vma_info = {
 		.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
-		.physicalDevice = out.gpu,
-		.device = out.device,
-		.pAllocationCallbacks = out.callbacks,
+		.physicalDevice = out->gpu,
+		.device = out->device,
+		.pAllocationCallbacks = out->callbacks,
 		.pVulkanFunctions = &functions,
 		.instance = instance,
 		.vulkanApiVersion = VK_API_VERSION_1_3,
 	};
-	if(vmaCreateAllocator(&vma_info, &out.allocator) != VK_SUCCESS)
+	if(vmaCreateAllocator(&vma_info, &out->gpu_allocator) != VK_SUCCESS)
 		return {};
 
-	out.command_submission_timeline_semaphore = gpuCreateSemaphore(out, 0).semaphore;
+	out->command_submission_timeline_semaphore = gpuCreateSemaphoreImpl(out, 0)->semaphore;
 
 	VkPhysicalDeviceDescriptorHeapPropertiesEXT heap_properties {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT,
@@ -123,61 +126,63 @@ std::optional<GpuQueue> gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu
 		.pNext = &heap_properties
 	};
 	vkGetPhysicalDeviceProperties2(gpu, &properties);
-	out.minimum_descriptor_heap_size = heap_properties.minResourceHeapReservedRange;
+	out->minimum_descriptor_heap_size = heap_properties.minResourceHeapReservedRange;
 
 	return out;
 }
 
-void gpuDestroyQueue(GpuQueue& queue) {
-	if(queue.command_pool)
-		vkDestroyCommandPool(queue.device, queue.command_pool, queue.callbacks);
-	if(queue.command_submission_timeline_semaphore)
-		vkDestroySemaphore(queue.device, queue.command_submission_timeline_semaphore, queue.callbacks);
+void gpuDestroyQueue(GpuQueue* queue) {
+	if(queue->command_pool)
+		vkDestroyCommandPool(queue->device, queue->command_pool, queue->callbacks);
+	if(queue->command_submission_timeline_semaphore)
+		vkDestroySemaphore(queue->device, queue->command_submission_timeline_semaphore, queue->callbacks);
 
-	if(queue.allocator)
-		vmaDestroyAllocator(queue.allocator);
+	if(queue->gpu_allocator)
+		vmaDestroyAllocator(queue->gpu_allocator);
+	queue->cpu_allocator(queue, 0);
 }
 
-GpuCommandBuffer gpuStartCommandRecording(GpuQueue& queue) {
-	if(!queue.command_pool) {
+GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
+	if(!queue->command_pool) {
 		VkCommandPoolCreateInfo info{
 			.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 			.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
-			.queueFamilyIndex = queue.queue_family
+			.queueFamilyIndex = queue->queue_family
 		};
-		VK_CHECK(vkCreateCommandPool(queue.device, &info, queue.callbacks, &queue.command_pool));
+		VK_CHECK(vkCreateCommandPool(queue->device, &info, queue->callbacks, &queue->command_pool), nullptr);
 	}
 
 	// Check the current value of the submission count timeline semaphore and free any buffers who's submission has finished
-	if(!queue.command_buffers_pending_free.empty()) {
+	if(!queue->command_buffers_pending_free.empty()) {
 		uint64_t current_finished_submission;
-		vkGetSemaphoreCounterValue(queue.device, queue.command_submission_timeline_semaphore, &current_finished_submission);
+		vkGetSemaphoreCounterValue(queue->device, queue->command_submission_timeline_semaphore, &current_finished_submission);
 
 		// TODO: Would it be worth the effort to deduplicate?
 
-		std::vector<VkCommandBuffer> to_free; to_free.reserve(queue.command_buffers_pending_free.size());
-		for(auto [cmd, submit]: queue.command_buffers_pending_free)
+		std::vector<VkCommandBuffer> to_free; to_free.reserve(queue->command_buffers_pending_free.size());
+		for(auto [cmd, submit]: queue->command_buffers_pending_free)
 			if(submit <= current_finished_submission)
 				to_free.push_back(cmd);
 
 		if(!to_free.empty())
-			vkFreeCommandBuffers(queue.device, queue.command_pool, to_free.size(), to_free.data());
+			vkFreeCommandBuffers(queue->device, queue->command_pool, to_free.size(), to_free.data());
 	}
 
-	GpuCommandBuffer out {.queue = &queue};
+	auto out = (GpuCommandBuffer*)queue->cpu_allocator(nullptr, sizeof(GpuCommandBuffer));
+	*out = {.queue = queue};
 	VkCommandBufferAllocateInfo info {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-		.commandPool = queue.command_pool,
+		.commandPool = queue->command_pool,
 		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 		.commandBufferCount = 1
 	};
-	VK_CHECK(vkAllocateCommandBuffers(queue.device, &info, &out.command_buffer));
+	VK_CHECK(vkAllocateCommandBuffers(queue->device, &info, &out->command_buffer), nullptr);
 
 	VkCommandBufferBeginInfo begin {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
 	};
-	VK_CHECK(vkBeginCommandBuffer(out.command_buffer, &begin));
+	VK_CHECK(vkBeginCommandBuffer(out->command_buffer, &begin), nullptr);
 	return out;
 }
 
@@ -185,24 +190,24 @@ void gpuDestoryCommandBuffer(GpuCommandBuffer& cmd) {
 	vkFreeCommandBuffers(cmd.queue->device, cmd.queue->command_pool, 1, &cmd.command_buffer);
 }
 
-void gpuSubmitNoDestroy(GpuQueue& queue, std::span<GpuCommandBuffer> commandBuffers, std::optional<GpuSemaphore&> semaphore /* = std::nullopt */, uint64_t signalValue /* = 0 */) {
+uint64_t gpuSubmitNoDestroy(GpuQueue* queue, std::span<GpuCommandBuffer*> commandBuffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signalValue /* = 0 */) {
 	std::vector<VkCommandBufferSubmitInfo> submits; submits.reserve(commandBuffers.size());
 	for(auto& cmd: commandBuffers) {
-		if(!cmd.ended) {
-			vkEndCommandBuffer(cmd.command_buffer);
-			cmd.ended = true;
+		if(!cmd->ended) {
+			vkEndCommandBuffer(cmd->command_buffer);
+			cmd->ended = true;
 		}
 		submits.emplace_back(VkCommandBufferSubmitInfo{
 			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-			.commandBuffer = cmd.command_buffer
+			.commandBuffer = cmd->command_buffer
 		});
 	}
 
 	std::array<VkSemaphoreSubmitInfo, 2> signals {
 		VkSemaphoreSubmitInfo{
 			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-			.semaphore = queue.command_submission_timeline_semaphore,
-			.value = queue.command_submission_timeline_semaphore_next_value++,
+			.semaphore = queue->command_submission_timeline_semaphore,
+			.value = queue->command_submission_timeline_semaphore_next_value,
 			.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
 		}
 	};
@@ -221,35 +226,44 @@ void gpuSubmitNoDestroy(GpuQueue& queue, std::span<GpuCommandBuffer> commandBuff
 		.signalSemaphoreInfoCount = static_cast<uint32_t>(semaphore ? 2 : 1),
 		.pSignalSemaphoreInfos = signals.data(),
 	};
-	VK_CHECK(vkQueueSubmit2(queue.queue, 1, &info, nullptr));
+	VK_CHECK(vkQueueSubmit2(queue->queue, 1, &info, nullptr), queue->command_submission_timeline_semaphore_next_value);
+	return queue->command_submission_timeline_semaphore_next_value++;
 }
 
-void gpuSubmit(GpuQueue& queue, std::span<GpuCommandBuffer> commandBuffers, std::optional<GpuSemaphore&> semaphore /* = std::nullopt */, uint64_t signalValue /* = 0 */) {
-	gpuSubmitNoDestroy(queue, commandBuffers, semaphore, signalValue);
+uint64_t gpuSubmit(GpuQueue* queue, std::span<GpuCommandBuffer*> commandBuffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signalValue /* = 0 */) {
+	auto submission_index = gpuSubmitNoDestroy(queue, commandBuffers, semaphore, signalValue);
 
 	for(auto& cmd: commandBuffers)
-		queue.command_buffers_pending_free.emplace_back(cmd.command_buffer, queue.command_submission_timeline_semaphore_next_value - 1); // -1 since it was incremented in the no destroy call
+		queue->command_buffers_pending_free.emplace_back(cmd->command_buffer, submission_index); 
+	return submission_index;
 }
 
-GpuSemaphore gpuCreateSemaphore(GpuQueue& queue, uint64_t initValue) {
+std::optional<GpuSemaphore> gpuCreateSemaphoreImpl(GpuQueue* queue, uint64_t init_value) {
 	GpuSemaphore out;
 
 	VkSemaphoreTypeCreateInfo semaphore_type{};
 	semaphore_type.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
 	semaphore_type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-	semaphore_type.initialValue = initValue; // Starting timeline value
+	semaphore_type.initialValue = init_value; // Starting timeline value
 
 	VkSemaphoreCreateInfo info{};
 	info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 	info.pNext = &semaphore_type;
-	VK_CHECK(vkCreateSemaphore(queue.device, &info, queue.callbacks, &out.semaphore));
+	VK_CHECK(vkCreateSemaphore(queue->device, &info, queue->callbacks, &out.semaphore), {});
 	return out;
 }
+GpuSemaphore* gpuCreateSemaphore(GpuQueue* queue, uint64_t init_value) {
+	if(auto out = gpuCreateSemaphoreImpl(queue, init_value); out) {
+		auto ret = (GpuSemaphore*)queue->cpu_allocator(nullptr, sizeof(GpuSemaphore));
+		*ret = *out;
+		return ret;
+	} else return nullptr;
+}
 
-uint64_t gpuWaitSemaphore(GpuQueue& queue, GpuSemaphore& semaphore, uint64_t value, uint64_t timeout /* = UINT64_MAX */) {
+uint64_t gpuWaitSemaphore(GpuQueue* queue, const GpuSemaphore* semaphore, uint64_t value, uint64_t timeout /* = UINT64_MAX */) {
 	if(value == GPU_GET_VALUE) {
 		uint64_t currentValue;
-		VK_CHECK(vkGetSemaphoreCounterValue(queue.device, semaphore.semaphore, &currentValue));
+		VK_CHECK(vkGetSemaphoreCounterValue(queue->device, semaphore->semaphore, &currentValue), 0);
 		return currentValue;
 	}
 
@@ -257,13 +271,14 @@ uint64_t gpuWaitSemaphore(GpuQueue& queue, GpuSemaphore& semaphore, uint64_t val
 	waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
 	waitInfo.flags = 0;
 	waitInfo.semaphoreCount = 1;
-	waitInfo.pSemaphores = &semaphore.semaphore;
+	waitInfo.pSemaphores = &semaphore->semaphore;
 	waitInfo.pValues = &value;
 
-	VK_CHECK(vkWaitSemaphores(queue.device, &waitInfo, timeout));
+	VK_CHECK(vkWaitSemaphores(queue->device, &waitInfo, timeout), 0);
 	return value;
 }
 
-void gpuDestroySemaphore(GpuQueue& queue, GpuSemaphore& semaphore) {
-	vkDestroySemaphore(queue.device, semaphore.semaphore, queue.callbacks);
+void gpuDestroySemaphore(GpuQueue* queue, GpuSemaphore* semaphore) {
+	vkDestroySemaphore(queue->device, semaphore->semaphore, queue->callbacks);
+	queue->cpu_allocator(semaphore, 0);
 }
