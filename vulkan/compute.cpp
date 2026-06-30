@@ -98,6 +98,64 @@ void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes, bool 
 	vkCmdCopyBuffer(cmd->command_buffer, src_buffer, dest_buffer, 1, &region);
 }
 
+void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* texture, bool no_offsets /* = false */) {
+	auto [dest, src] = closest_buffer(cmd->queue, dest_, src_, no_offsets);
+	auto [dest_buffer, dest_offset, dest_addr] = dest; auto [src_buffer, src_offset, src_addr] = src;
+
+	assert(cmd->queue->gpu2image.contains(dest_addr) && cmd->queue->gpu2image[dest_addr] == texture->image);
+
+	assert(dest_offset == 0); // TODO: Can we relax these restrictions?
+	assert(src_offset == 0);
+
+	// TODO: DO we need a barrier?
+
+	VkBufferImageCopy copy {
+		.bufferOffset = src_offset,
+		.bufferRowLength = static_cast<uint32_t>(std::get<VkDeviceSize>(cmd->queue->allocations[src_addr]) / texture->descriptor.dimensions.y),
+		.bufferImageHeight = texture->descriptor.dimensions.y,
+		.imageSubresource = {
+			.aspectMask = static_cast<VkImageAspectFlags>(gpuFormatIsDepth(texture->descriptor.format) 
+				? VK_IMAGE_ASPECT_DEPTH_BIT | (gpuFormatIsStencil(texture->descriptor.format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)
+				: VK_IMAGE_ASPECT_COLOR_BIT),
+			.mipLevel = 0,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		},
+		.imageOffset = {0, 0, 0},
+		.imageExtent = {texture->descriptor.dimensions.x, texture->descriptor.dimensions.y, texture->descriptor.dimensions.z}
+	};
+	vkCmdCopyBufferToImage(cmd->command_buffer, src_buffer, texture->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+}
+
+void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuTexture* texture, bool no_offsets /* = false */) {
+	auto [dest, src] = closest_buffer(cmd->queue, dest_, src_, no_offsets);
+	auto [dest_buffer, dest_offset, dest_addr] = dest; auto [src_buffer, src_offset, src_addr] = src;
+
+	assert(cmd->queue->gpu2image.contains(src_addr) && cmd->queue->gpu2image[src_addr] == texture->image);
+
+	assert(dest_offset == 0); // TODO: Can we relax these restrictions?
+	assert(src_offset == 0);
+
+	// TODO: DO we need a barrier?
+
+	VkBufferImageCopy copy {
+		.bufferOffset = src_offset,
+		.bufferRowLength = static_cast<uint32_t>(std::get<VkDeviceSize>(cmd->queue->allocations[dest_addr]) / texture->descriptor.dimensions.y),
+		.bufferImageHeight = texture->descriptor.dimensions.y,
+		.imageSubresource = {
+			.aspectMask = static_cast<VkImageAspectFlags>(gpuFormatIsDepth(texture->descriptor.format) 
+				? VK_IMAGE_ASPECT_DEPTH_BIT | (gpuFormatIsStencil(texture->descriptor.format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)
+				: VK_IMAGE_ASPECT_COLOR_BIT),
+			.mipLevel = 0,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		},
+		.imageOffset = {0, 0, 0},
+		.imageExtent = {texture->descriptor.dimensions.x, texture->descriptor.dimensions.y, texture->descriptor.dimensions.z}
+	};
+	vkCmdCopyImageToBuffer(cmd->command_buffer, texture->image, VK_IMAGE_LAYOUT_GENERAL, dest_buffer, 1, &copy);
+}
+
 void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap, bool no_offsets /* = false */) {
 	auto [source_buffer, offset, source_address] = closest_buffer(cmd->queue, texture_heap, no_offsets);
 	auto source_size = std::get<VkDeviceSize>(cmd->queue->allocations[source_address]);
