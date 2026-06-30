@@ -1,6 +1,8 @@
 #pragma once
 
 #include "../surface.hpp"
+#include "../sync.hpp"
+#include "../allocator.hpp"
 
 #include <vulkan/vulkan_core.h>
 #include <vk_mem_alloc.h>
@@ -10,25 +12,13 @@
 #include <expected>
 
 
-#ifndef NOAPI_NO_EXCEPTIONS
-	struct VkResultExecption : std::exception {
-		VkResult result;
-
-		VkResultExecption(VkResult result) : result(result) {}
-	};
-
-	#define VK_CHECK(expr) do {\
-		auto res = expr;\
-		if(res != VK_SUCCESS)\
-			throw VkResultExecption(res);\
-	} while(false)
-#else
-	#define VK_CHECK(expr) do {\
-		auto res = expr;\
-		if(res != VK_SUCCESS)\
-			std::exit((int)res);\
-	} while(false)
-#endif
+#define VK_CHECK(expr, RETURN) do {\
+	auto res = expr;\
+	if(res != VK_SUCCESS) {\
+		errno = res;\
+		return RETURN;\
+	}\
+} while(false)
 
 
 struct GpuVulkanDefault {
@@ -86,6 +76,7 @@ inline void* gpuRequiredVulkanDeviceCreateInfoPnext() {
 }
 
 struct GpuQueue {
+	GpuAllocatorFunc cpu_allocator;
 	VkPhysicalDevice gpu;
 	VkDevice device;
 	VkQueue queue;
@@ -95,7 +86,7 @@ struct GpuQueue {
 	VkAllocationCallbacks* callbacks = nullptr;
 
 	// Memory Allocator
-	VmaAllocator allocator = VK_NULL_HANDLE;
+	VmaAllocator gpu_allocator = VK_NULL_HANDLE;
 	// Mapping from gpu* (Device Addresses) to buffer allocations
 	std::unordered_map<VkDeviceAddress, std::tuple<VkBuffer, VmaAllocation, VkDeviceSize>> allocations;
 	// Mapping from gpu* (Device Addresses) to a mapped descriptor heap
@@ -111,9 +102,9 @@ struct GpuQueue {
 	uint64_t command_submission_timeline_semaphore_next_value = 1;
 	std::vector<std::pair<VkCommandBuffer, uint64_t>> command_buffers_pending_free;
 };
-std::optional<GpuQueue> gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue = VK_NULL_HANDLE, uint32_t queue_family = -1, VkAllocationCallbacks* callbacks = nullptr, bool is_graphics_queue = true);
-inline std::optional<GpuQueue> gpuCreateQueue(const GpuVulkanDefault& vulkan, VkAllocationCallbacks* callbacks = nullptr) {
-	return gpuCreateQueue(vulkan.instance, vulkan.gpu, vulkan.device, vulkan.graphics_queue, vulkan.graphics_queue_family, callbacks, true);
+GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue = VK_NULL_HANDLE, uint32_t queue_family = -1, GpuAllocatorFunc allocator = default_::gpu_allocator, VkAllocationCallbacks* callbacks = nullptr, bool is_graphics_queue = true);
+inline GpuQueue* gpuCreateQueue(const GpuVulkanDefault& vulkan, GpuAllocatorFunc allocator = default_::gpu_allocator, VkAllocationCallbacks* callbacks = nullptr) {
+	return gpuCreateQueue(vulkan.instance, vulkan.gpu, vulkan.device, vulkan.graphics_queue, vulkan.graphics_queue_family, allocator, callbacks, true);
 }
 
 struct GpuPipeline {

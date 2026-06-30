@@ -14,6 +14,8 @@
 
 #include "compute.hpp"
 
+#include <optional>
+
 // ---------------------------------------------------------------------------
 // Basic math types used in the API
 // ---------------------------------------------------------------------------
@@ -308,7 +310,7 @@ struct GpuColorAttachment {
 	* Texture subresource used as the render target.
 	* Must have been created with TEXTURE_USAGE_RENDER_TARGET.
 	*/
-	const GpuTexture& texture;
+	const GpuTexture* texture;
 
 	/**
 	* Mip level to render into.
@@ -326,7 +328,7 @@ struct GpuColorAttachment {
 	* When texture is multisampled and resolveTexture is valid, the rasterized
 	* image is automatically resolved into this texture at the end of the pass.
 	*/
-	std::optional<const GpuTexture&> resolveTexture = std::nullopt;
+	const GpuTexture* resolveTexture = nullptr;
 
 	/**
 	* Load operation performed at render pass begin.
@@ -356,7 +358,7 @@ struct GpuDepthStencilAttachment {
 	* Texture subresource used as the depth/stencil target.
 	* Must have been created with TEXTURE_USAGE_DEPTH_STENCIL.
 	*/
-	const GpuTexture& texture;
+	const GpuTexture* texture;
 
 	/**
 	 * Mip level to render into.
@@ -431,7 +433,7 @@ struct GpuRenderPassDesc {
  * @param pixelIR Pixel shader IR blob.
  * @param desc Rasterizer, format, and optional embedded blend state.
  */
-GpuPipeline gpuCreateGraphicsPipeline(GpuQueue& queue, std::span<const std::byte> vertexIR, std::span<const std::byte> pixelIR, GpuRasterDesc desc);
+GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, std::span<const std::byte> vertexIR, std::span<const std::byte> pixelIR, GpuRasterDesc desc);
 
 /**
  * gpuCreateGraphicsMeshletPipeline – Compile a mesh shader + pixel shader pipeline.
@@ -446,7 +448,7 @@ GpuPipeline gpuCreateGraphicsPipeline(GpuQueue& queue, std::span<const std::byte
  * @param pixelIR Pixel shader IR blob.
  * @param desc Rasterizer, format, and optional embedded blend state.
  */
-// GpuPipeline gpuCreateGraphicsMeshletPipeline(GpuQueue& queue, std::span<const std::byte> meshletIR, std::span<const std::byte> pixelIR, GpuRasterDesc desc);
+// GpuPipeline gpuCreateGraphicsMeshletPipeline(GpuQueue* queue, std::span<const std::byte> meshletIR, std::span<const std::byte> pixelIR, GpuRasterDesc desc);
 // NOTE: WebGPU doesn't yet support mesh shaders!
 
 // ---------------------------------------------------------------------------
@@ -463,7 +465,7 @@ GpuPipeline gpuCreateGraphicsPipeline(GpuQueue& queue, std::span<const std::byte
  * @param queue The GPU queue (device) on which the state object will be created.
  * @param desc Depth/stencil test and write configuration.
  */
-GpuDepthStencilState gpuCreateDepthStencilState(GpuQueue& queue, GpuDepthStencilDesc desc);
+GpuDepthStencilState* gpuCreateDepthStencilState(GpuQueue* queue, GpuDepthStencilDesc desc);
 
 /**
  * gpuCreateBlendState – Bake a blend configuration into a reusable state object.
@@ -475,7 +477,7 @@ GpuDepthStencilState gpuCreateDepthStencilState(GpuQueue& queue, GpuDepthStencil
  * @param queue The GPU queue (device) on which the state object will be created.
  * @param desc Blend equation and factor configuration.
  */
-GpuBlendState gpuCreateBlendState(GpuQueue& queue, GpuBlendDesc desc);
+GpuBlendState* gpuCreateBlendState(GpuQueue* queue, GpuBlendDesc desc);
 
 /**
  * gpuFreeDepthStencilState – Release a GpuDepthStencilState object.
@@ -507,7 +509,7 @@ void gpuFreeBlendState(GpuQueue* queue, GpuBlendState* state);
  * @param cmd Command buffer to record into.
  * @param state Depth/stencil state object to apply, created by gpuCreateDepthStencilState.
  */
-void gpuSetDepthStencilState(GpuCommandBuffer& cb, const GpuDepthStencilState& state);
+void gpuSetDepthStencilState(GpuCommandBuffer* cmd, const GpuDepthStencilState* state);
 
 /**
  * gpuSetBlendState – Apply a pre-baked GpuBlendState for subsequent draw calls on
@@ -520,7 +522,7 @@ void gpuSetDepthStencilState(GpuCommandBuffer& cb, const GpuDepthStencilState& s
  * @param cmd Command buffer to record into.
  * @param state Blend state object to apply, created by gpuCreateBlendState.
  */
-void gpuSetBlendState(GpuCommandBuffer& cb, const GpuBlendState& state);
+void gpuSetBlendState(GpuCommandBuffer* cmd, const GpuBlendState* state);
 
 /**
  * gpuSetViewportEXT – Set the viewport transform used to map clip-space
@@ -568,7 +570,7 @@ void gpuSetScissorRectEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin = {0
  * @param cmd Command buffer to record into.
  * @param desc Render target attachments and their load/store behaviour.
  */
-void gpuBeginRenderPass(GpuCommandBuffer& cb, const GpuRenderPassDesc& desc);
+void gpuBeginRenderPass(GpuCommandBuffer* cmd, const GpuRenderPassDesc* desc);
 
 /**
  * gpuEndRenderPass – End the current render pass and trigger (on TBDR GPUs) tile
@@ -578,7 +580,7 @@ void gpuBeginRenderPass(GpuCommandBuffer& cb, const GpuRenderPassDesc& desc);
  * to read these render targets as textures, the user must call gpuBarrier with
  * STAGE_RASTER_COLOR_OUT / STAGE_RASTER_DEPTH_OUT as the producer stage.
  */
-void gpuEndRenderPass(GpuCommandBuffer& cb);
+void gpuEndRenderPass(GpuCommandBuffer* cmd);
 
 // ---------------------------------------------------------------------------
 // GPU commands – rasterizer draw calls
@@ -643,7 +645,7 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd,
  * A stride of 0 for vertex or pixel data means the same pointer is replicated for
  * every draw (akin to a broadcast), reducing memory if all draws share parameters.
  *
- * @param cb Command buffer to record into.
+ * @param cmd Command buffer to record into.
  * @param dataVxGpu GPU pointer to the array of vertex shader root data structs.
  * @param vxStride Stride between vertex data entries in bytes (0 = broadcast first).
  * @param dataPxGpu GPU pointer to the array of pixel shader root data structs.
@@ -651,7 +653,7 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd,
  * @param argsGpu GPU pointer to an array of indirect draw argument structs.
  * @param drawCountGpu GPU pointer to a uint32 holding the actual draw count.
  */
-void gpuDrawIndexedInstancedIndirectMulti(GpuCommandBuffer& cb,
+void gpuDrawIndexedInstancedIndirectMulti(GpuCommandBuffer* cmd,
  gpu* dataVxGpu, uint32_t vxStride,
  gpu* dataPxGpu, uint32_t pxStride,
  gpu* argsGpu, gpu* drawCountGpu);

@@ -9,7 +9,7 @@
 #include <VkBootstrap.h>
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added
 
-void* gpuMalloc(GpuQueue& queue, size_t bytes, size_t align /* = 16 */, MEMORY memory /* = MEMORY_DEFAULT */) {
+void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY memory /* = MEMORY_DEFAULT */) {
 	constexpr static auto memory_to_allocation_usage = [](MEMORY memory) {
 		switch (memory) {
 		case MEMORY_GPU:
@@ -38,67 +38,67 @@ void* gpuMalloc(GpuQueue& queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 	if(memory == MEMORY_TEXTURE || memory == MEMORY_TEXTURE_READBACK) alloc_info.flags |= VMA_ALLOCATION_CREATE_CAN_ALIAS_BIT; // We can create a texture that is aliased with the buffer
 	VkBuffer buffer;
 	VmaAllocation allocation;
-	VK_CHECK(vmaCreateBufferWithAlignment(queue.allocator, &buffer_info, &alloc_info, align, &buffer, &allocation, nullptr));
+	VK_CHECK(vmaCreateBufferWithAlignment(queue->gpu_allocator, &buffer_info, &alloc_info, align, &buffer, &allocation, nullptr), nullptr);
 
 	VkBufferDeviceAddressInfo address_info {
 		.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
 		.buffer = buffer
 	};
-	auto gpu_ptr = vkGetBufferDeviceAddress(queue.device, &address_info);
+	auto gpu_ptr = vkGetBufferDeviceAddress(queue->device, &address_info);
 
-	queue.allocations[gpu_ptr] = {buffer, allocation, bytes};
+	queue->allocations[gpu_ptr] = {buffer, allocation, bytes};
 
 	if(memory == MEMORY_GPU || memory == MEMORY_TEXTURE)
 		return (void*)gpu_ptr;
 
 	void* cpu_ptr = allocation->GetMappedData();
-	queue.host2gpu[cpu_ptr] = gpu_ptr;
-	queue.gpu2host[gpu_ptr] = cpu_ptr;
+	queue->host2gpu[cpu_ptr] = gpu_ptr;
+	queue->gpu2host[gpu_ptr] = cpu_ptr;
 	return cpu_ptr;
 }
 
-void gpuFree(GpuQueue& queue, void* ptr) {
-	if(queue.host2gpu.contains(ptr)) {
-		gpuFree(queue, (gpu*)queue.host2gpu[ptr]);
+void gpuFree(GpuQueue* queue, void* ptr) {
+	if(queue->host2gpu.contains(ptr)) {
+		gpuFree(queue, (gpu*)queue->host2gpu[ptr]);
 	}
 }
-void gpuFree(GpuQueue& queue, gpu* ptr) {
+void gpuFree(GpuQueue* queue, gpu* ptr) {
 	auto gpu_ptr = (VkDeviceAddress)ptr;
-	if(!queue.allocations.contains(gpu_ptr)) return;
+	if(!queue->allocations.contains(gpu_ptr)) return;
 
-	auto [buffer, allocation, _size] = queue.allocations[gpu_ptr];
-	queue.allocations.erase(gpu_ptr);
+	auto [buffer, allocation, _size] = queue->allocations[gpu_ptr];
+	queue->allocations.erase(gpu_ptr);
 
-	if(queue.gpu2host.contains(gpu_ptr)) {
-		auto host = queue.gpu2host[gpu_ptr];
-		queue.gpu2host.erase(gpu_ptr);
-		queue.host2gpu.erase(host);
+	if(queue->gpu2host.contains(gpu_ptr)) {
+		auto host = queue->gpu2host[gpu_ptr];
+		queue->gpu2host.erase(gpu_ptr);
+		queue->host2gpu.erase(host);
 	}
 
-	if(queue.gpu2image.contains(gpu_ptr)) {
-		auto image = queue.gpu2image[gpu_ptr];
-		vkDestroyImage(queue.device, image, queue.callbacks);
-		queue.gpu2image.erase(gpu_ptr);
+	if(queue->gpu2image.contains(gpu_ptr)) {
+		auto image = queue->gpu2image[gpu_ptr];
+		vkDestroyImage(queue->device, image, queue->callbacks);
+		queue->gpu2image.erase(gpu_ptr);
 	}
 
-	if(queue.descriptor_heaps.contains(gpu_ptr)) {
-		auto [buffer, allocation, _size, _address] = queue.descriptor_heaps[gpu_ptr];
-		vmaDestroyBuffer(queue.allocator, buffer, allocation);
+	if(queue->descriptor_heaps.contains(gpu_ptr)) {
+		auto [buffer, allocation, _size, _address] = queue->descriptor_heaps[gpu_ptr];
+		vmaDestroyBuffer(queue->gpu_allocator, buffer, allocation);
 	}
 
-	vmaDestroyBuffer(queue.allocator, buffer, allocation);
+	vmaDestroyBuffer(queue->gpu_allocator, buffer, allocation);
 }
 
-gpu* gpuHostToDevicePointer(GpuQueue& queue, void* ptr) {
-	if(queue.host2gpu.contains(ptr))
-		return (gpu*)queue.host2gpu[ptr];
+gpu* gpuHostToDevicePointer(GpuQueue* queue, void* ptr) {
+	if(queue->host2gpu.contains(ptr))
+		return (gpu*)queue->host2gpu[ptr];
 	return nullptr;
 }
 
-void* gpuDeviceToHostPointer(GpuQueue& queue, gpu* ptr) {
+void* gpuDeviceToHostPointer(GpuQueue* queue, gpu* ptr) {
 	auto gpu_ptr = (VkDeviceAddress)ptr;
-	if(queue.gpu2host.contains(gpu_ptr))
-		return queue.gpu2host[gpu_ptr];
+	if(queue->gpu2host.contains(gpu_ptr))
+		return queue->gpu2host[gpu_ptr];
 	return nullptr;
 }
 
@@ -198,30 +198,31 @@ VkImageCreateInfo descriptor2vulkan(const GpuTextureDesc& descriptor) {
 	};
 }
 
-GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue& queue, const GpuTextureDesc& desc) {
+GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue* queue, const GpuTextureDesc& desc) {
 	auto info = descriptor2vulkan(desc);
 	VkImage temp;
-	VK_CHECK(vkCreateImage(queue.device, &info, queue.callbacks, &temp));
+	VK_CHECK(vkCreateImage(queue->device, &info, queue->callbacks, &temp), {});
 
 	VkMemoryRequirements requirements;
-	vkGetImageMemoryRequirements(queue.device, temp, &requirements);
-	vkDestroyImage(queue.device, temp, queue.callbacks);
+	vkGetImageMemoryRequirements(queue->device, temp, &requirements);
+	vkDestroyImage(queue->device, temp, queue->callbacks);
 
 	return {requirements.size, requirements.alignment};
 }
 
-GpuTexture gpuCreateTexture(GpuQueue& queue, const GpuTextureDesc& desc, gpu* memory) {
-	GpuTexture out{.descriptor = desc};
+GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* memory) {
+	auto out = (GpuTexture*)queue->cpu_allocator(nullptr, sizeof(GpuTexture));
+	*out = {.descriptor = desc};
 
 	auto info = descriptor2vulkan(desc);
-	VK_CHECK(vkCreateImage(queue.device, &info, queue.callbacks, &out.image));
-	VK_CHECK(vkBindImageMemory(queue.device, out.image, std::get<VmaAllocation>(queue.allocations[(VkDeviceAddress)memory])->GetMemory(), 0));
+	VK_CHECK(vkCreateImage(queue->device, &info, queue->callbacks, &out->image), nullptr);
+	VK_CHECK(vkBindImageMemory(queue->device, out->image, std::get<VmaAllocation>(queue->allocations[(VkDeviceAddress)memory])->GetMemory(), 0), nullptr);
 
-	queue.gpu2image[(VkDeviceAddress)memory] = out.image;
+	queue->gpu2image[(VkDeviceAddress)memory] = out->image;
 	return out;
 }
 
-inline GpuTextureDescriptor gpuTextureViewDescriptorImpl(GpuQueue& queue, const GpuTexture& texture, const GpuViewDesc& desc, bool read_only) {
+inline GpuTextureDescriptor gpuTextureViewDescriptorImpl(GpuQueue* queue, const GpuTexture* texture, const GpuViewDesc& desc, bool read_only) {
 	constexpr static auto type2vulkan = [](TEXTURE type) {
 		switch (type) {
 		case TEXTURE_1D: return VK_IMAGE_VIEW_TYPE_1D;
@@ -240,20 +241,20 @@ inline GpuTextureDescriptor gpuTextureViewDescriptorImpl(GpuQueue& queue, const 
 		.size = sizeof(GpuTextureDescriptor)
 	};
 
-	auto format = desc.format == FORMAT_NONE ? texture.descriptor.format : desc.format;
+	auto format = desc.format == FORMAT_NONE ? texture->descriptor.format : desc.format;
 	VkImageViewCreateInfo view_info {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-		.image = texture.image,
-		.viewType = type2vulkan(texture.descriptor.type),
+		.image = texture->image,
+		.viewType = type2vulkan(texture->descriptor.type),
 		.format = format2vulkan(format),
 		.subresourceRange = {
 			.aspectMask = static_cast<VkImageAspectFlags>(gpuFormatIsDepth(format) 
 				? VK_IMAGE_ASPECT_DEPTH_BIT | (gpuFormatIsStencil(format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)
 				: VK_IMAGE_ASPECT_COLOR_BIT),
 			.baseMipLevel = desc.baseMip,
-			.levelCount = desc.mipCount == ALL_MIPS ? texture.descriptor.mipCount - desc.baseMip : desc.mipCount,
+			.levelCount = desc.mipCount == ALL_MIPS ? texture->descriptor.mipCount - desc.baseMip : desc.mipCount,
 			.baseArrayLayer = desc.baseLayer,
-			.layerCount = desc.layerCount == ALL_LAYERS ? texture.descriptor.layerCount - desc.baseLayer : desc.layerCount,
+			.layerCount = desc.layerCount == ALL_LAYERS ? texture->descriptor.layerCount - desc.baseLayer : desc.layerCount,
 		}
 	};
 	VkImageDescriptorInfoEXT image_info {
@@ -268,16 +269,16 @@ inline GpuTextureDescriptor gpuTextureViewDescriptorImpl(GpuQueue& queue, const 
 			.pImage = &image_info
 		},
 	};
-	VK_CHECK(vkWriteResourceDescriptorsEXT(queue.device, 1, &descriptor, &host_info));
+	VK_CHECK(vkWriteResourceDescriptorsEXT(queue->device, 1, &descriptor, &host_info), {});
 
 	return out;
 }
 
-GpuTextureDescriptor gpuTextureViewDescriptor(GpuQueue& queue, const GpuTexture& texture, const GpuViewDesc& desc) {
+GpuTextureDescriptor gpuTextureViewDescriptor(GpuQueue* queue, const GpuTexture* texture, const GpuViewDesc& desc) {
 	return gpuTextureViewDescriptorImpl(queue, texture, desc, true);
 }
 
-GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue& queue, const GpuTexture& texture, const GpuViewDesc& desc) {
+GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue* queue, const GpuTexture* texture, const GpuViewDesc& desc) {
 	return gpuTextureViewDescriptorImpl(queue, texture, desc, false);
 }
 

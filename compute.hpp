@@ -23,7 +23,6 @@
 #include <cstddef> // size_t
 #include <cstdint> // uint8_t, uint16_t, uint32_t, uint64_t
 #include <span> // std::std::span (C++20)
-#include <optional> // std::optional (C++17)
 #include <string_view> // std::string_view (C++17)
 #include <algorithm> // std::max
 
@@ -378,7 +377,7 @@ struct GpuTextureDescriptor { uint64_t data[4]; };
  * gpuCreateQueue – Create a GPU submission queue (device and queue selection
  * details are platform-specific and omitted from this minimal API).
  */
-// std::optional<GpuQueue> gpuCreateQueue(/* platform-specific device/queue parameters */);
+// GpuQueue* gpuCreateQueue(/* platform-specific device/queue parameters */);
 
 /**
  * @brief Destroy all of the objects internally allocated by a queue.
@@ -388,7 +387,7 @@ struct GpuTextureDescriptor { uint64_t data[4]; };
  *
  * @param queue Queue to destroy.
  */
-void gpuDestroyQueue(GpuQueue& queue);
+void gpuDestroyQueue(GpuQueue* queue);
 
 // ---------------------------------------------------------------------------
 // Memory management
@@ -440,7 +439,7 @@ inline void* gpuMalloc(GpuQueue* queue, GpuTextureSizeAlign sizeAlign, MEMORY me
  * @param memory Memory heap type (default is MEMORY_DEFAULT).
  */
 template<typename T>
-T* gpuMalloc(GpuQueue& queue, size_t count = 1, MEMORY memory = MEMORY_DEFAULT) {
+T* gpuMalloc(GpuQueue* queue, size_t count = 1, MEMORY memory = MEMORY_DEFAULT) {
 	return (T*)gpuMalloc(queue, sizeof(T) * count, std::max<size_t>(alignof(T), 16), memory);
 }
 
@@ -477,7 +476,7 @@ void gpuFree(GpuQueue* queue, gpu* ptr);
  * @param queue The GPU queue (device) the memory was allocated on.
  * @param ptr CPU pointer returned by gpuMalloc. Must not be null.
  */
-gpu* gpuHostToDevicePointer(GpuQueue& queue, void* ptr);
+gpu* gpuHostToDevicePointer(GpuQueue* queue, void* ptr);
 
 /**
  * gpuDeviceToHostPointer – Translate a GPU pointer to a CPU-mapped pointer.
@@ -490,7 +489,7 @@ gpu* gpuHostToDevicePointer(GpuQueue& queue, void* ptr);
  * @param queue The GPU queue (device) the memory was allocated on.
  * @param ptr GPU pointer to translate. Must not be null.
  */
-void* gpuDeviceToHostPointer(GpuQueue& queue, gpu* ptr);
+void* gpuDeviceToHostPointer(GpuQueue* queue, gpu* ptr);
 
 // ---------------------------------------------------------------------------
 // Texture management
@@ -511,7 +510,7 @@ void* gpuDeviceToHostPointer(GpuQueue& queue, gpu* ptr);
  * @param queue The GPU queue (device) on which the texture will be created.
  * @param desc Texture description used to determine size.
  */
-GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue& queue, const GpuTextureDesc& desc);
+GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue* queue, const GpuTextureDesc& desc);
 
 /**
  * gpuCreateTexture – Create a CPU-side GpuTexture handle backed by an existing GPU
@@ -529,7 +528,7 @@ GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue& queue, const GpuTextureDesc& d
  * @param desc Texture description matching the one passed to gpuTextureSizeAlign.
  * @param memory MEMORY_TEXTURE/MEMORY_TEXTURE_READBACK pointer from gpuMalloc (GPU virtual address).
  */
-GpuTexture gpuCreateTexture(GpuQueue& queue, const GpuTextureDesc& desc, gpu* memory);
+GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* memory);
 
 /**
  * gpuTextureViewDescriptor – Create a read-only (sampled) 256-bit descriptor blob
@@ -544,7 +543,7 @@ GpuTexture gpuCreateTexture(GpuQueue& queue, const GpuTextureDesc& desc, gpu* me
  * @param texture Handle returned by gpuCreateTexture.
  * @param desc Mip/layer sub-range and optional format override.
  */
-GpuTextureDescriptor gpuTextureViewDescriptor(GpuQueue& queue, const GpuTexture& texture, const GpuViewDesc& desc);
+GpuTextureDescriptor gpuTextureViewDescriptor(GpuQueue* queue, const GpuTexture* texture, const GpuViewDesc& desc);
 
 /**
  * gpuRWTextureViewDescriptor – Create a read/write (storage image / UAV) 256-bit
@@ -558,7 +557,7 @@ GpuTextureDescriptor gpuTextureViewDescriptor(GpuQueue& queue, const GpuTexture&
  * @param texture Handle returned by gpuCreateTexture.
  * @param desc Mip/layer sub-range and optional format override.
  */
-GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue& queue, const GpuTexture& texture, const GpuViewDesc& desc);
+GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue* queue, const GpuTexture* texture, const GpuViewDesc& desc);
 
 // ---------------------------------------------------------------------------
 // Pipeline creation
@@ -575,7 +574,7 @@ GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue& queue, const GpuTextur
  * @param queue The GPU queue (device) on which the pipeline will be created.
  * @param computeIR Platform IR blob (e.g. DXIL, SPIR-V, or Metal AIR).
  */
-GpuPipeline gpuCreateComputePipeline(GpuQueue& queue, std::span<const std::byte> computeIR);
+GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, std::span<const std::byte> computeIR);
 
 /**
  * gpuDestroyPipeline – Release a previously compiled GpuPipeline and its associated
@@ -585,7 +584,7 @@ GpuPipeline gpuCreateComputePipeline(GpuQueue& queue, std::span<const std::byte>
  * @param queue The GPU queue (device) the pipeline was created on.
  * @param pipeline Pipeline to release.
  */
-void gpuDestroyPipeline(GpuQueue& queue, GpuPipeline& pipeline);
+void gpuDestroyPipeline(GpuQueue* queue, GpuPipeline* pipeline);
 
 // ---------------------------------------------------------------------------
 // Command recording
@@ -606,7 +605,7 @@ void gpuDestroyPipeline(GpuQueue& queue, GpuPipeline& pipeline);
  *
  * @param queue Queue the command buffer will later be submitted to.
  */
-GpuCommandBuffer gpuStartCommandRecording(GpuQueue& queue);
+GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue);
 
 /**
  * @brief Destroys the command buffers.
@@ -623,13 +622,14 @@ void gpuFreeCommandBuffer(GpuCommandBuffer* cmd);
  * gpuSubmit – Submit a batch of recorded command buffers to the queue for GPU
  * execution. Optionally signals a timeline semaphore to a new value upon completion,
  * enabling frame-pacing and CPU-GPU synchronisation without per-submit fence objects.
+ * Returns a monotonically increasing submission number.
  *
  * Note that submitted command buffers are then destroyed unless the NoDestroy variant is used
  *
  * @param queue Target submission queue.
- * @param commandBuffers Ordered list of command buffers to execute.
+ * @param command_buffers Ordered list of command buffers to execute.
  * @param semaphore Optional timeline semaphore to signal on completion.
- * @param signalValue Value to write to the semaphore on completion (monotonically
+ * @param signal_value Value to write to the semaphore on completion (monotonically
  * increasing). Ignored if semaphore is null.
  */
 uint64_t gpuSubmit(GpuQueue* queue, std::span<GpuCommandBuffer*> command_buffers, GpuSemaphore* semaphore = nullptr, uint64_t signal_value = 0);
@@ -653,7 +653,7 @@ uint64_t gpuSubmitNoFree(GpuQueue* queue, std::span<GpuCommandBuffer*> commandBu
 // ---------------------------------------------------------------------------
 
 /**
- * gpuCreateSemaphore – Create a timeline semaphore initialised to `initValue`.
+ * gpuCreateSemaphore – Create a timeline semaphore initialised to `initial_value`.
  *
  * A single semaphore with a monotonically-increasing 64-bit counter replaces
  * the per-frame fence + N-buffering patterns required by older Vulkan/Metal APIs.
@@ -663,7 +663,7 @@ uint64_t gpuSubmitNoFree(GpuQueue* queue, std::span<GpuCommandBuffer*> commandBu
  * @param queue The GPU queue (device) on which the semaphore will be used.
  * @param initial_value Starting value of the timeline counter.
  */
-GpuSemaphore gpuCreateSemaphore(GpuQueue& queue, uint64_t initValue);
+GpuSemaphore* gpuCreateSemaphore(GpuQueue* queue, uint64_t initial_value);
 
 #define GPU_GET_VALUE UINT64_MAX
 
@@ -680,7 +680,7 @@ GpuSemaphore gpuCreateSemaphore(GpuQueue& queue, uint64_t initValue);
  * @param value Counter value to wait for, or GPU_GET_VALUE to return the current value immediately.
  * @param timeout Maximum time to wait, in implementation-defined units (default: wait forever).
  */
-uint64_t gpuWaitSemaphore(GpuQueue& queue, GpuSemaphore& semaphore, uint64_t value, uint64_t timeout = UINT64_MAX);
+uint64_t gpuWaitSemaphore(GpuQueue* queue, const GpuSemaphore* semaphore, uint64_t value, uint64_t timeout = UINT64_MAX);
 
 /**
  * gpuFreeSemaphore – Destroy a timeline semaphore object.
@@ -702,12 +702,13 @@ void gpuFreeSemaphore(GpuQueue* queue, GpuSemaphore* semaphore);
  * transfer data from a CPU-mapped staging region into MEMORY_GPU, allowing the
  * driver to apply lossless generic buffer compression.
  *
- * @param cb Command buffer to record into.
- * @param destGpu Destination GPU address.
- * @param srcGpu Source GPU address.
+ * @param cmd Command buffer to record into.
+ * @param dest Destination GPU address.
+ * @param src Source GPU address.
  * @param bytes Number of bytes to copy.
+ * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuMemCpy(GpuCommandBuffer& cmd, gpu* dest, gpu* src, size_t bytes, bool no_offsets = false);
+void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest, gpu* src, size_t bytes, bool no_offsets = false);
 
 /**
  * gpuCopyToTexture – Record a copy from a linear CPU-mapped staging region into a
@@ -723,8 +724,9 @@ void gpuMemCpy(GpuCommandBuffer& cmd, gpu* dest, gpu* src, size_t bytes, bool no
  * @param dest GPU-only texture memory pointer (from gpuMalloc MEMORY_GPU).
  * @param src CPU-mapped (MEMORY_DEFAULT) GPU pointer to linear texture data.
  * @param texture GpuTexture handle describing the layout/format for swizzling.
+ * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuCopyToTexture(GpuCommandBuffer& cmd, gpu* dest, gpu* src, GpuTexture texture);
+void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, GpuTexture* texture, bool no_offsets = false);
 
 /**
  * gpuCopyFromTexture – Record a copy from a MEMORY_GPU texture back to a linear
@@ -735,8 +737,9 @@ void gpuCopyToTexture(GpuCommandBuffer& cmd, gpu* dest, gpu* src, GpuTexture tex
  * @param dest MEMORY_READBACK GPU pointer (CPU can read after semaphore wait).
  * @param src GPU-only texture memory pointer.
  * @param texture GpuTexture handle.
+ * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuCopyFromTexture(GpuCommandBuffer& cmd, gpu* dest, gpu* src, GpuTexture texture);
+void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, const GpuTexture* texture, bool no_offsets = false);
 
 // ---------------------------------------------------------------------------
 // GPU commands – texture heap
@@ -754,10 +757,11 @@ void gpuCopyFromTexture(GpuCommandBuffer& cmd, gpu* dest, gpu* src, GpuTexture t
  * On modern GPUs the base address is embedded per sample instruction and multiple
  * heaps can be sampled seamlessly.
  *
- * @param cb Command buffer to record into.
- * @param ptrGpu GPU virtual address of the first GpuTextureDescriptor in the heap.
+ * @param cmd Command buffer to record into.
+ * @param texture_heap GPU virtual address of the first GpuTextureDescriptor in the heap.
+ * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuSetActiveTextureHeapPtr(GpuCommandBuffer& cmd, gpu* textureHeap, bool no_offsets = false);
+void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap, bool no_offsets = false);
 
 // ---------------------------------------------------------------------------
 // GPU commands – barriers and split barriers
@@ -783,12 +787,12 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer& cmd, gpu* textureHeap, bool no
  * // Render target → texture sample (ROP cache is flushed automatically)
  * gpuBarrier(cb, STAGE_RASTER_COLOR_OUT | STAGE_RASTER_DEPTH_OUT, STAGE_PIXEL_SHADER);
  *
- * @param cb Command buffer to record into.
+ * @param cmd Command buffer to record into.
  * @param before Bitmask of STAGE values for the producing stage(s).
  * @param after Bitmask of STAGE values for the consuming stage(s).
  * @param hazards Optional HAZARD_FLAGS bitmask for special cache invalidation.
  */
-void gpuBarrier(GpuCommandBuffer& cmd, STAGE before, STAGE after, HAZARD_FLAGS hazards = (HAZARD_FLAGS)0);
+void gpuBarrier(GpuCommandBuffer* cmd, STAGE before, STAGE after, HAZARD_FLAGS hazards = (HAZARD_FLAGS)0);
 
 /**
  * gpuSignalAfter – Split-barrier producer: after `before` finishes, atomically
@@ -802,13 +806,13 @@ void gpuBarrier(GpuCommandBuffer& cmd, STAGE before, STAGE after, HAZARD_FLAGS h
  * // ... independent work that doesn't depend on the compute output ...
  * gpuWaitBefore(cb, STAGE_PIXEL_SHADER, counterGpu, N, OP_GREATER_EQUAL);
  *
- * @param cb Command buffer to record into.
+ * @param cmd Command buffer to record into.
  * @param before Producer stage; signal fires after this stage completes.
  * @param ptr GPU virtual address of a 64-bit counter value in GPU memory.
  * @param value Value to write / OR / max into the counter.
  * @param signal Atomic operation to apply.
  */
-void gpuSignalAfter(GpuCommandBuffer& cmd, STAGE before, void* ptrGpu, uint64_t value, SIGNAL signal);
+void gpuSignalAfter(GpuCommandBuffer* cmd, STAGE before, gpu* ptr, uint64_t value, SIGNAL signal);
 
 /**
  * gpuWaitBefore – Split-barrier consumer: stall the GPU before `after` starts
@@ -817,7 +821,7 @@ void gpuSignalAfter(GpuCommandBuffer& cmd, STAGE before, void* ptrGpu, uint64_t 
  * bits of the counter are compared via `mask` (e.g. for multi-producer bitmask
  * patterns using SIGNAL_ATOMIC_OR).
  *
- * @param cb Command buffer to record into.
+ * @param cmd Command buffer to record into.
  * @param after Consumer stage; this stage stalls until the condition is met.
  * @param ptr GPU virtual address of the 64-bit counter to poll.
  * @param value Reference value for the comparison.
@@ -825,7 +829,7 @@ void gpuSignalAfter(GpuCommandBuffer& cmd, STAGE before, void* ptrGpu, uint64_t 
  * @param hazards Optional HAZARD_FLAGS for cache invalidation after the wait.
  * @param mask Bitmask applied to the counter before comparison (default: all bits).
  */
-void gpuWaitBefore(GpuCommandBuffer& cmd, STAGE after, void* ptrGpu, uint64_t value, OP op, HAZARD_FLAGS hazards = (HAZARD_FLAGS)0, uint64_t mask = ~uint64_t(0));
+void gpuWaitBefore(GpuCommandBuffer* cmd, STAGE after, gpu* ptr, uint64_t value, OP op, HAZARD_FLAGS hazards = (HAZARD_FLAGS)0, uint64_t mask = ~uint64_t(0));
 
 // ---------------------------------------------------------------------------
 // GPU commands – pipeline binding
@@ -842,7 +846,7 @@ void gpuWaitBefore(GpuCommandBuffer& cmd, STAGE after, void* ptrGpu, uint64_t va
  * @param cmd Command buffer to record into.
  * @param pipeline Pipeline to bind for subsequent dispatch/draw commands.
  */
-void gpuSetPipeline(GpuCommandBuffer& cmd, GpuPipeline pipeline);
+void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline);
 
 // ---------------------------------------------------------------------------
 // GPU commands – compute dispatch
@@ -851,13 +855,13 @@ void gpuSetPipeline(GpuCommandBuffer& cmd, GpuPipeline pipeline);
 /**
  * gpuDispatch – Launch a compute shader. The shader receives `data` as its
  * single root pointer (cast to the matching shader-side struct). Thread groups are
- * spawned in a 3D grid of `gridDimensions` groups.
+ * spawned in a 3D grid of `grid_dimensions` groups.
  *
- * @param cb Command buffer to record into.
- * @param dataGpu GPU pointer to the root data struct (see root arguments design).
- * @param gridDimensions Thread group grid (x * y * z total groups).
+ * @param cmd Command buffer to record into.
+ * @param data GPU pointer to the root data struct (see root arguments design).
+ * @param grid_dimensions Thread group grid (x * y * z total groups).
  */
-void gpuDispatch(GpuCommandBuffer& cmd, gpu* dataGpu, uvec3 gridDimensions);
+void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions);
 
 /**
  * gpuDispatchIndirect – Like gpuDispatch but reads the thread group dimensions from
@@ -870,4 +874,4 @@ void gpuDispatch(GpuCommandBuffer& cmd, gpu* dataGpu, uvec3 gridDimensions);
  * @param grid_dimensions_gpu GPU pointer to a uvec3 holding the group dimensions.
  * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuDispatchIndirect(GpuCommandBuffer& cmd, gpu* dataGpu, gpu* gridDimensionsGpu, bool no_offsets = false);
+void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* data, gpu* grid_dimensions_gpu, bool no_offsets = false);
