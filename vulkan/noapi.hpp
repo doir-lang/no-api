@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <functional>
 #include <expected>
+#include <memory>
 
 
 #define VK_CHECK(expr, RETURN) do {\
@@ -115,6 +116,7 @@ struct GpuPipeline {
 struct GpuTexture {
 	VkImage image;
 	GpuTextureDesc descriptor;
+	VkSemaphore available_semaphore = VK_NULL_HANDLE;
 };
 
 struct GpuCommandBuffer {
@@ -126,3 +128,23 @@ struct GpuCommandBuffer {
 struct GpuSemaphore {
 	VkSemaphore semaphore;
 };
+
+namespace vkb {
+	struct Swapchain;
+}
+
+constexpr static int SURFACE_SUBOPTIMAL = VK_SUBOPTIMAL_KHR;
+constexpr static int SURFACE_OUT_OF_DATE = VK_ERROR_OUT_OF_DATE_KHR;
+
+struct GpuSurface {
+	VkSurfaceKHR surface;
+	std::shared_ptr<vkb::Swapchain> swapchain = nullptr;
+	GpuSurfaceDescriptor descriptor;
+	std::vector<GpuTexture> images;
+	std::vector<VkImageView> image_views;
+	std::vector<VkSemaphore> image_available_semaphores;
+	std::vector<VkSemaphore> render_finished_semaphores;
+
+	uint32_t current_image = -1, semaphore_counter = 0;
+};
+GpuSurface* gpuCreateSurface(GpuQueue* queue, VkSurfaceKHR surface, const GpuSurfaceDescriptor& desc);

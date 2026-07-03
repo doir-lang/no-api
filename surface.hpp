@@ -2,6 +2,8 @@
 
 #include "graphics.hpp"
 
+#include <vector>
+
 // ---------------------------------------------------------------------------
 // Surface Extension
 // ---------------------------------------------------------------------------
@@ -67,30 +69,25 @@ enum PRESENT_MODE {
  * Used to determine which texture formats and presentation modes are supported
  * by the current platform compositor and display backend.
  */
-struct GpuSurfaceCapabilities {
-	/**
-	 * Supported swapchain texture formats.
-	 *
-	 * Typically includes formats such as FORMAT_RGBA8_UNORM_SRGB,
-	 * FORMAT_BGRA8_UNORM_SRGB, and optionally HDR formats.
-	 */
-	std::span<const FORMAT> formats;
+// struct GpuSurfaceCapabilities {
+// 	/**
+// 	 * Supported swapchain texture formats.
+// 	 *
+// 	 * Typically includes formats such as FORMAT_RGBA8_UNORM_SRGB,
+// 	 * FORMAT_BGRA8_UNORM_SRGB, and optionally HDR formats.
+// 	 */
+// 	std::vector<FORMAT> formats;
 
-	/**
-	 * Supported presentation scheduling modes.
-	 */
-	std::span<const PRESENT_MODE> presentModes;
+// 	/**
+// 	 * Supported presentation scheduling modes.
+// 	 */
+// 	std::vector<PRESENT_MODE> presentModes;
 
-	/**
-	 * True if the surface/display path supports HDR presentation formats.
-	 */
-	bool supportsHDR = false;
-
-	/**
-	 * True if the compositor supports transparent or alpha-composited windows.
-	 */
-	bool supportsTransparency = false;
-};
+// 	/**
+// 	 * True if the compositor supports transparent or alpha-composited windows.
+// 	 */
+// 	bool supportsTransparency = false;
+// };
 
 /**
  * GpuSurfaceDescriptor – Presentation surface / swapchain configuration.
@@ -103,7 +100,7 @@ struct GpuSurfaceDescriptor {
 	 * this descriptor. Implementations may impose additional restrictions on
 	 * supported formats/usages depending on platform swapchain limitations.
 	 */
-	GpuTextureDescriptor texture;
+	GpuTextureDesc texture = {};
 
 	/**
 	 * Preferred presentation scheduling mode.
@@ -141,7 +138,7 @@ struct GpuSurfaceDescriptor {
  * @param ... Platform-specific windowing/display handles.
  * @param desc Surface configuration descriptor.
  */
-// GpuSurface gpuCreateSurface(/* Platform creation logic up to implementation */);
+// GpuSurface* gpuCreateSurface(/* Platform creation logic up to implementation */);
 
 /**
  * gpuFreeSurface – Destroy a presentation surface and release all associated
@@ -170,7 +167,7 @@ void gpuFreeSurfaceEXT(GpuQueue* queue, GpuSurface* surface);
  * @param surface Surface to reconfigure.
  * @param desc New surface configuration.
  */
-void gpuSurfaceReconfigure(GpuSurface& surface, const GpuSurfaceDescriptor& desc);
+void gpuSurfaceReconfigure(GpuQueue* queue, GpuSurface* surface, const GpuSurfaceDescriptor& desc);
 
 /**
  * gpuGetSurfaceCapabilities – Query presentation capabilities for a surface.
@@ -178,7 +175,8 @@ void gpuSurfaceReconfigure(GpuSurface& surface, const GpuSurfaceDescriptor& desc
  * Used to determine supported formats, present modes, transparency support,
  * and HDR support before configuring the surface.
  */
-GpuSurfaceCapabilities gpuGetSurfaceCapabilities(GpuQueue& queue, GpuSurface& surface);
+// GpuSurfaceCapabilities gpuGetSurfaceCapabilities(GpuQueue* queue, GpuSurface* surface);
+// TODO: Do we need this API?
 
 /**
  * gpuSurfaceGetConfigurationEXT – Gets the configured properties of the surface.
@@ -186,7 +184,7 @@ GpuSurfaceCapabilities gpuGetSurfaceCapabilities(GpuQueue& queue, GpuSurface& su
  * @param surface Surface to query.
  * @return The GpuSurfaceDescriptor last used to create or reconfigure the surface.
  */
-uvec2 gpuSurfaceGetSize(const GpuSurface& surface);
+GpuSurfaceDescriptor gpuSurfaceGetConfiguration(const GpuSurface* surface);
 
 /**
  * gpuSurfaceGetNextTexture – Acquire the next presentable surface texture.
@@ -206,7 +204,9 @@ uvec2 gpuSurfaceGetSize(const GpuSurface& surface);
  * @param queue GPU queue/device the surface was created against.
  * @param surface Surface to acquire the next presentable texture from.
  */
-std::optional<GpuTexture&> gpuSurfaceGetNextTexture(GpuSurface& surface);
+const GpuTexture* gpuSurfaceNextTexture(GpuQueue* queue, GpuSurface* surface);
+
+constexpr static uint64_t NO_SUBMISSION_WAIT = -1;
 
 /**
  * gpuSurfacePresent – Queue the currently acquired surface texture for display.
@@ -221,13 +221,6 @@ std::optional<GpuTexture&> gpuSurfaceGetNextTexture(GpuSurface& surface);
  * (as returned by gpuSubmit), or NO_SUBMISSION_WAIT to present without waiting
  * on a specific submission.
  */
-void gpuSurfacePresent(GpuSurface& surface);
+void gpuSurfacePresent(GpuQueue* queue, GpuSurface* surface, uint64_t wait_submission_index = NO_SUBMISSION_WAIT);
 
-/**
- * gpuFreeSurface – Destroy a presentation surface and release all associated
- * swapchain resources.
- *
- * The caller must ensure the GPU is no longer rendering to any acquired
- * surface textures before destroying the surface.
- */
-void gpuFreeSurface(GpuSurface& surface);
+

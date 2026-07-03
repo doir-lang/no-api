@@ -11,7 +11,7 @@ if (NOT vk-bootstrap_FOUND)
 	)
 	FetchContent_MakeAvailable(vk-bootstrap)
 endif()
- 
+
 find_package(VulkanMemoryAllocator QUIET)
 if (NOT VulkanMemoryAllocator_FOUND)
 	message(STATUS "VulkanMemoryAllocator not found via find_package; fetching from GitHub")
@@ -34,7 +34,7 @@ if (NOT volk_FOUND)
     FetchContent_MakeAvailable(volk)
 endif()
 
-add_library(noapi-vulkan STATIC noapi.cpp memory.cpp compute.cpp)
+add_library(noapi-vulkan STATIC noapi.cpp memory.cpp compute.cpp surface.cpp)
 target_link_libraries(noapi-vulkan PUBLIC
 	volk::volk
 	vk-bootstrap::vk-bootstrap

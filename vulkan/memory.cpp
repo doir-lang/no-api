@@ -102,39 +102,58 @@ void* gpuDeviceToHostPointer(GpuQueue* queue, gpu* ptr) {
 	return nullptr;
 }
 
-inline VkFormat format2vulkan(FORMAT format) {
-	switch(format) {
-	case FORMAT_NONE:
-		return VK_FORMAT_UNDEFINED;
-	case FORMAT_RGBA8_UNORM:
-		return VK_FORMAT_R8G8B8A8_UNORM;
-	case FORMAT_RGBA8_SRGB:
-		return VK_FORMAT_R8G8B8A8_SRGB;
-	case FORMAT_RGBA16_FLOAT:
-		return VK_FORMAT_R16G16B16A16_SFLOAT;
-	case FORMAT_RGBA32_FLOAT:
-		return VK_FORMAT_R32G32B32A32_SFLOAT;
-	case FORMAT_RG11B10_FLOAT:
-		return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-	case FORMAT_RGB10_A2_UNORM:
-		return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
-	case FORMAT_R8_UNORM:
-		return VK_FORMAT_R8_UNORM;
-	case FORMAT_R16_FLOAT:
-		return VK_FORMAT_R16_SFLOAT;
-	case FORMAT_R32_FLOAT:
-		return VK_FORMAT_R32_SFLOAT;
-	case FORMAT_D16_UNORM:
-		return VK_FORMAT_D16_UNORM;
-	case FORMAT_D24_UNORM_S8_UINT:
-		return VK_FORMAT_D24_UNORM_S8_UINT;
-	case FORMAT_D32_FLOAT:
-		return VK_FORMAT_D32_SFLOAT;
-	case FORMAT_D32_FLOAT_S8_UINT:
-		return VK_FORMAT_D32_SFLOAT_S8_UINT;
-	}
-	std::unreachable();
-};
+namespace GPU::detail {
+	VkFormat format2vulkan(FORMAT format) {
+		switch(format) {
+		case FORMAT_NONE:
+			return VK_FORMAT_UNDEFINED;
+		case FORMAT_RGBA8_UNORM:
+			return VK_FORMAT_R8G8B8A8_UNORM;
+		case FORMAT_RGBA8_SRGB:
+			return VK_FORMAT_R8G8B8A8_SRGB;
+		case FORMAT_RGBA16_FLOAT:
+			return VK_FORMAT_R16G16B16A16_SFLOAT;
+		case FORMAT_RGBA32_FLOAT:
+			return VK_FORMAT_R32G32B32A32_SFLOAT;
+		case FORMAT_RG11B10_FLOAT:
+			return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+		case FORMAT_RGB10_A2_UNORM:
+			return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+		case FORMAT_R8_UNORM:
+			return VK_FORMAT_R8_UNORM;
+		case FORMAT_R16_FLOAT:
+			return VK_FORMAT_R16_SFLOAT;
+		case FORMAT_R32_FLOAT:
+			return VK_FORMAT_R32_SFLOAT;
+		case FORMAT_D16_UNORM:
+			return VK_FORMAT_D16_UNORM;
+		case FORMAT_D24_UNORM_S8_UINT:
+			return VK_FORMAT_D24_UNORM_S8_UINT;
+		case FORMAT_D32_FLOAT:
+			return VK_FORMAT_D32_SFLOAT;
+		case FORMAT_D32_FLOAT_S8_UINT:
+			return VK_FORMAT_D32_SFLOAT_S8_UINT;
+		}
+		std::unreachable();
+	};
+
+	VkImageUsageFlags usage2vulkan(TEXTURE_USAGE_FLAGS usageFlags) {
+		VkImageUsageFlags result = 0;
+		if (usageFlags & USAGE_SAMPLED)
+			result |= VK_IMAGE_USAGE_SAMPLED_BIT;
+		if (usageFlags & USAGE_STORAGE)
+			result |= VK_IMAGE_USAGE_STORAGE_BIT;
+		if (usageFlags & USAGE_COLOR_ATTACHMENT)
+			result |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+		if (usageFlags & USAGE_DEPTH_STENCIL_ATTACHMENT)
+			result |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+		if (usageFlags & USAGE_TRANSFER_SRC)
+			result |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+		if (usageFlags & USAGE_TRANSFER_DST)
+			result |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		return result;
+	};
+}
 
 VkImageCreateInfo descriptor2vulkan(const GpuTextureDesc& descriptor) {
 	constexpr static auto type2vulkan = [](TEXTURE type) {
@@ -166,34 +185,18 @@ VkImageCreateInfo descriptor2vulkan(const GpuTextureDesc& descriptor) {
 			return VK_SAMPLE_COUNT_32_BIT;
 		else return VK_SAMPLE_COUNT_64_BIT;
 	};
-	constexpr static auto usage2vulkan = [](TEXTURE_USAGE_FLAGS usageFlags) {
-		VkImageUsageFlags result = 0;
-		if (usageFlags & USAGE_SAMPLED)
-			result |= VK_IMAGE_USAGE_SAMPLED_BIT;
-		if (usageFlags & USAGE_STORAGE)
-			result |= VK_IMAGE_USAGE_STORAGE_BIT;
-		if (usageFlags & USAGE_COLOR_ATTACHMENT)
-			result |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-		if (usageFlags & USAGE_DEPTH_STENCIL_ATTACHMENT)
-			result |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-		if (usageFlags & USAGE_TRANSFER_SRC)
-			result |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-		if (usageFlags & USAGE_TRANSFER_DST)
-			result |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-		return result;
-	};
 
 	return VkImageCreateInfo{
 		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 		.flags = VK_IMAGE_CREATE_ALIAS_BIT,
 		.imageType = type2vulkan(descriptor.type),
-		.format = format2vulkan(descriptor.format),
+		.format = GPU::detail::format2vulkan(descriptor.format),
 		.extent = VkExtent3D{descriptor.dimensions.x, descriptor.dimensions.y, descriptor.dimensions.z},
 		.mipLevels = descriptor.mipCount,
 		.arrayLayers = descriptor.layerCount,
 		.samples = samples2vulkan(descriptor.sampleCount),
 		.tiling = VK_IMAGE_TILING_LINEAR,
-		.usage = usage2vulkan(descriptor.usage),
+		.usage = GPU::detail::usage2vulkan(descriptor.usage),
 		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	};
 }
@@ -246,9 +249,9 @@ inline GpuTextureDescriptor gpuTextureViewDescriptorImpl(GpuQueue* queue, const 
 		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 		.image = texture->image,
 		.viewType = type2vulkan(texture->descriptor.type),
-		.format = format2vulkan(format),
+		.format = GPU::detail::format2vulkan(format),
 		.subresourceRange = {
-			.aspectMask = static_cast<VkImageAspectFlags>(gpuFormatIsDepth(format) 
+			.aspectMask = static_cast<VkImageAspectFlags>(gpuFormatIsDepth(format)
 				? VK_IMAGE_ASPECT_DEPTH_BIT | (gpuFormatIsStencil(format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)
 				: VK_IMAGE_ASPECT_COLOR_BIT),
 			.baseMipLevel = desc.baseMip,
