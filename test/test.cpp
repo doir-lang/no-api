@@ -59,14 +59,10 @@ struct render_state {
 
 	VkInstance instance = {};
 	VkDebugUtilsMessengerEXT debug_messenger = {};
-	VkSurfaceKHR surface = {};
+	VkSurfaceKHR raw_surface = {};
 	GpuQueue* graphics_queue = {};
 
-	VkSwapchainKHR swapchain = {};
-	VkFormat swapchain_format = {};
-	VkExtent2D swapchain_extent = {};
-	std::vector<VkImage> swapchain_images;
-	std::vector<VkImageView> swapchain_views;
+	GpuSurface* surface = nullptr;
 	std::vector<VkSemaphore> swapchain_render_finished_semaphore = {};
 
 	VkRenderPass render_pass = {};
@@ -137,29 +133,6 @@ static VkShaderModule create_shader_module(render_state& state, const std::vecto
 	return out;
 }
 
-void create_swapchain(render_state& state, int width, int height) {
-	vkb::SwapchainBuilder builder{state.graphics_queue->gpu, state.graphics_queue->device, state.surface, state.graphics_queue->queue_family};
-	auto swap = builder
-		.set_old_swapchain(state.swapchain)
-		.use_default_present_mode_selection()
-		.set_desired_extent(width, height)
-		.build();
-	if (!swap) throw std::runtime_error(swap.error().message());
-
-	vkb::destroy_swapchain(state.vkb_swapchain);
-	state.vkb_swapchain = swap.value();
-	state.swapchain = state.vkb_swapchain.swapchain;
-	state.swapchain_format = state.vkb_swapchain.image_format;
-	state.swapchain_extent = state.vkb_swapchain.extent;
-	state.swapchain_images = state.vkb_swapchain.get_images().value();
-	state.swapchain_views = state.vkb_swapchain.get_image_views().value();
-
-	VkSemaphoreCreateInfo semaphore_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-	state.swapchain_render_finished_semaphore.resize(state.swapchain_images.size());
-	for (auto& sema : state.swapchain_render_finished_semaphore)
-		VK_CHECK(vkCreateSemaphore(state.graphics_queue->device, &semaphore_info, nullptr, &sema), /*nothing*/);
-}
-
 void create_pipeline(render_state& state) {
 	auto vertex_spirv = compile_glsl(EShLangVertex, vertex_glsl);
 	auto fragment_spirv = compile_glsl(EShLangFragment, fragment_glsl);
@@ -182,6 +155,16 @@ void create_pipeline(render_state& state) {
 		}
 	};
 
+	std::array<VkDynamicState, 2> dynamic = {
+		VK_DYNAMIC_STATE_VIEWPORT,
+		VK_DYNAMIC_STATE_SCISSOR
+	};
+
+	VkPipelineDynamicStateCreateInfo dynamic_state{};
+	dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+	dynamic_state.dynamicStateCount = 2;
+	dynamic_state.pDynamicStates = dynamic.data();
+
 	VkPipelineVertexInputStateCreateInfo vertex_input = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
 	};
@@ -189,15 +172,13 @@ void create_pipeline(render_state& state) {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
 		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
 	};
-	VkViewport viewport{0, 0, (float)state.swapchain_extent.width, (float)state.swapchain_extent.height, 0, 1};
-	VkRect2D scissor{{0, 0}, state.swapchain_extent};
 
 	VkPipelineViewportStateCreateInfo viewport_state = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
 		.viewportCount = 1,
-		.pViewports = &viewport,
+		.pViewports = nullptr,
 		.scissorCount = 1,
-		.pScissors = &scissor,
+		.pScissors = nullptr,
 	};
 	VkPipelineRasterizationStateCreateInfo raster = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
@@ -234,6 +215,7 @@ void create_pipeline(render_state& state) {
 		.pRasterizationState = &raster,
 		.pMultisampleState = &msaa,
 		.pColorBlendState = &blend,
+		.pDynamicState = &dynamic_state,
 		.layout = state.pipeline_layout,
 		.renderPass = state.render_pass,
 		.subpass = 0,
@@ -246,15 +228,15 @@ void create_pipeline(render_state& state) {
 }
 
 void create_framebuffers(render_state& state) {
-	state.framebuffers.resize(state.swapchain_views.size());
-	for (size_t i = 0; i < state.swapchain_views.size(); ++i) {
+	state.framebuffers.resize(state.surface->swapchain->image_count);
+	for (size_t i = 0; i < state.surface->swapchain->image_count; ++i) {
 		VkFramebufferCreateInfo fbInfo = {
 			.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
 			.renderPass = state.render_pass,
 			.attachmentCount = 1,
-			.pAttachments = &state.swapchain_views[i],
-			.width = state.swapchain_extent.width,
-			.height = state.swapchain_extent.height,
+			.pAttachments = &state.surface->image_views[i],
+			.width = state.surface->swapchain->extent.width,
+			.height = state.surface->swapchain->extent.height,
 			.layers = 1,
 		};
 		VK_CHECK(vkCreateFramebuffer(state.graphics_queue->device, &fbInfo, nullptr, &state.framebuffers[i]), /*nothing*/);
@@ -270,11 +252,18 @@ void init_vulkan(render_state& state) {
 	if(!vk) throw std::runtime_error(vk.error());
 	state.instance = vk->instance;
 	state.debug_messenger = vk->messenger;
-	state.surface = vk->surface;
+	state.raw_surface = vk->surface;
 
 	auto queue = gpuCreateQueue(*vk);
 	if(!queue) throw std::runtime_error("Failed to create noapi queue");
 	state.graphics_queue = queue;
+
+	state.surface = gpuCreateSurface(queue, state.raw_surface, GpuSurfaceDescriptor{
+		.texture = {
+			.dimensions = {WIDTH, HEIGHT, 1},
+			.format = FORMAT_RGBA8_UNORM
+		}
+	});
 
 	auto upload = gpuMalloc<float>(state.graphics_queue, 16);
 	gpu* upload_gpu = gpuHostToDevicePointer(state.graphics_queue, upload);
@@ -288,7 +277,7 @@ void init_vulkan(render_state& state) {
 	auto texture_heap_gpu = gpuHostToDevicePointer(state.graphics_queue, texture_heap);
 
 	GpuTextureDesc descriptor {
-		.dimensions = {800, 600, 1},
+		.dimensions = {WIDTH, HEIGHT, 1},
 		.format = FORMAT_RGBA8_UNORM,
 		.usage = USAGE_STORAGE,
 	};
@@ -345,10 +334,15 @@ void init_vulkan(render_state& state) {
 	gpuFree(state.graphics_queue, texture_gpu);
 	gpuFree(state.graphics_queue, texture_heap);
 
-	create_swapchain(state, WIDTH, HEIGHT);
+	{ // create_swapchain()
+		VkSemaphoreCreateInfo semaphore_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+		state.swapchain_render_finished_semaphore.resize(state.surface->swapchain->image_count);
+		for (auto& sema : state.swapchain_render_finished_semaphore)
+			VK_CHECK(vkCreateSemaphore(state.graphics_queue->device, &semaphore_info, nullptr, &sema), /*nothing*/);
+	}
 	{ // create_render_pass();
 		VkAttachmentDescription color_attachment = {
-			.format = state.swapchain_format,
+			.format = state.surface->swapchain->image_format,
 			.samples = VK_SAMPLE_COUNT_1_BIT,
 			.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
 			.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
@@ -417,26 +411,15 @@ void init_vulkan(render_state& state) {
 	}
 }
 
-void cleanup_swapchain(render_state& state) {
-	for (auto sema : state.swapchain_render_finished_semaphore)
-		vkDestroySemaphore(state.graphics_queue->device, sema, nullptr);
-	state.swapchain_render_finished_semaphore.clear();
-	for (auto fb : state.framebuffers) vkDestroyFramebuffer(state.graphics_queue->device, fb, nullptr);
-	state.framebuffers.clear();
-	for (auto iv : state.swapchain_views) vkDestroyImageView(state.graphics_queue->device, iv, nullptr);
-	state.swapchain_views.clear();
-}
+void recreate_swapchain(render_state& state, uvec2 extent) {
+	gpuWaitIdle(state.graphics_queue);
 
-void recreate_swapchain(render_state& state) {
-	int w = 0, h = 0;
-	glfwGetFramebufferSize(state.window, &w, &h);
-	while (w == 0 || h == 0) {
-		glfwGetFramebufferSize(state.window, &w, &h);
-		glfwWaitEvents();
-	}
-	vkDeviceWaitIdle(state.graphics_queue->device);
-	cleanup_swapchain(state);
-	create_swapchain(state, w, h);
+	auto config = gpuSurfaceGetConfiguration(state.surface);
+	config.texture.dimensions = {extent.x, extent.y, 1};
+	gpuSurfaceReconfigure(state.graphics_queue, state.surface, config);
+
+	for(auto framebuffer: state.framebuffers)
+		vkDestroyFramebuffer(state.graphics_queue->device, framebuffer, nullptr);
 	create_framebuffers(state);
 }
 
@@ -446,14 +429,17 @@ void cleanup(render_state& state) {
 		vkDestroyFence (state.graphics_queue->device, state.render_fence[i], nullptr);
 	}
 	vkDestroyCommandPool (state.graphics_queue->device, state.command_pool, nullptr);
-	cleanup_swapchain(state);
+	for (auto sema : state.swapchain_render_finished_semaphore)
+		vkDestroySemaphore(state.graphics_queue->device, sema, nullptr);
+	for (auto framebuffer: state.framebuffers)
+		vkDestroyFramebuffer(state.graphics_queue->device, framebuffer, nullptr);
+	gpuDestroySurface(state.graphics_queue, state.surface);
 	vkDestroyPipeline (state.graphics_queue->device, state.pipeline, nullptr);
 	vkDestroyPipelineLayout(state.graphics_queue->device, state.pipeline_layout, nullptr);
 	vkDestroyRenderPass (state.graphics_queue->device, state.render_pass, nullptr);
 	gpuDestroyQueue(state.graphics_queue);
-	vkb::destroy_swapchain(state.vkb_swapchain);
 	vkDestroyDevice(state.graphics_queue->device, nullptr);
-	vkDestroySurfaceKHR (state.instance, state.surface, nullptr);
+	vkDestroySurfaceKHR (state.instance, state.raw_surface, nullptr);
 	vkDestroyDebugUtilsMessengerEXT(state.instance, state.debug_messenger, nullptr);
 	vkDestroyInstance(state.instance, nullptr);
 	volkFinalize();
@@ -467,11 +453,22 @@ void draw_frame(render_state& state) {
 	VkFence fence = state.render_fence[frame_index];
 	vkWaitForFences(state.graphics_queue->device, 1, &fence, VK_TRUE, UINT64_MAX);
 
-	uint32_t image_index = {};
-	VkResult result = vkAcquireNextImageKHR(state.graphics_queue->device, state.swapchain, UINT64_MAX, state.image_available_semaphore[frame_index], VK_NULL_HANDLE, &image_index);
-	if (result == VK_ERROR_OUT_OF_DATE_KHR) { recreate_swapchain(state); return; }
-	if ( !(result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) )
-		throw std::runtime_error("vkAcquireNextImageKHR failed");
+	int w = 0, h = 0;
+	glfwGetFramebufferSize(state.window, &w, &h);
+	while (w == 0 || h == 0) {
+		glfwGetFramebufferSize(state.window, &w, &h);
+		glfwWaitEvents();
+	}
+	uvec2 needed_size = {static_cast<uint32_t>(w), static_cast<uint32_t>(h)};
+	auto surface_size = gpuSurfaceGetConfiguration(state.surface).texture.dimensions;
+	if(surface_size.x != w && surface_size.y != h)
+		recreate_swapchain(state, needed_size);
+
+	auto texture = gpuSurfaceNextTexture(state.graphics_queue, state.surface);
+	if(errno == SURFACE_SUBOPTIMAL || errno == SURFACE_OUT_OF_DATE) {
+		recreate_swapchain(state, needed_size);
+		return;
+	}
 
 	vkResetFences(state.graphics_queue->device, 1, &fence);
 
@@ -486,46 +483,55 @@ void draw_frame(render_state& state) {
 	VkRenderPassBeginInfo rp_begin = {
 		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
 		.renderPass = state.render_pass,
-		.framebuffer = state.framebuffers[image_index],
-		.renderArea { .extent = state.swapchain_extent },
+		.framebuffer = state.framebuffers[state.surface->current_image],
+		.renderArea { .extent = state.surface->swapchain->extent },
 		.clearValueCount = 1,
 		.pClearValues = &clear_color,
 	};
 
 	vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+	VkViewport viewport{0, 0, (float)state.surface->swapchain->extent.width, (float)state.surface->swapchain->extent.height, 0, 1};
+	vkCmdSetViewport(cmd, 0, 1, &viewport);
+	VkRect2D scissor{{0, 0}, state.surface->swapchain->extent};
+	vkCmdSetScissor(cmd, 0, 1, &scissor);
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, state.pipeline);
 	vkCmdDraw(cmd, 3, 1, 0, 0);
 	vkCmdEndRenderPass(cmd);
 	VK_CHECK(vkEndCommandBuffer(cmd), /*nothing*/);
 
+	auto submit_index = state.graphics_queue->command_submission_timeline_semaphore_next_value;
 	{ // Submit queue
 		VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-		VkSubmitInfo info = {
-			.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-			.waitSemaphoreCount = 1,
-			.pWaitSemaphores = &state.image_available_semaphore[frame_index],
-			.pWaitDstStageMask = &wait_stage,
-			.commandBufferCount = 1,
-			.pCommandBuffers = &cmd,
-			.signalSemaphoreCount = 1,
-			.pSignalSemaphores = &state.swapchain_render_finished_semaphore[image_index],
+		VkSemaphoreSubmitInfo wait {
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+			.semaphore = texture->available_semaphore,
+			.stageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
 		};
-		VK_CHECK(vkQueueSubmit(state.graphics_queue->queue, 1, &info, fence), /*nothing*/);
-	}{ // Present
-		VkPresentInfoKHR presentInfo = {
-			.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-			.waitSemaphoreCount = 1,
-			.pWaitSemaphores = &state.swapchain_render_finished_semaphore[image_index],
-			.swapchainCount = 1,
-			.pSwapchains = &state.swapchain,
-			.pImageIndices = &image_index,
+		VkCommandBufferSubmitInfo cmds {
+			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+			.commandBuffer = cmd
 		};
-
-		result = vkQueuePresentKHR(state.graphics_queue->queue, &presentInfo);
-		if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
-			recreate_swapchain(state);
-		else VK_CHECK(result, /*nothing*/);
+		VkSemaphoreSubmitInfo signal {
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+			.semaphore = state.graphics_queue->command_submission_timeline_semaphore,
+			.value = state.graphics_queue->command_submission_timeline_semaphore_next_value++,
+			.stageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
+		};
+		VkSubmitInfo2 info = {
+			.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+			.waitSemaphoreInfoCount = 1,
+			.pWaitSemaphoreInfos = &wait,
+			.commandBufferInfoCount = 1,
+			.pCommandBufferInfos = &cmds,
+			.signalSemaphoreInfoCount = 1,
+			.pSignalSemaphoreInfos = &signal
+		};
+		VK_CHECK(vkQueueSubmit2(state.graphics_queue->queue, 1, &info, fence), /*nothing*/);
 	}
+
+	gpuSurfacePresent(state.graphics_queue, state.surface, submit_index);
+	if(errno == SURFACE_SUBOPTIMAL || errno == SURFACE_OUT_OF_DATE)
+		recreate_swapchain(state, needed_size);
 
 	state.current_frame++;
 }
