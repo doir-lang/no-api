@@ -20,6 +20,7 @@ struct ComputePipelinePushConstants {
 
 GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, std::span<const std::byte> computeIR) {
 	auto out = (GpuPipeline*)queue->cpu_allocator(nullptr, sizeof(GpuPipeline));
+	out->color_target_count = {}; // Null indicating compute pipeline
 
 	VkShaderModule compute_module;
 	{
@@ -51,7 +52,7 @@ GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, std::span<const std::byte
 	return out;
 }
 
-void gpuDestroyPipeline(GpuQueue* queue, GpuPipeline* pipeline) {
+void gpuFreePipeline(GpuQueue* queue, GpuPipeline* pipeline) {
 	vkDestroyPipeline(queue->device, pipeline->pipeline, queue->callbacks);
 	queue->cpu_allocator(pipeline, 0);
 }
@@ -309,7 +310,8 @@ void gpuWaitBefore(GpuCommandBuffer* cmd, STAGE after, void* ptrGpu, uint64_t va
 }
 
 void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline) {
-	vkCmdBindPipeline(cmd->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
+	vkCmdBindPipeline(cmd->command_buffer, pipeline->color_target_count.has_value() ? VK_PIPELINE_BIND_POINT_GRAPHICS : VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
+	cmd->bound_pipeline = pipeline;
 }
 
 void gpuDispatch(GpuCommandBuffer* cmd, gpu* dataGpu, uvec3 gridDimensions) {

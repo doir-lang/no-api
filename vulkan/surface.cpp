@@ -3,15 +3,11 @@
 #include <vk_mem_alloc.h>
 
 #include "noapi.hpp"
+#include "common.hpp"
 
 #include <VkBootstrap.h>
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added"
 
-
-namespace GPU::detail {
-	VkFormat format2vulkan(FORMAT format);
-	VkImageUsageFlags usage2vulkan(TEXTURE_USAGE_FLAGS usageFlags);
-}
 
 GpuSurface* gpuCreateSurface(GpuQueue* queue, VkSurfaceKHR surface, const GpuSurfaceDescriptor& desc) {
 	auto out = (GpuSurface*)queue->cpu_allocator(nullptr, sizeof(GpuSurface));
@@ -30,7 +26,7 @@ void gpuDestroySurfaceNoSemaphores(GpuQueue* queue, GpuSurface* surface) {
 		vkb::destroy_swapchain(*surface->swapchain);
 }
 
-void gpuDestroySurface(GpuQueue* queue, GpuSurface* surface) {
+void gpuFreeSurface(GpuQueue* queue, GpuSurface* surface) {
 	for(auto semaphore: surface->image_available_semaphores)
 		vkDestroySemaphore(queue->device, semaphore, queue->callbacks);
 	for(auto semaphore: surface->render_finished_semaphores)

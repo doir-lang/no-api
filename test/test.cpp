@@ -24,15 +24,15 @@ static const char* vertex_glsl = R"glsl(
 	layout(location = 0) out vec3 frag_color;
 
 	vec2 positions[3] = vec2[](
-		vec2( 0.0, -0.5),
+		vec2(-0.5, 0.5),
 		vec2( 0.5, 0.5),
-		vec2(-0.5, 0.5)
+		vec2( 0.0, -0.5)
 	);
 
 	vec3 colors[3] = vec3[](
-		vec3(1.0, 0.0, 0.0),
+		vec3(0.0, 0.0, 1.0),
 		vec3(0.0, 1.0, 0.0),
-		vec3(0.0, 0.0, 1.0)
+		vec3(1.0, 0.0, 0.0)
 	);
 
 	void main() {
@@ -55,8 +55,6 @@ static const char* fragment_glsl = R"glsl(
 struct render_state {
 	GLFWwindow* window = {};
 
-	vkb::Swapchain vkb_swapchain = {};
-
 	VkInstance instance = {};
 	VkDebugUtilsMessengerEXT debug_messenger = {};
 	VkSurfaceKHR raw_surface = {};
@@ -66,8 +64,7 @@ struct render_state {
 	std::vector<VkSemaphore> swapchain_render_finished_semaphore = {};
 
 	VkRenderPass render_pass = {};
-	VkPipelineLayout pipeline_layout = {};
-	VkPipeline pipeline = {};
+	GpuPipeline* pipeline = nullptr;
 	std::vector<VkFramebuffer> framebuffers;
 
 	VkCommandPool command_pool = {};
@@ -131,100 +128,6 @@ static VkShaderModule create_shader_module(render_state& state, const std::vecto
 	VkShaderModule out;
 	VK_CHECK(vkCreateShaderModule(state.graphics_queue->device, &info, nullptr, &out), nullptr);
 	return out;
-}
-
-void create_pipeline(render_state& state) {
-	auto vertex_spirv = compile_glsl(EShLangVertex, vertex_glsl);
-	auto fragment_spirv = compile_glsl(EShLangFragment, fragment_glsl);
-
-	VkShaderModule vertex_module = create_shader_module(state, vertex_spirv);
-	VkShaderModule fragment_module = create_shader_module(state, fragment_spirv);
-
-	VkPipelineShaderStageCreateInfo stages[2] = {
-		VkPipelineShaderStageCreateInfo{
-			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-			.stage = VK_SHADER_STAGE_VERTEX_BIT,
-			.module = vertex_module,
-			.pName = "main",
-		},
-		VkPipelineShaderStageCreateInfo{
-			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-			.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-			.module = fragment_module,
-			.pName = "main",
-		}
-	};
-
-	std::array<VkDynamicState, 2> dynamic = {
-		VK_DYNAMIC_STATE_VIEWPORT,
-		VK_DYNAMIC_STATE_SCISSOR
-	};
-
-	VkPipelineDynamicStateCreateInfo dynamic_state{};
-	dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-	dynamic_state.dynamicStateCount = 2;
-	dynamic_state.pDynamicStates = dynamic.data();
-
-	VkPipelineVertexInputStateCreateInfo vertex_input = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-	};
-	VkPipelineInputAssemblyStateCreateInfo input_assembly = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-	};
-
-	VkPipelineViewportStateCreateInfo viewport_state = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-		.viewportCount = 1,
-		.pViewports = nullptr,
-		.scissorCount = 1,
-		.pScissors = nullptr,
-	};
-	VkPipelineRasterizationStateCreateInfo raster = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-		.polygonMode = VK_POLYGON_MODE_FILL,
-		.cullMode = VK_CULL_MODE_BACK_BIT,
-		.frontFace = VK_FRONT_FACE_CLOCKWISE,
-		.lineWidth = 1.0f,
-	};
-	VkPipelineMultisampleStateCreateInfo msaa = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-		.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
-	};
-	VkPipelineColorBlendAttachmentState blend_attachment = {
-		.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT
-	};
-	VkPipelineColorBlendStateCreateInfo blend = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-		.attachmentCount = 1,
-		.pAttachments = &blend_attachment,
-	};
-
-	VkPipelineLayoutCreateInfo layoutInfo = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
-	};
-	VK_CHECK(vkCreatePipelineLayout(state.graphics_queue->device, &layoutInfo, nullptr, &state.pipeline_layout), /*nothing*/);
-
-	VkGraphicsPipelineCreateInfo pipeInfo = {
-		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-		.stageCount = 2,
-		.pStages = stages,
-		.pVertexInputState = &vertex_input,
-		.pInputAssemblyState = &input_assembly,
-		.pViewportState = &viewport_state,
-		.pRasterizationState = &raster,
-		.pMultisampleState = &msaa,
-		.pColorBlendState = &blend,
-		.pDynamicState = &dynamic_state,
-		.layout = state.pipeline_layout,
-		.renderPass = state.render_pass,
-		.subpass = 0,
-	};
-	VK_CHECK(vkCreateGraphicsPipelines(state.graphics_queue->device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &state.pipeline), /*nothing*/);
-
-	// Shader modules are only needed during pipeline creation
-	vkDestroyShaderModule(state.graphics_queue->device, vertex_module, nullptr);
-	vkDestroyShaderModule(state.graphics_queue->device, fragment_module, nullptr);
 }
 
 void create_framebuffers(render_state& state) {
@@ -314,7 +217,7 @@ void init_vulkan(render_state& state) {
 		}
 	)glsl");
 
-	GpuPipeline* pipeline = gpuCreateComputePipeline(state.graphics_queue, {(std::byte*)glsl.data(), glsl.size() * sizeof(glsl[0])});
+	GpuPipeline* pipeline = gpuCreateComputePipeline(state.graphics_queue, byte_span<uint32_t>(glsl));
 	GpuCommandBuffer* cmd = gpuStartCommandRecording(state.graphics_queue);
 
 	gpuSetActiveTextureHeapPtr(cmd, texture_heap_gpu, true);
@@ -327,7 +230,7 @@ void init_vulkan(render_state& state) {
 
 	auto dbg_up = upload[5];
 	auto dbg_down = download[5];
-	gpuDestroyPipeline(state.graphics_queue, pipeline);
+	gpuFreePipeline(state.graphics_queue, pipeline);
 	gpuFree(state.graphics_queue, upload);
 	gpuFree(state.graphics_queue, download);
 
@@ -380,7 +283,15 @@ void init_vulkan(render_state& state) {
 		};
 		VK_CHECK(vkCreateRenderPass(state.graphics_queue->device, &rpInfo, nullptr, &state.render_pass), /*nothing*/);
 	}
-	create_pipeline(state);
+	{ // create_pipeline(state);
+		auto vertex_spirv = compile_glsl(EShLangVertex, vertex_glsl);
+		auto fragment_spirv = compile_glsl(EShLangFragment, fragment_glsl);
+
+		ColorTarget target { .format = FORMAT_RGBA8_UNORM };
+		state.pipeline = gpuCreateGraphicsPipeline(state.graphics_queue, byte_span<uint32_t>(vertex_spirv), byte_span<uint32_t>(fragment_spirv), {
+			.colorTargets = {&target, 1}
+		});
+	}
 	create_framebuffers(state);
 	{ // create_command_pool();
 		VkCommandPoolCreateInfo info = {
@@ -433,11 +344,12 @@ void cleanup(render_state& state) {
 		vkDestroySemaphore(state.graphics_queue->device, sema, nullptr);
 	for (auto framebuffer: state.framebuffers)
 		vkDestroyFramebuffer(state.graphics_queue->device, framebuffer, nullptr);
-	gpuDestroySurface(state.graphics_queue, state.surface);
-	vkDestroyPipeline (state.graphics_queue->device, state.pipeline, nullptr);
-	vkDestroyPipelineLayout(state.graphics_queue->device, state.pipeline_layout, nullptr);
+	gpuFreeSurface(state.graphics_queue, state.surface);
+	// vkDestroyPipeline (state.graphics_queue->device, state.pipeline, nullptr);
+	// vkDestroyPipelineLayout(state.graphics_queue->device, state.pipeline_layout, nullptr);
+	gpuFreePipeline(state.graphics_queue, state.pipeline);
 	vkDestroyRenderPass (state.graphics_queue->device, state.render_pass, nullptr);
-	gpuDestroyQueue(state.graphics_queue);
+	gpuFreeQueue(state.graphics_queue);
 	vkDestroyDevice(state.graphics_queue->device, nullptr);
 	vkDestroySurfaceKHR (state.instance, state.raw_surface, nullptr);
 	vkDestroyDebugUtilsMessengerEXT(state.instance, state.debug_messenger, nullptr);
@@ -494,7 +406,7 @@ void draw_frame(render_state& state) {
 	vkCmdSetViewport(cmd, 0, 1, &viewport);
 	VkRect2D scissor{{0, 0}, state.surface->swapchain->extent};
 	vkCmdSetScissor(cmd, 0, 1, &scissor);
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, state.pipeline);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, state.pipeline->pipeline);
 	vkCmdDraw(cmd, 3, 1, 0, 0);
 	vkCmdEndRenderPass(cmd);
 	VK_CHECK(vkEndCommandBuffer(cmd), /*nothing*/);

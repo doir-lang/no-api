@@ -429,11 +429,11 @@ struct GpuRenderPassDesc {
  * dynamically via gpuSetBlendState.
  *
  * @param queue The GPU queue (device) on which the pipeline will be created.
- * @param vertexIR Vertex shader IR blob.
- * @param pixelIR Pixel shader IR blob.
+ * @param vertexIR Vertex shader IR blob (SPIRV on Vulkan, WGSL on WebGPU)
+ * @param fragmentIR Pixel shader IR blob (SPIRV on Vulkan, WGSL on WebGPU)
  * @param desc Rasterizer, format, and optional embedded blend state.
  */
-GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, std::span<const std::byte> vertexIR, std::span<const std::byte> pixelIR, GpuRasterDesc desc);
+GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, std::span<const std::byte> vertexIR, std::span<const std::byte> fragmentIR, const GpuRasterDesc& desc);
 
 /**
  * gpuCreateGraphicsMeshletPipeline – Compile a mesh shader + pixel shader pipeline.
@@ -444,11 +444,11 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, std::span<const std::byt
  * binning requires a vertex-shader-granularity primitive stream.
  *
  * @param queue The GPU queue (device) on which the pipeline will be created.
- * @param meshletIR Mesh shader IR blob.
- * @param pixelIR Pixel shader IR blob.
+ * @param meshletIR Mesh shader IR blob (SPIRV on Vulkan, WGSL on WebGPU)
+ * @param fragmentIR Pixel shader IR blob (SPIRV on Vulkan, WGSL on WebGPU)
  * @param desc Rasterizer, format, and optional embedded blend state.
  */
-// GpuPipeline gpuCreateGraphicsMeshletPipeline(GpuQueue* queue, std::span<const std::byte> meshletIR, std::span<const std::byte> pixelIR, GpuRasterDesc desc);
+// GpuPipeline gpuCreateGraphicsMeshletPipeline(GpuQueue* queue, std::span<const std::byte> meshletIR, std::span<const std::byte> fragmentIR, GpuRasterDesc desc);
 // NOTE: WebGPU doesn't yet support mesh shaders!
 
 // ---------------------------------------------------------------------------
@@ -465,7 +465,7 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, std::span<const std::byt
  * @param queue The GPU queue (device) on which the state object will be created.
  * @param desc Depth/stencil test and write configuration.
  */
-GpuDepthStencilState* gpuCreateDepthStencilState(GpuQueue* queue, GpuDepthStencilDesc desc);
+GpuDepthStencilState* gpuCreateDepthStencilState(GpuQueue* queue, const GpuDepthStencilDesc& desc);
 
 /**
  * gpuCreateBlendState – Bake a blend configuration into a reusable state object.
@@ -477,7 +477,7 @@ GpuDepthStencilState* gpuCreateDepthStencilState(GpuQueue* queue, GpuDepthStenci
  * @param queue The GPU queue (device) on which the state object will be created.
  * @param desc Blend equation and factor configuration.
  */
-GpuBlendState* gpuCreateBlendState(GpuQueue* queue, GpuBlendDesc desc);
+GpuBlendState* gpuCreateBlendState(GpuQueue* queue, const GpuBlendDesc& desc);
 
 /**
  * gpuFreeDepthStencilState – Release a GpuDepthStencilState object.

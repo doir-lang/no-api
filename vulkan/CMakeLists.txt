@@ -34,7 +34,7 @@ if (NOT volk_FOUND)
     FetchContent_MakeAvailable(volk)
 endif()
 
-add_library(noapi-vulkan STATIC noapi.cpp memory.cpp compute.cpp surface.cpp)
+add_library(noapi-vulkan STATIC noapi.cpp memory.cpp compute.cpp graphics.cpp surface.cpp)
 target_link_libraries(noapi-vulkan PUBLIC
 	volk::volk
 	vk-bootstrap::vk-bootstrap
