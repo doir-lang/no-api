@@ -103,7 +103,7 @@ struct GpuCommandBuffer;
  * GPU<->GPU synchronisation. Semantically identical to DX12 / Vulkan 1.2
  * timeline semaphores. A single semaphore and an ever-incrementing counter value
  * replace the older Vulkan/Metal per-submit fence objects and N-buffering patterns.
- * Created by gpuCreateSemaphore(initialValue); destroyed by gpuDestroySemaphore.
+ * Created by gpuCreateSemaphore(initialValue); destroyed by gpuFreeSemaphore.
  */
 struct GpuSemaphore;
 
@@ -387,7 +387,7 @@ struct GpuTextureDescriptor { uint64_t data[4]; };
  *
  * @param queue Queue to destroy.
  */
-void gpuDestroyQueue(GpuQueue* queue);
+void gpuFreeQueue(GpuQueue* queue);
 
 // ---------------------------------------------------------------------------
 // Memory management
@@ -572,19 +572,19 @@ GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue* queue, const GpuTextur
  * to gpuDispatch / gpuDispatchIndirect.
  *
  * @param queue The GPU queue (device) on which the pipeline will be created.
- * @param computeIR Platform IR blob (e.g. DXIL, SPIR-V, or Metal AIR).
+ * @param computeIR Platform IR blob (SPIRV on Vulkan, WGSL on WebGPU).
  */
 GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, std::span<const std::byte> computeIR);
 
 /**
- * gpuDestroyPipeline – Release a previously compiled GpuPipeline and its associated
+ * gpuFreePipeline – Release a previously compiled GpuPipeline and its associated
  * device memory. Must not be called while the GPU still has in-flight work using
  * the pipeline.
  *
  * @param queue The GPU queue (device) the pipeline was created on.
  * @param pipeline Pipeline to release.
  */
-void gpuDestroyPipeline(GpuQueue* queue, GpuPipeline* pipeline);
+void gpuFreePipeline(GpuQueue* queue, GpuPipeline* pipeline);
 
 // ---------------------------------------------------------------------------
 // Command recording

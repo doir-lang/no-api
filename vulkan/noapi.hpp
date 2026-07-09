@@ -111,6 +111,7 @@ inline GpuQueue* gpuCreateQueue(const GpuVulkanDefault& vulkan, GpuAllocatorFunc
 struct GpuPipeline {
 	// VkShaderModule compute_module; // TODO: Do we have a need to carry this around?
 	VkPipeline pipeline;
+	std::optional<size_t> color_target_count = {}; // When null indicates a compute pipeline
 };
 
 struct GpuTexture {
@@ -123,10 +124,19 @@ struct GpuCommandBuffer {
 	GpuQueue* queue;
 	VkCommandBuffer command_buffer;
 	bool ended = false;
+	const GpuPipeline* bound_pipeline = nullptr;
 };
 
 struct GpuSemaphore {
 	VkSemaphore semaphore;
+};
+
+struct GpuDepthStencilState {
+	GpuDepthStencilDesc descriptor;
+};
+
+struct GpuBlendState {
+	GpuBlendDesc descriptor;
 };
 
 namespace vkb {

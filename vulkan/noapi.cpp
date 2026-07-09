@@ -131,7 +131,7 @@ GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice dev
 	return out;
 }
 
-void gpuDestroyQueue(GpuQueue* queue) {
+void gpuFreeQueue(GpuQueue* queue) {
 	if(queue->command_pool)
 		vkDestroyCommandPool(queue->device, queue->command_pool, queue->callbacks);
 	if(queue->command_submission_timeline_semaphore)
@@ -278,7 +278,7 @@ uint64_t gpuWaitSemaphore(GpuQueue* queue, const GpuSemaphore* semaphore, uint64
 	return value;
 }
 
-void gpuDestroySemaphore(GpuQueue* queue, GpuSemaphore* semaphore) {
+void gpuFreeSemaphore(GpuQueue* queue, GpuSemaphore* semaphore) {
 	vkDestroySemaphore(queue->device, semaphore->semaphore, queue->callbacks);
 	queue->cpu_allocator(semaphore, 0);
 }
