@@ -59,7 +59,7 @@ std::span<const std::byte> byte_span(std::span<const T> span) {
  * Semantically equivalent to void. Some functions will expect a gpu* instead of
  * a void* to indicate that the data should be on the gpu.
  */
-struct gpu;
+struct gpu { char size_equals_one; };
 
 /**
  * GpuQueue

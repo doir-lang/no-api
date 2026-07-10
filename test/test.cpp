@@ -161,7 +161,7 @@ void init_vulkan(render_state& state) {
 	if(!queue) throw std::runtime_error("Failed to create noapi queue");
 	state.graphics_queue = queue;
 
-	state.surface = gpuCreateSurface(queue, state.raw_surface, GpuSurfaceDescriptor{
+	state.surface = gpuCreateSurfaceEXT(queue, state.raw_surface, GpuSurfaceDescriptor{
 		.texture = {
 			.dimensions = {WIDTH, HEIGHT, 1},
 			.format = FORMAT_RGBA8_UNORM
@@ -191,18 +191,59 @@ void init_vulkan(render_state& state) {
 	auto glsl = compile_glsl(EShLangCompute, R"glsl(
 		#version 460
 		#extension GL_EXT_shader_explicit_arithmetic_types : require
+		#extension GL_EXT_buffer_reference : require
+
+		const uint ADDRESS_MODE_CLAMP = 0;
+		const uint ADDRESS_MODE_MIRROR_REPEAT = 1;
+		const uint ADDRESS_MODE_REPEAT = 2;
+
+		const uint FILTER_NEAREST = 0;
+		const uint FILTER_LINEAR = 1;
+
+		struct GpuSamplerDesc {
+			uint address_mode_u; // CLAMP, REPEAT, MIRROR_REPEAT
+			uint address_mode_v; // CLAMP, REPEAT, MIRROR_REPEAT
+			uint address_mode_w; // CLAMP, REPEAT, MIRROR_REPEAT
+			uint mag_filter; // NEAREST, LINEAR
+			uint min_filter; // NEAREST, LINEAR
+			uint mip_filter; // NEAREST, LINEAR
+		};
+
+		uint gpuPackSamplerDesc(const GpuSamplerDesc d) {
+			return (d.address_mode_u) 
+			| (d.address_mode_v << 2) 
+			| (d.address_mode_w << 4) 
+			| (d.mag_filter << 6) 
+			| (d.min_filter << 7) 
+			| (d.mip_filter << 8);
+		}
+
+		GpuSamplerDesc gpuDefaultSampler() {
+			return GpuSamplerDesc(ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, FILTER_LINEAR, FILTER_LINEAR, FILTER_LINEAR);
+		}
+
+		layout(buffer_reference, std430) buffer GpuSamplerMap {
+			uint data[];
+		};
 
 		layout(push_constant) uniform PushConstants {
 			uint64_t compute_data;
+			GpuSamplerMap sampler_map;
 		} pc;
+
+		uint gpuGetSamplerIndex(const GpuSamplerDesc desc) {
+			return pc.sampler_map.data[gpuPackSamplerDesc(desc)];
+		}
+
 		// End prologue
 
-		#extension GL_EXT_buffer_reference : require
+		#extension GL_EXT_nonuniform_qualifier : require
 		#extension GL_EXT_descriptor_heap : require
 
 		layout(local_size_x = 16) in;
 
 		layout(descriptor_heap, rgba8) uniform image2D images[];
+		layout(descriptor_heap) uniform sampler2D samplers[];
 
 		layout(buffer_reference, std430) buffer Floats {
 			float data[];
@@ -214,6 +255,7 @@ void init_vulkan(render_state& state) {
 			uint i = gl_GlobalInvocationID.x;
 			floats.data[i] *= 5;
 			imageStore(images[0], ivec2(0), vec4(0));
+			samplers[gpuGetSamplerIndex(gpuDefaultSampler())];
 		}
 	)glsl");
 
@@ -221,12 +263,13 @@ void init_vulkan(render_state& state) {
 	GpuCommandBuffer* cmd = gpuStartCommandRecording(state.graphics_queue);
 
 	gpuSetActiveTextureHeapPtr(cmd, texture_heap_gpu, true);
+	gpuSetEnabledSamplersEXT(cmd, {});
 	gpuSetPipeline(cmd, pipeline);
 	gpuDispatch(cmd, upload_gpu, {1, 1, 1});
 	gpuMemCpy(cmd, download_gpu, upload_gpu, 16 * sizeof(float));
 
 	auto submission_index = gpuSubmit(state.graphics_queue, {&cmd, 1});
-	gpuWaitSemaphore(state.graphics_queue, gpuGetSubmissionTimelineSemaphore(state.graphics_queue), submission_index);
+	gpuWaitSemaphore(state.graphics_queue, gpuGetSubmissionSemaphoreEXT(state.graphics_queue), submission_index);
 
 	auto dbg_up = upload[5];
 	auto dbg_down = download[5];
@@ -323,11 +366,11 @@ void init_vulkan(render_state& state) {
 }
 
 void recreate_swapchain(render_state& state, uvec2 extent) {
-	gpuWaitIdle(state.graphics_queue);
+	gpuWaitIdleEXT(state.graphics_queue);
 
-	auto config = gpuSurfaceGetConfiguration(state.surface);
+	auto config = gpuSurfaceGetConfigurationEXT(state.surface);
 	config.texture.dimensions = {extent.x, extent.y, 1};
-	gpuSurfaceReconfigure(state.graphics_queue, state.surface, config);
+	gpuSurfaceReconfigureEXT(state.graphics_queue, state.surface, config);
 
 	for(auto framebuffer: state.framebuffers)
 		vkDestroyFramebuffer(state.graphics_queue->device, framebuffer, nullptr);
@@ -344,7 +387,7 @@ void cleanup(render_state& state) {
 		vkDestroySemaphore(state.graphics_queue->device, sema, nullptr);
 	for (auto framebuffer: state.framebuffers)
 		vkDestroyFramebuffer(state.graphics_queue->device, framebuffer, nullptr);
-	gpuFreeSurface(state.graphics_queue, state.surface);
+	gpuFreeSurfaceEXT(state.graphics_queue, state.surface);
 	// vkDestroyPipeline (state.graphics_queue->device, state.pipeline, nullptr);
 	// vkDestroyPipelineLayout(state.graphics_queue->device, state.pipeline_layout, nullptr);
 	gpuFreePipeline(state.graphics_queue, state.pipeline);
@@ -372,11 +415,11 @@ void draw_frame(render_state& state) {
 		glfwWaitEvents();
 	}
 	uvec2 needed_size = {static_cast<uint32_t>(w), static_cast<uint32_t>(h)};
-	auto surface_size = gpuSurfaceGetConfiguration(state.surface).texture.dimensions;
+	auto surface_size = gpuSurfaceGetConfigurationEXT(state.surface).texture.dimensions;
 	if(surface_size.x != w && surface_size.y != h)
 		recreate_swapchain(state, needed_size);
 
-	auto texture = gpuSurfaceNextTexture(state.graphics_queue, state.surface);
+	auto texture = gpuSurfaceNextTextureEXT(state.graphics_queue, state.surface);
 	if(errno == SURFACE_SUBOPTIMAL || errno == SURFACE_OUT_OF_DATE) {
 		recreate_swapchain(state, needed_size);
 		return;
@@ -441,7 +484,7 @@ void draw_frame(render_state& state) {
 		VK_CHECK(vkQueueSubmit2(state.graphics_queue->queue, 1, &info, fence), /*nothing*/);
 	}
 
-	gpuSurfacePresent(state.graphics_queue, state.surface, submit_index);
+	gpuSurfacePresentEXT(state.graphics_queue, state.surface, submit_index);
 	if(errno == SURFACE_SUBOPTIMAL || errno == SURFACE_OUT_OF_DATE)
 		recreate_swapchain(state, needed_size);
 

@@ -138,7 +138,7 @@ struct GpuSurfaceDescriptor {
  * @param ... Platform-specific windowing/display handles.
  * @param desc Surface configuration descriptor.
  */
-// GpuSurface* gpuCreateSurface(/* Platform creation logic up to implementation */);
+// GpuSurface* gpuCreateSurfaceEXT(/* Platform creation logic up to implementation */);
 
 /**
  * gpuFreeSurface – Destroy a presentation surface and release all associated
@@ -167,7 +167,7 @@ void gpuFreeSurfaceEXT(GpuQueue* queue, GpuSurface* surface);
  * @param surface Surface to reconfigure.
  * @param desc New surface configuration.
  */
-void gpuSurfaceReconfigure(GpuQueue* queue, GpuSurface* surface, const GpuSurfaceDescriptor& desc);
+void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSurfaceDescriptor& desc);
 
 /**
  * gpuGetSurfaceCapabilities – Query presentation capabilities for a surface.
@@ -184,7 +184,7 @@ void gpuSurfaceReconfigure(GpuQueue* queue, GpuSurface* surface, const GpuSurfac
  * @param surface Surface to query.
  * @return The GpuSurfaceDescriptor last used to create or reconfigure the surface.
  */
-GpuSurfaceDescriptor gpuSurfaceGetConfiguration(const GpuSurface* surface);
+GpuSurfaceDescriptor gpuSurfaceGetConfigurationEXT(const GpuSurface* surface);
 
 /**
  * gpuSurfaceGetNextTexture – Acquire the next presentable surface texture.
@@ -204,7 +204,7 @@ GpuSurfaceDescriptor gpuSurfaceGetConfiguration(const GpuSurface* surface);
  * @param queue GPU queue/device the surface was created against.
  * @param surface Surface to acquire the next presentable texture from.
  */
-const GpuTexture* gpuSurfaceNextTexture(GpuQueue* queue, GpuSurface* surface);
+const GpuTexture* gpuSurfaceNextTextureEXT(GpuQueue* queue, GpuSurface* surface);
 
 constexpr static uint64_t NO_SUBMISSION_WAIT = -1;
 
@@ -221,6 +221,6 @@ constexpr static uint64_t NO_SUBMISSION_WAIT = -1;
  * (as returned by gpuSubmit), or NO_SUBMISSION_WAIT to present without waiting
  * on a specific submission.
  */
-void gpuSurfacePresent(GpuQueue* queue, GpuSurface* surface, uint64_t wait_submission_index = NO_SUBMISSION_WAIT);
+void gpuSurfacePresentEXT(GpuQueue* queue, GpuSurface* surface, uint64_t wait_submission_index = NO_SUBMISSION_WAIT);
 
 

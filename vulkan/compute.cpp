@@ -6,16 +6,17 @@
 #include <VkBootstrap.h>
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added
 
-const GpuSemaphore* gpuGetSubmissionTimelineSemaphore(GpuQueue* queue) {
+const GpuSemaphore* gpuGetSubmissionSemaphoreEXT(GpuQueue* queue) {
 	return (GpuSemaphore*)&queue->command_submission_timeline_semaphore;
 }
 
-void gpuWaitIdle(GpuQueue* queue) {
+void gpuWaitIdleEXT(GpuQueue* queue) {
 	vkDeviceWaitIdle(queue->device);
 }
 
 struct ComputePipelinePushConstants {
 	gpu* data;
+	gpu* sampler_map;
 };
 
 GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, std::span<const std::byte> computeIR) {
@@ -316,7 +317,8 @@ void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline) {
 
 void gpuDispatch(GpuCommandBuffer* cmd, gpu* dataGpu, uvec3 gridDimensions) {
 	ComputePipelinePushConstants data {
-		.data = dataGpu
+		.data = dataGpu,
+		.sampler_map = (gpu*)cmd->sampler_map
 	};
 	VkPushDataInfoEXT info {
 		.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,

@@ -2,6 +2,7 @@
 
 #include "../surface.hpp"
 #include "../sync.hpp"
+#include "../samplers.hpp"
 #include "../allocator.hpp"
 
 #include <vulkan/vulkan_core.h>
@@ -12,6 +13,15 @@
 #include <expected>
 #include <memory>
 
+template<>
+struct std::hash<std::vector<GpuSamplerDesc>> {
+	size_t operator()(const std::vector<GpuSamplerDesc>& descs) const noexcept {
+		size_t out = 0;
+		for(auto& desc: descs)
+			out ^= desc.pack();
+		return out;
+	}
+};
 
 #define VK_CHECK(expr, RETURN) do {\
 	auto res = expr;\
@@ -20,7 +30,6 @@
 		return RETURN;\
 	}\
 } while(false)
-
 
 struct GpuVulkanDefault {
 	VkInstance instance = VK_NULL_HANDLE;
@@ -92,16 +101,19 @@ struct GpuQueue {
 	std::unordered_map<VkDeviceAddress, std::tuple<VkBuffer, VmaAllocation, VkDeviceSize>> allocations;
 	// Mapping from gpu* (Device Addresses) to a mapped descriptor heap
 	std::unordered_map<VkDeviceAddress, std::tuple<VkBuffer, VmaAllocation, VkDeviceSize, VkDeviceAddress>> descriptor_heaps;
-	VkDeviceSize minimum_descriptor_heap_size = 0;
+	VkDeviceSize minimum_descriptor_heap_size = 0, sampler_size = 0;
 	// Mappings between cpu and gpu pointers
 	std::unordered_map<void*, VkDeviceAddress> host2gpu;
 	std::unordered_map<VkDeviceAddress, void*> gpu2host;
 	std::unordered_map<VkDeviceAddress, VkImage> gpu2image;
 
+	std::unordered_map<std::vector<GpuSamplerDesc>, VkDeviceAddress> sampler_cache; 
+
 	VkCommandPool command_pool = VK_NULL_HANDLE;
 	VkSemaphore command_submission_timeline_semaphore = VK_NULL_HANDLE;
 	uint64_t command_submission_timeline_semaphore_next_value = 1;
 	std::vector<std::pair<VkCommandBuffer, uint64_t>> command_buffers_pending_free;
+	std::vector<void*> buffers_pending_free;
 };
 GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue = VK_NULL_HANDLE, uint32_t queue_family = -1, GpuAllocatorFunc allocator = default_::gpu_allocator, VkAllocationCallbacks* callbacks = nullptr, bool is_graphics_queue = true);
 inline GpuQueue* gpuCreateQueue(const GpuVulkanDefault& vulkan, GpuAllocatorFunc allocator = default_::gpu_allocator, VkAllocationCallbacks* callbacks = nullptr) {
@@ -125,6 +137,7 @@ struct GpuCommandBuffer {
 	VkCommandBuffer command_buffer;
 	bool ended = false;
 	const GpuPipeline* bound_pipeline = nullptr;
+	VkDeviceAddress sampler_map = {};
 };
 
 struct GpuSemaphore {
@@ -157,4 +170,4 @@ struct GpuSurface {
 
 	uint32_t current_image = -1, semaphore_counter = 0;
 };
-GpuSurface* gpuCreateSurface(GpuQueue* queue, VkSurfaceKHR surface, const GpuSurfaceDescriptor& desc);
+GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, VkSurfaceKHR surface, const GpuSurfaceDescriptor& desc);
