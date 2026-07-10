@@ -9,13 +9,13 @@
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added"
 
 
-GpuSurface* gpuCreateSurface(GpuQueue* queue, VkSurfaceKHR surface, const GpuSurfaceDescriptor& desc) {
+GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, VkSurfaceKHR surface, const GpuSurfaceDescriptor& desc) {
 	auto out = (GpuSurface*)queue->cpu_allocator(nullptr, sizeof(GpuSurface));
 	new(out) GpuSurface {
 		.surface = surface,
 	};
 
-	gpuSurfaceReconfigure(queue, out, desc);
+	gpuSurfaceReconfigureEXT(queue, out, desc);
 	return out;
 }
 
@@ -26,7 +26,7 @@ void gpuDestroySurfaceNoSemaphores(GpuQueue* queue, GpuSurface* surface) {
 		vkb::destroy_swapchain(*surface->swapchain);
 }
 
-void gpuFreeSurface(GpuQueue* queue, GpuSurface* surface) {
+void gpuFreeSurfaceEXT(GpuQueue* queue, GpuSurface* surface) {
 	for(auto semaphore: surface->image_available_semaphores)
 		vkDestroySemaphore(queue->device, semaphore, queue->callbacks);
 	for(auto semaphore: surface->render_finished_semaphores)
@@ -34,7 +34,7 @@ void gpuFreeSurface(GpuQueue* queue, GpuSurface* surface) {
 	gpuDestroySurfaceNoSemaphores(queue, surface);
 }
 
-void gpuSurfaceReconfigure(GpuQueue* queue, GpuSurface* surface, const GpuSurfaceDescriptor& desc) {
+void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSurfaceDescriptor& desc) {
 	surface->descriptor = desc;
 	surface->descriptor.texture.type = TEXTURE_2D;
 	surface->descriptor.texture.mipCount = 1;
@@ -81,11 +81,11 @@ void gpuSurfaceReconfigure(GpuQueue* queue, GpuSurface* surface, const GpuSurfac
 		};
 }
 
-GpuSurfaceDescriptor gpuSurfaceGetConfiguration(const GpuSurface* surface) {
+GpuSurfaceDescriptor gpuSurfaceGetConfigurationEXT(const GpuSurface* surface) {
 	return surface->descriptor;
 }
 
-const GpuTexture* gpuSurfaceNextTexture(GpuQueue* queue, GpuSurface* surface) {
+const GpuTexture* gpuSurfaceNextTextureEXT(GpuQueue* queue, GpuSurface* surface) {
 	if(surface->image_available_semaphores.size() != surface->images.size()) {
 		for(auto semaphore: surface->image_available_semaphores)
 			vkDestroySemaphore(queue->device, semaphore, queue->callbacks);
@@ -105,7 +105,7 @@ const GpuTexture* gpuSurfaceNextTexture(GpuQueue* queue, GpuSurface* surface) {
 	return &surface->images[surface->current_image];
 }
 
-void gpuSurfacePresent(GpuQueue* queue, GpuSurface* surface, uint64_t wait_submission_index /*= NO_SUBMISSION_WAIT */) {
+void gpuSurfacePresentEXT(GpuQueue* queue, GpuSurface* surface, uint64_t wait_submission_index /*= NO_SUBMISSION_WAIT */) {
 	if(wait_submission_index != NO_SUBMISSION_WAIT) {
 		if(surface->render_finished_semaphores.size() != surface->images.size()) {
 			for(auto semaphore: surface->render_finished_semaphores)

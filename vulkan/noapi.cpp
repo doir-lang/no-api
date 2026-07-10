@@ -127,6 +127,7 @@ GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice dev
 	};
 	vkGetPhysicalDeviceProperties2(gpu, &properties);
 	out->minimum_descriptor_heap_size = heap_properties.minResourceHeapReservedRange;
+	out->sampler_size = heap_properties.samplerDescriptorSize;
 
 	return out;
 }
@@ -137,8 +138,13 @@ void gpuFreeQueue(GpuQueue* queue) {
 	if(queue->command_submission_timeline_semaphore)
 		vkDestroySemaphore(queue->device, queue->command_submission_timeline_semaphore, queue->callbacks);
 
+	for(auto [_, buffer]: queue->sampler_cache)
+		gpuFree(queue, (gpu*)buffer);
+
 	if(queue->gpu_allocator)
 		vmaDestroyAllocator(queue->gpu_allocator);
+
+	queue->~GpuQueue(); // Get all of the caches to free their memory
 	queue->cpu_allocator(queue, 0);
 }
 
