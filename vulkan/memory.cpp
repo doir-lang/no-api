@@ -87,6 +87,11 @@ void gpuFree(GpuQueue* queue, gpu* ptr) {
 		vmaDestroyBuffer(queue->gpu_allocator, buffer, allocation);
 	}
 
+	if(queue->gpu2index.contains(gpu_ptr)) {
+		auto [buffer, allocation, _size] = queue->gpu2index[gpu_ptr];
+		vmaDestroyBuffer(queue->gpu_allocator, buffer, allocation);
+	}
+
 	vmaDestroyBuffer(queue->gpu_allocator, buffer, allocation);
 }
 
@@ -159,18 +164,6 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 }
 
 inline GpuTextureDescriptor gpuTextureViewDescriptorImpl(GpuQueue* queue, const GpuTexture* texture, const GpuViewDesc& desc, bool read_only) {
-	constexpr static auto type2vulkan = [](TEXTURE type) {
-		switch (type) {
-		case TEXTURE_1D: return VK_IMAGE_VIEW_TYPE_1D;
-		case TEXTURE_2D: return VK_IMAGE_VIEW_TYPE_2D;
-		case TEXTURE_3D: return VK_IMAGE_VIEW_TYPE_3D;
-		case TEXTURE_2D_ARRAY: return VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-		case TEXTURE_CUBE: return VK_IMAGE_VIEW_TYPE_CUBE;
-		case TEXTURE_CUBE_ARRAY: return VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
-		}
-		std::unreachable();
-	};
-
 	GpuTextureDescriptor out = {};
 	VkHostAddressRangeEXT host_info {
 		.address = &out,
@@ -181,7 +174,7 @@ inline GpuTextureDescriptor gpuTextureViewDescriptorImpl(GpuQueue* queue, const 
 	VkImageViewCreateInfo view_info {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 		.image = texture->image,
-		.viewType = type2vulkan(texture->descriptor.type),
+		.viewType = GPU::detail::type2vulkan(texture->descriptor.type),
 		.format = GPU::detail::format2vulkan(format),
 		.subresourceRange = {
 			.aspectMask = static_cast<VkImageAspectFlags>(gpuFormatIsDepth(format)

@@ -8,6 +8,7 @@
 #include <vulkan/vulkan_core.h>
 #include <vk_mem_alloc.h>
 
+#include <vector>
 #include <unordered_map>
 #include <functional>
 #include <expected>
@@ -40,39 +41,41 @@ struct GpuVulkanDefault {
 	VkQueue graphics_queue = VK_NULL_HANDLE;
 	uint32_t graphics_queue_family;
 };
-std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkan(
+std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(
 	std::function_ref<VkSurfaceKHR(VkInstance)> surface_loader, std::span<const char*> instance_extensions = {}, std::span<const char*> extra_layers = {}, std::span<const char*> device_extensions = {}, bool debug = true
 );
 
-inline VkPhysicalDeviceFeatures gpuEnableRequiredVulkanFeatures(VkPhysicalDeviceFeatures features) {
+inline VkPhysicalDeviceFeatures gpuEnableRequiredVulkanFeaturesEXT(VkPhysicalDeviceFeatures features) {
 	features.shaderInt64 = true;
 	return features;
 }
 
-inline VkPhysicalDeviceVulkan12Features gpuEnableRequiredVulkan12Features(VkPhysicalDeviceVulkan12Features features) {
+inline VkPhysicalDeviceVulkan12Features gpuEnableRequiredVulkan12FeaturesEXT(VkPhysicalDeviceVulkan12Features features) {
 	features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
 	features.bufferDeviceAddress = true;
 	features.timelineSemaphore = true;
 	return features;
 }
 
-inline VkPhysicalDeviceVulkan13Features gpuEnableRequiredVulkan13Features(VkPhysicalDeviceVulkan13Features features) {
+inline VkPhysicalDeviceVulkan13Features gpuEnableRequiredVulkan13FeaturesEXT(VkPhysicalDeviceVulkan13Features features) {
 	features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+	features.dynamicRendering = true;
 	features.synchronization2 = true;
 	return features;
 }
 
-inline VkPhysicalDeviceVulkan14Features gpuEnableRequiredVulkan14Features(VkPhysicalDeviceVulkan14Features features) {
+inline VkPhysicalDeviceVulkan14Features gpuEnableRequiredVulkan14FeaturesEXT(VkPhysicalDeviceVulkan14Features features) {
 	features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
-	features.pushDescriptor = true;
+	// features.pushDescriptor = true;
+	features.indexTypeUint8 = true;
 	return features;
 }
 
-inline std::vector<const char*> gpuRequiredVulkanDeviceExtensions() {
+inline std::vector<const char*> gpuRequiredVulkanDeviceExtensionsEXT() {
 	return {"VK_EXT_descriptor_heap", "VK_KHR_shader_untyped_pointers"};
 }
 
-inline void* gpuRequiredVulkanDeviceCreateInfoPnext() {
+inline void* gpuRequiredVulkanDeviceCreateInfoPnextEXT() {
 	static VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptor_heap_info {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT,
 		.descriptorHeap = true
@@ -105,15 +108,17 @@ struct GpuQueue {
 	// Mappings between cpu and gpu pointers
 	std::unordered_map<void*, VkDeviceAddress> host2gpu;
 	std::unordered_map<VkDeviceAddress, void*> gpu2host;
+	// Mapping from gpu* (Device Addresses) to an associated image
 	std::unordered_map<VkDeviceAddress, VkImage> gpu2image;
+	// Mapping from gpu* (Device Addresses) to an associated index buffer
+	std::unordered_map<VkDeviceAddress, std::tuple<VkBuffer, VmaAllocation, VkDeviceSize>> gpu2index;
 
-	std::unordered_map<std::vector<GpuSamplerDesc>, VkDeviceAddress> sampler_cache; 
+	std::unordered_map<std::vector<GpuSamplerDesc>, VkDeviceAddress> sampler_cache;
 
 	VkCommandPool command_pool = VK_NULL_HANDLE;
 	VkSemaphore command_submission_timeline_semaphore = VK_NULL_HANDLE;
 	uint64_t command_submission_timeline_semaphore_next_value = 1;
 	std::vector<std::pair<VkCommandBuffer, uint64_t>> command_buffers_pending_free;
-	std::vector<void*> buffers_pending_free;
 };
 GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue = VK_NULL_HANDLE, uint32_t queue_family = -1, GpuAllocatorFunc allocator = default_::gpu_allocator, VkAllocationCallbacks* callbacks = nullptr, bool is_graphics_queue = true);
 inline GpuQueue* gpuCreateQueue(const GpuVulkanDefault& vulkan, GpuAllocatorFunc allocator = default_::gpu_allocator, VkAllocationCallbacks* callbacks = nullptr) {
@@ -121,13 +126,13 @@ inline GpuQueue* gpuCreateQueue(const GpuVulkanDefault& vulkan, GpuAllocatorFunc
 }
 
 struct GpuPipeline {
-	// VkShaderModule compute_module; // TODO: Do we have a need to carry this around?
 	VkPipeline pipeline;
 	std::optional<size_t> color_target_count = {}; // When null indicates a compute pipeline
 };
 
 struct GpuTexture {
 	VkImage image;
+	VkImageView full_view;
 	GpuTextureDesc descriptor;
 	VkSemaphore available_semaphore = VK_NULL_HANDLE;
 };
@@ -135,9 +140,14 @@ struct GpuTexture {
 struct GpuCommandBuffer {
 	GpuQueue* queue;
 	VkCommandBuffer command_buffer;
-	bool ended = false;
+	enum State {
+		Recording,
+		RecordingRenderPass,
+		Ended
+	} state;
 	const GpuPipeline* bound_pipeline = nullptr;
 	VkDeviceAddress sampler_map = {};
+	std::vector<VkSemaphore> wait_semaphores;
 };
 
 struct GpuSemaphore {
@@ -171,3 +181,107 @@ struct GpuSurface {
 	uint32_t current_image = -1, semaphore_counter = 0;
 };
 GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, VkSurfaceKHR surface, const GpuSurfaceDescriptor& desc);
+
+
+
+constexpr static std::string_view COMPUTE_SHADER_PROLOGUE = R"(
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_buffer_reference : require
+
+const uint ADDRESS_MODE_CLAMP = 0;
+const uint ADDRESS_MODE_MIRROR_REPEAT = 1;
+const uint ADDRESS_MODE_REPEAT = 2;
+
+const uint FILTER_NEAREST = 0;
+const uint FILTER_LINEAR = 1;
+
+struct GpuSamplerDesc {
+	uint address_mode_u; // CLAMP, REPEAT, MIRROR_REPEAT
+	uint address_mode_v; // CLAMP, REPEAT, MIRROR_REPEAT
+	uint address_mode_w; // CLAMP, REPEAT, MIRROR_REPEAT
+	uint mag_filter; // NEAREST, LINEAR
+	uint min_filter; // NEAREST, LINEAR
+	uint mip_filter; // NEAREST, LINEAR
+};
+
+uint gpuPackSamplerDesc(const GpuSamplerDesc d) {
+	return (d.address_mode_u)
+	| (d.address_mode_v << 2)
+	| (d.address_mode_w << 4)
+	| (d.mag_filter << 6)
+	| (d.min_filter << 7)
+	| (d.mip_filter << 8);
+}
+
+GpuSamplerDesc gpuDefaultSampler() {
+	return GpuSamplerDesc(ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, FILTER_LINEAR, FILTER_LINEAR, FILTER_LINEAR);
+}
+
+layout(buffer_reference, std430) buffer GpuSamplerMap {
+	uint data[];
+};
+
+layout(push_constant) uniform PushConstants {
+	uint64_t compute_data;
+	GpuSamplerMap sampler_map;
+} pc;
+
+uint gpuGetSamplerIndex(const GpuSamplerDesc desc) {
+	return pc.sampler_map.data[gpuPackSamplerDesc(desc)];
+}
+
+// End prologue
+)";
+
+constexpr static std::string_view GRAPHICS_SHADER_PROLOGUE = R"(
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_buffer_reference : require
+
+const uint ADDRESS_MODE_CLAMP = 0;
+const uint ADDRESS_MODE_MIRROR_REPEAT = 1;
+const uint ADDRESS_MODE_REPEAT = 2;
+
+const uint FILTER_NEAREST = 0;
+const uint FILTER_LINEAR = 1;
+
+struct GpuSamplerDesc {
+	uint address_mode_u; // CLAMP, REPEAT, MIRROR_REPEAT
+	uint address_mode_v; // CLAMP, REPEAT, MIRROR_REPEAT
+	uint address_mode_w; // CLAMP, REPEAT, MIRROR_REPEAT
+	uint mag_filter; // NEAREST, LINEAR
+	uint min_filter; // NEAREST, LINEAR
+	uint mip_filter; // NEAREST, LINEAR
+};
+
+uint gpuPackSamplerDesc(const GpuSamplerDesc d) {
+	return (d.address_mode_u)
+	| (d.address_mode_v << 2)
+	| (d.address_mode_w << 4)
+	| (d.mag_filter << 6)
+	| (d.min_filter << 7)
+	| (d.mip_filter << 8);
+}
+
+GpuSamplerDesc gpuDefaultSampler() {
+	return GpuSamplerDesc(ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, FILTER_LINEAR, FILTER_LINEAR, FILTER_LINEAR);
+}
+
+layout(buffer_reference, std430) buffer GpuSamplerMap {
+	uint data[];
+};
+
+layout(push_constant) uniform PushConstants {
+	uint64_t vertex_data;
+	uint64_t fragment_data;
+	uint64_t index_data;
+	GpuSamplerMap sampler_map;
+} pc;
+
+uint gpuGetSamplerIndex(const GpuSamplerDesc desc) {
+	return pc.sampler_map.data[gpuPackSamplerDesc(desc)];
+}
+
+// End prologue
+)";

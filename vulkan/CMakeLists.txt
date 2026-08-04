@@ -36,6 +36,7 @@ endif()
 
 add_library(noapi-vulkan STATIC noapi.cpp memory.cpp compute.cpp graphics.cpp surface.cpp samplers.cpp)
 target_link_libraries(noapi-vulkan PUBLIC
+	Vulkan::Vulkan
 	volk::volk
 	vk-bootstrap::vk-bootstrap
 	GPUOpen::VulkanMemoryAllocator

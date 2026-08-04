@@ -20,6 +20,7 @@
 // Basic math types used in the API
 // ---------------------------------------------------------------------------
 struct uvec2 { uint32_t x, y; };
+struct ivec2 { int32_t x, y; };
 
 // ---------------------------------------------------------------------------
 // Opaque GPU object handles
@@ -128,6 +129,12 @@ enum TOPOLOGY {
 	// TOPOLOGY_TRIANGLE_FAN, // Not supported by WebGPU
 };
 
+enum INDEX_TYPE_EXT {
+	INDEX_TYPE_UINT8,
+	INDEX_TYPE_UINT16,
+	INDEX_TYPE_UINT32
+};
+
 // ---------------------------------------------------------------------------
 // Structs
 // ---------------------------------------------------------------------------
@@ -135,7 +142,7 @@ enum TOPOLOGY {
 /**
  * Stencil – Per-face stencil operation description used inside GpuDepthStencilDesc.
  */
-struct Stencil {
+struct GpuStencil {
 	OP test = OP_ALWAYS; ///< Stencil comparison function.
 	STENCIL_OP failOp = STENCIL_OP_KEEP; ///< Action when stencil test fails.
 	STENCIL_OP passOp = STENCIL_OP_KEEP; ///< Action when both tests pass.
@@ -163,8 +170,8 @@ struct GpuDepthStencilDesc {
 	float depthBiasClamp = 0.0f; ///< Maximum magnitude of the slope-scaled depth bias.
 	uint8_t stencilReadMask = 0xff; ///< Mask ANDed with the stencil buffer before comparison.
 	uint8_t stencilWriteMask = 0xff; ///< Mask ANDed with written stencil values.
-	Stencil stencilFront; ///< Stencil ops for front-facing (CCW) triangles.
-	Stencil stencilBack; ///< Stencil ops for back-facing (CW) triangles.
+	GpuStencil stencilFront; ///< Stencil ops for front-facing (CCW) triangles.
+	GpuStencil stencilBack; ///< Stencil ops for back-facing (CW) triangles.
 };
 
 /**
@@ -200,7 +207,7 @@ struct GpuBlendDesc {
  * from GpuBlendDesc::colorWriteMask, which applies when a dynamic GpuBlendState is
  * in use.
  */
-struct ColorTarget {
+struct GpuColorTarget {
 	FORMAT format = FORMAT_NONE; ///< Pixel format of this render target attachment.
 	uint8_t writeMask = 0xf; ///< Bitmask: bit 0=R, 1=G, 2=B, 3=A. 0xf = write all channels.
 };
@@ -248,7 +255,7 @@ struct GpuRasterDesc {
 	///< List of colour render target formats and write masks. Maximum is
 	///< hardware-defined (typically 8). An empty std::span means no colour output
 	///< (e.g. depth-only shadow pass).
-	std::span<ColorTarget> colorTargets = {};
+	std::span<GpuColorTarget> colorTargets = {};
 
 	///< Optional pointer to an embedded (baked) blend state. When non-null the
 	///< blend equation is compiled into the PSO, allowing the driver to dead-code-
@@ -373,16 +380,16 @@ struct GpuDepthStencilAttachment {
 	/**
 	 * Depth load operation
 	 */
-	LOAD_OP depthLoadOp = LOAD_OP_LOAD;
+	LOAD_OP loadOp = LOAD_OP_LOAD;
 	/**
 	 * Depth store operation
 	 */
-	STORE_OP depthStoreOp = STORE_OP_STORE;
+	STORE_OP storeOp = STORE_OP_STORE;
 
 	/**
 	 * Clear depth value used when depthLoadOp == LOAD_OP_CLEAR.
 	 */
-	float clearValue = 1.0f;
+	double clearValue = 1.0f;
 };
 
 /**
@@ -570,7 +577,7 @@ void gpuSetScissorRectEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin = {0
  * @param cmd Command buffer to record into.
  * @param desc Render target attachments and their load/store behaviour.
  */
-void gpuBeginRenderPass(GpuCommandBuffer* cmd, const GpuRenderPassDesc* desc);
+void gpuBeginRenderPass(GpuCommandBuffer* cmd, const GpuRenderPassDesc& desc);
 
 /**
  * gpuEndRenderPass – End the current render pass and trigger (on TBDR GPUs) tile
@@ -579,8 +586,11 @@ void gpuBeginRenderPass(GpuCommandBuffer* cmd, const GpuRenderPassDesc* desc);
  * Does NOT insert an automatic barrier after the pass. If subsequent passes need
  * to read these render targets as textures, the user must call gpuBarrier with
  * STAGE_RASTER_COLOR_OUT / STAGE_RASTER_DEPTH_OUT as the producer stage.
+ *
+ * @param cmd The command buffer to bind against.
+ * @param desc (optionally) the same render pass descriptor that was passed to gpuBeginRenderPass (transitions the images to a more optimal presentation layout if provided)
  */
-void gpuEndRenderPass(GpuCommandBuffer* cmd);
+void gpuEndRenderPass(GpuCommandBuffer* cmd, std::optional<const GpuRenderPassDesc> desc = {});
 
 // ---------------------------------------------------------------------------
 // GPU commands – rasterizer draw calls
@@ -634,29 +644,34 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd,
  gpu* indices, gpu* args, 
  INDEX_TYPE_EXT index_type = INDEX_TYPE_UINT32, bool no_offsets = false, bool no_index_buffer_changes = false);
 
-/**
- * gpuDrawIndexedInstancedIndirectMulti – Multi-draw indirect with per-draw root data.
- *
- * Allows the GPU to drive an entire batch of draw calls, each with its own root
- * data structs, avoiding the per-draw CPU overhead of vkCmdDrawIndexedIndirectCount
- * (which shares a single descriptor set for all draws). This enables clean, efficient
- * per-draw material/texture switching with no hacks or shader indirections.
- *
- * A stride of 0 for vertex or pixel data means the same pointer is replicated for
- * every draw (akin to a broadcast), reducing memory if all draws share parameters.
- *
- * @param cmd Command buffer to record into.
- * @param dataVxGpu GPU pointer to the array of vertex shader root data structs.
- * @param vxStride Stride between vertex data entries in bytes (0 = broadcast first).
- * @param dataPxGpu GPU pointer to the array of pixel shader root data structs.
- * @param pxStride Stride between pixel data entries in bytes (0 = broadcast first).
- * @param argsGpu GPU pointer to an array of indirect draw argument structs.
- * @param drawCountGpu GPU pointer to a uint32 holding the actual draw count.
- */
-void gpuDrawIndexedInstancedIndirectMulti(GpuCommandBuffer* cmd,
- gpu* dataVxGpu, uint32_t vxStride,
- gpu* dataPxGpu, uint32_t pxStride,
- gpu* argsGpu, gpu* drawCountGpu);
+// TODO: Why does this one not take an index buffer?
+// /**
+//  * gpuDrawIndexedInstancedIndirectMulti – Multi-draw indirect with per-draw root data.
+//  *
+//  * Allows the GPU to drive an entire batch of draw calls, each with its own root
+//  * data structs, avoiding the per-draw CPU overhead of vkCmdDrawIndexedIndirectCount
+//  * (which shares a single descriptor set for all draws). This enables clean, efficient
+//  * per-draw material/texture switching with no hacks or shader indirections.
+//  *
+//  * A stride of 0 for vertex or pixel data means the same pointer is replicated for
+//  * every draw (akin to a broadcast), reducing memory if all draws share parameters.
+//  *
+//  * @param cmd Command buffer to record into.
+//  * @param dataVxGpu GPU pointer to the array of vertex shader root data structs.
+//  * @param vxStride Stride between vertex data entries in bytes (0 = broadcast first).
+//  * @param dataPxGpu GPU pointer to the array of pixel shader root data structs.
+//  * @param pxStride Stride between pixel data entries in bytes (0 = broadcast first).
+//  * @param argsGpu GPU pointer to an array of indirect draw argument structs.
+//  * @param drawCountGpu GPU pointer to a uint32 holding the actual draw count.
+//  * @param index_type expected type of the bound indicies
+//  * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
+//  * @param no_index_buffer_changes When true reuses the last value in interal index buffer (skips copying any changed indicies)
+//  */
+// void gpuDrawIndexedInstancedIndirectMulti(GpuCommandBuffer* cmd,
+//  gpu* dataVxGpu, uint32_t vxStride,
+//  gpu* dataPxGpu, uint32_t pxStride,
+//  gpu* argsGpu, gpu* drawCountGpu, 
+//  INDEX_TYPE_EXT index_type = INDEX_TYPE_UINT32, bool no_offsets = false, bool no_index_buffer_changes = false);
 
 /**
  * gpuDrawMeshlets – Launch a mesh shader pass, dispatching a 3D grid of mesh

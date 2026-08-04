@@ -2,6 +2,7 @@
 #include <vk_mem_alloc.h>
 
 #include "noapi.hpp"
+#include "common.hpp"
 
 #include <VkBootstrap.h>
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added
@@ -58,38 +59,8 @@ void gpuFreePipeline(GpuQueue* queue, GpuPipeline* pipeline) {
 	queue->cpu_allocator(pipeline, 0);
 }
 
-inline std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress> closest_buffer(GpuQueue* queue, gpu* addr, bool no_offsets) {
-	auto address = (VkDeviceAddress)addr;
-	VkDeviceAddress closest = 0; // TODO: There are probably edge cases around setting these to zero!
-	if(no_offsets)
-		closest = address;
-	else for(auto [key, _]: queue->allocations) {
-		if(closest - address > key - address)
-			closest = key;
-	}
-	return {std::get<VkBuffer>(queue->allocations[closest]), closest - address, address};
-}
-
-inline std::array<std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress>, 2> closest_buffer(GpuQueue* queue, gpu* addrA, gpu* addrB, bool no_offsets) {
-	auto a = (VkDeviceAddress)addrA, b = (VkDeviceAddress)addrB;
-	VkDeviceAddress closestA = 0, closestB = 0; // TODO: There are probably edge cases around setting these to zero!
-	if(no_offsets) {
-		closestA = a;
-		closestB = b;
-	} else for(auto [key, _]: queue->allocations) {
-		if(closestA - a > key - a)
-			closestA = key;
-		if(closestB - b > key - b)
-			closestB = key;
-	}
-	return {
-		std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress>{std::get<VkBuffer>(queue->allocations[closestA]), closestA - a, a}, 
-		std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress>{std::get<VkBuffer>(queue->allocations[closestB]), closestB - b, b}
-	};
-}
-
 void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes, bool no_offsets /* = false*/) {
-	auto [dest, src] = closest_buffer(cmd->queue, dest_, src_, no_offsets);
+	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_, no_offsets);
 	auto [dest_buffer, dest_offset, dest_addr] = dest; auto [src_buffer, src_offset, src_addr] = src;
 
 	VkBufferCopy region {
@@ -101,7 +72,7 @@ void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes, bool 
 }
 
 void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* texture, bool no_offsets /* = false */) {
-	auto [dest, src] = closest_buffer(cmd->queue, dest_, src_, no_offsets);
+	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_, no_offsets);
 	auto [dest_buffer, dest_offset, dest_addr] = dest; auto [src_buffer, src_offset, src_addr] = src;
 
 	assert(cmd->queue->gpu2image.contains(dest_addr) && cmd->queue->gpu2image[dest_addr] == texture->image);
@@ -130,7 +101,7 @@ void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* 
 }
 
 void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuTexture* texture, bool no_offsets /* = false */) {
-	auto [dest, src] = closest_buffer(cmd->queue, dest_, src_, no_offsets);
+	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_, no_offsets);
 	auto [dest_buffer, dest_offset, dest_addr] = dest; auto [src_buffer, src_offset, src_addr] = src;
 
 	assert(cmd->queue->gpu2image.contains(src_addr) && cmd->queue->gpu2image[src_addr] == texture->image);
@@ -159,7 +130,7 @@ void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuT
 }
 
 void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap, bool no_offsets /* = false */) {
-	auto [source_buffer, offset, source_address] = closest_buffer(cmd->queue, texture_heap, no_offsets);
+	auto [source_buffer, offset, source_address] = GPU::detail::closest_buffer(cmd->queue, texture_heap, no_offsets);
 	auto source_size = std::get<VkDeviceSize>(cmd->queue->allocations[source_address]);
 	
 	if(!cmd->queue->descriptor_heaps.contains(source_address)) {
@@ -346,6 +317,6 @@ void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* dataGpu, gpu* gridDimension
 	};
 	vkCmdPushDataEXT(cmd->command_buffer, &info);
 
-	auto [buffer, offset, _address] = closest_buffer(cmd->queue, gridDimensionsGpu, no_offsets);
+	auto [buffer, offset, _address] = GPU::detail::closest_buffer(cmd->queue, gridDimensionsGpu, no_offsets);
 	vkCmdDispatchIndirect(cmd->command_buffer, buffer, offset);
 }

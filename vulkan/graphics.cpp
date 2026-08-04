@@ -5,10 +5,17 @@
 
 #include "compute.hpp"
 #include "noapi.hpp"
-#include "vulkan/common.hpp"
+#include "common.hpp"
 
 #include <VkBootstrap.h>
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added
+
+struct GraphicsPipelinePushConstants {
+	gpu* vertex;
+	gpu* fragment;
+	gpu* index;
+	gpu* sampler_map;
+};
 
 
 VkBlendOp blend2vulkan(BLEND op) {
@@ -52,81 +59,6 @@ VkColorComponentFlags mask2vulkan(uint8_t mask) {
 };
 
 
-
-inline VkRenderPass create_compatible_render_pass(VkDevice device, const GpuRasterDesc& raster) {
-	std::vector<VkAttachmentDescription> attachmentDescs;
-	std::vector<VkAttachmentReference> colorRefs;
-
-	attachmentDescs.reserve(raster.colorTargets.size() + 1);
-	colorRefs.reserve(raster.colorTargets.size());
-
-	for (const ColorTarget& target : raster.colorTargets) {
-		VkAttachmentDescription desc{};
-		desc.format = GPU::detail::format2vulkan(target.format);
-		desc.samples = GPU::detail::samples2vulkan(raster.sampleCount);
-		desc.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; // adjust to your clear policy
-		desc.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-		desc.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-		desc.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-		desc.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-		desc.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
-		VkAttachmentReference ref{};
-		ref.attachment = static_cast<uint32_t>(attachmentDescs.size());
-		ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-		attachmentDescs.push_back(desc);
-		colorRefs.push_back(ref);
-	}
-
-	VkAttachmentReference depthRef{};
-	const bool hasDepth = raster.depthFormat != FORMAT_NONE;
-	const bool hasStencil = raster.stencilFormat != FORMAT_NONE || gpuFormatIsStencil(raster.depthFormat);
-	if (hasDepth) {
-		VkAttachmentDescription desc{
-			.format = GPU::detail::format2vulkan(raster.depthFormat),
-			.samples = GPU::detail::samples2vulkan(raster.sampleCount),
-			.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-			.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-			.stencilLoadOp = hasStencil ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.stencilStoreOp = hasStencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-			.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-		};
-
-		depthRef.attachment = static_cast<uint32_t>(attachmentDescs.size());
-		depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-		attachmentDescs.push_back(desc);
-	}
-
-	VkSubpassDescription subpass{};
-	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-	subpass.colorAttachmentCount = static_cast<uint32_t>(colorRefs.size());
-	subpass.pColorAttachments = colorRefs.empty() ? nullptr : colorRefs.data();
-	subpass.pDepthStencilAttachment = hasDepth ? &depthRef : nullptr;
-
-	VkSubpassDependency dep = {
-		.srcSubpass = VK_SUBPASS_EXTERNAL,
-		.dstSubpass = 0,
-		.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		.srcAccessMask = 0,
-		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	};
-	VkRenderPassCreateInfo info{
-		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-		.attachmentCount = static_cast<uint32_t>(attachmentDescs.size()),
-		.pAttachments = attachmentDescs.empty() ? nullptr : attachmentDescs.data(),
-		.subpassCount = 1,
-		.pSubpasses = &subpass,
-		.dependencyCount = 1,
-		.pDependencies = &dep,
-	};
-	VkRenderPass renderPass = VK_NULL_HANDLE;
-	VK_CHECK(vkCreateRenderPass(device, &info, nullptr, &renderPass), VK_NULL_HANDLE);
-	return renderPass;
-}
 
 GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, std::span<const std::byte> vertexIR, std::span<const std::byte> fragmentIR, const GpuRasterDesc& desc) {
 	constexpr static auto topology2vulkan = [](TOPOLOGY t) -> VkPrimitiveTopology{
@@ -220,7 +152,7 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, std::span<const std::byt
 		const bool blendEnabled = desc.blendstate.has_value();
 		const GpuBlendDesc blend = desc.blendstate.value_or(GpuBlendDesc{});
 
-		for (const ColorTarget& target : desc.colorTargets) {
+		for (const GpuColorTarget& target : desc.colorTargets) {
 			VkPipelineColorBlendAttachmentState state{};
 			state.blendEnable = blendEnabled ? VK_TRUE : VK_FALSE;
 
@@ -268,10 +200,21 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, std::span<const std::byt
 	dynamic_state.dynamicStateCount = 2;
 	dynamic_state.pDynamicStates = dynamic.data();
 
-	auto compatible_render_pass = create_compatible_render_pass(queue->device, desc);
+	std::vector<VkFormat> color_formats; color_formats.reserve(desc.colorTargets.size());
+	for(auto& target: desc.colorTargets)
+		color_formats.emplace_back(GPU::detail::format2vulkan(target.format));
+
+	VkPipelineRenderingCreateInfo dynamic_rendering_info {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+		.colorAttachmentCount = static_cast<uint32_t>(color_formats.size()),
+		.pColorAttachmentFormats = color_formats.data(),
+		.depthAttachmentFormat = desc.depthFormat == FORMAT_NONE ? VK_FORMAT_UNDEFINED : GPU::detail::format2vulkan(desc.depthFormat),
+		.stencilAttachmentFormat = desc.stencilFormat == FORMAT_NONE ? VK_FORMAT_UNDEFINED : GPU::detail::format2vulkan(desc.stencilFormat),
+	};
 
 	VkPipelineCreateFlags2CreateInfo create_flags {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
+		.pNext = &dynamic_rendering_info,
 		.flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT
 	};
 	VkGraphicsPipelineCreateInfo info {
@@ -287,15 +230,15 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, std::span<const std::byt
 		.pDepthStencilState = &depth_stencil_state,
 		.pColorBlendState = &color_blend_state,
 		.pDynamicState = &dynamic_state,
-		.renderPass = compatible_render_pass,
-		.subpass = 0,
+		.renderPass = VK_NULL_HANDLE,
+		// .subpass = 0,
 		.basePipelineIndex = -1
 	};
 	vkCreateGraphicsPipelines(queue->device, VK_NULL_HANDLE, 1, &info, queue->callbacks, &out->pipeline);
 
 	for(auto module: shader_modules)
 		vkDestroyShaderModule(queue->device, module, queue->callbacks);
-	vkDestroyRenderPass(queue->device, compatible_render_pass, queue->callbacks);
+	// vkDestroyRenderPass(queue->device, compatible_render_pass, queue->callbacks);
 
 	return out;
 }
@@ -426,4 +369,385 @@ void gpuSetBlendState(GpuCommandBuffer* cmd, const GpuBlendState* state) {
 	// for (uint32_t i = 0; i < count; ++i)
 	// 	masks[i] = mask2vulkan(writeMasks[i] & state->descriptor.colorWriteMask);
 	// vkCmdSetColorWriteMaskEXT(cmd, 0, count, masks.data());
+}
+
+void gpuSetViewportEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin /*= {0, 0} */, float depth_min /* = 0 */, float depth_max /* = 1 */) {
+	VkViewport viewport {
+		.x = static_cast<float>(origin.x),
+		.y = static_cast<float>(origin.y),
+		.width = static_cast<float>(extent.x),
+		.height = static_cast<float>(extent.y),
+		.minDepth = depth_min,
+		.maxDepth = depth_max,
+	};
+	vkCmdSetViewport(cmd->command_buffer, 0, 1, &viewport);
+}
+
+void gpuSetScissorRectEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin /* = {0, 0} */) {
+	VkRect2D scissor { // TODO: Should we support additional scissors?
+		.offset = {origin.x, origin.y},
+		.extent = {extent.x, extent.y},
+	};
+	vkCmdSetScissor(cmd->command_buffer, 0, 1, &scissor);
+}
+
+inline void transition_image_layout(VkCommandBuffer cmd, VkImage image, VkImageLayout old_layout, VkImageLayout new_layout, VkAccessFlags source_access_mask, VkAccessFlags destination_access_mask, VkPipelineStageFlags source_stage, VkPipelineStageFlags destination_stage, uint32_t base_mip_level, uint32_t mip_levels, uint32_t base_slice, uint32_t slices) {
+	VkImageMemoryBarrier barrier{
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		.srcAccessMask = source_access_mask,
+		.dstAccessMask = destination_access_mask,
+		.oldLayout = old_layout,
+		.newLayout = new_layout,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.image = image,
+		.subresourceRange = {
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.baseMipLevel = base_mip_level == ALL_MIPS ? 0 : base_mip_level,
+			.levelCount = base_mip_level == ALL_MIPS ? mip_levels : 1,
+			.baseArrayLayer = base_slice == ALL_LAYERS ? 0 : base_slice,
+			.layerCount = base_slice == ALL_LAYERS ? slices : 1,
+		}
+	};
+	vkCmdPipelineBarrier(cmd, source_stage, destination_stage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
+void gpuBeginRenderPass(GpuCommandBuffer* cmd, const GpuRenderPassDesc& desc) {
+	constexpr static auto view_create_info = [](const GpuTexture* texture) -> VkImageViewCreateInfo {
+		return {
+			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+			.image = texture->image,
+			.viewType = GPU::detail::type2vulkan(texture->descriptor.type),
+			.format = GPU::detail::format2vulkan(texture->descriptor.format),
+			.subresourceRange = {
+				.aspectMask = static_cast<VkImageAspectFlags>(gpuFormatIsDepth(texture->descriptor.format)
+					? VK_IMAGE_ASPECT_DEPTH_BIT | (gpuFormatIsStencil(texture->descriptor.format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)
+					: VK_IMAGE_ASPECT_COLOR_BIT),
+				.baseMipLevel = 0,
+				.levelCount = texture->descriptor.mipCount,
+				.baseArrayLayer = 0,
+				.layerCount = texture->descriptor.layerCount
+			}
+		};
+	};
+
+	constexpr static auto load2vulkan = [](LOAD_OP op) {
+		switch (op) {
+		case LOAD_OP_LOAD: return VK_ATTACHMENT_LOAD_OP_LOAD;
+		case LOAD_OP_CLEAR: return VK_ATTACHMENT_LOAD_OP_CLEAR;
+		case LOAD_OP_DONT_CARE: return VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		}
+		std::unreachable();
+	};
+	constexpr static auto store2vulkan = [](STORE_OP op) {
+		switch (op) {
+		case STORE_OP_STORE: return VK_ATTACHMENT_STORE_OP_STORE;
+		case STORE_OP_DONT_CARE: return VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		}
+		std::unreachable();
+	};
+
+	assert(cmd->state == GpuCommandBuffer::Recording && "The command buffer must not be ended or recording another active render pass");
+	cmd->state = GpuCommandBuffer::RecordingRenderPass;
+
+	std::vector<VkRenderingAttachmentInfo> color_attachments; color_attachments.reserve(desc.colorAttachments.size());
+	for(auto& color: desc.colorAttachments) {
+		if(color.texture->available_semaphore)
+			cmd->wait_semaphores.push_back(color.texture->available_semaphore);
+
+		transition_image_layout(cmd->command_buffer,
+			color.texture->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, color.mipLevel, color.texture->descriptor.mipCount, color.slice, color.texture->descriptor.sampleCount
+		);
+
+		if(!color.texture->full_view) {
+			auto info = view_create_info(color.texture);
+			vkCreateImageView(cmd->queue->device, &info, cmd->queue->callbacks, const_cast<VkImageView*>(&color.texture->full_view));
+		}
+		if(color.resolveTexture && !color.resolveTexture->full_view) {
+			auto info = view_create_info(color.resolveTexture);
+			VK_CHECK(vkCreateImageView(cmd->queue->device, &info, cmd->queue->callbacks, const_cast<VkImageView*>(&color.resolveTexture->full_view)), /*NOTHING*/);
+		}
+
+		color_attachments.emplace_back(VkRenderingAttachmentInfo{
+			.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+			.imageView = color.texture->full_view,
+			.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			.resolveMode = color.resolveTexture ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_NONE,
+			.resolveImageView = color.resolveTexture ? color.resolveTexture->full_view : VK_NULL_HANDLE,
+			.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+			.loadOp = load2vulkan(color.loadOp),
+			.storeOp = store2vulkan(color.storeOp),
+			.clearValue = {
+				.color = {
+					.float32 = {color.clearValue.r, color.clearValue.g, color.clearValue.b, color.clearValue.a}
+				}
+			}
+		});
+	}
+
+	VkRenderingAttachmentInfo depth_attachment;
+	if(desc.depthAttachment) {
+		if(desc.depthAttachment->texture->available_semaphore)
+			cmd->wait_semaphores.push_back(desc.depthAttachment->texture->available_semaphore);
+
+		transition_image_layout(cmd->command_buffer,
+			desc.depthAttachment->texture->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, desc.depthAttachment->mipLevel, desc.depthAttachment->texture->descriptor.mipCount,
+			desc.depthAttachment->slice, desc.depthAttachment->texture->descriptor.sampleCount
+		);
+
+		if(!desc.depthAttachment->texture->full_view) {
+			auto info = view_create_info(desc.depthAttachment->texture);
+			VK_CHECK(vkCreateImageView(cmd->queue->device, &info, cmd->queue->callbacks, const_cast<VkImageView*>(&desc.depthAttachment->texture->full_view)), /*nothing*/);
+		}
+
+		depth_attachment = {
+			.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+			.imageView = desc.depthAttachment->texture->full_view,
+			.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+			.resolveMode = VK_RESOLVE_MODE_NONE,
+			.resolveImageView = VK_NULL_HANDLE,
+			.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+			.loadOp = load2vulkan(desc.depthAttachment->loadOp),
+			.storeOp = store2vulkan(desc.depthAttachment->storeOp),
+			.clearValue = {
+				.depthStencil = {
+					.depth = static_cast<float>(desc.depthAttachment->clearValue)
+				}
+			}
+		};
+	}
+
+	VkRenderingAttachmentInfo stencil_attachment;
+	if(desc.stencilAttachment) {
+		if(desc.stencilAttachment->texture->available_semaphore)
+			cmd->wait_semaphores.push_back(desc.stencilAttachment->texture->available_semaphore);
+
+		transition_image_layout(cmd->command_buffer,
+			desc.stencilAttachment->texture->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, desc.stencilAttachment->mipLevel, desc.stencilAttachment->texture->descriptor.mipCount,
+			desc.stencilAttachment->slice, desc.stencilAttachment->texture->descriptor.sampleCount
+		);
+
+		if(!desc.stencilAttachment->texture->full_view) {
+			auto info = view_create_info(desc.stencilAttachment->texture);
+			VK_CHECK(vkCreateImageView(cmd->queue->device, &info, cmd->queue->callbacks, const_cast<VkImageView*>(&desc.stencilAttachment->texture->full_view)), /*NOTHING*/);
+		}
+
+		stencil_attachment = {
+			.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+			.imageView = desc.stencilAttachment->texture->full_view,
+			.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+			.resolveMode = VK_RESOLVE_MODE_NONE,
+			.resolveImageView = VK_NULL_HANDLE,
+			.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+			.loadOp = load2vulkan(desc.stencilAttachment->loadOp),
+			.storeOp = store2vulkan(desc.stencilAttachment->storeOp),
+			.clearValue = {
+				.depthStencil = {
+					.stencil = static_cast<uint32_t>(desc.stencilAttachment->clearValue)
+				}
+			}
+		};
+	}
+
+	VkRenderingInfo info{
+		.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+		.renderArea = {
+			.offset = {0, 0},
+			.extent = {desc.colorAttachments[0].texture->descriptor.dimensions.x, desc.colorAttachments[0].texture->descriptor.dimensions.y},
+		},
+		.layerCount = 1,
+		.colorAttachmentCount = static_cast<uint32_t>(color_attachments.size()),
+		.pColorAttachments = color_attachments.data(),
+		.pDepthAttachment = desc.depthAttachment ? &depth_attachment : nullptr,
+		.pStencilAttachment = desc.stencilAttachment ? &stencil_attachment : nullptr,
+	};
+	vkCmdBeginRendering(cmd->command_buffer, &info);
+
+	gpuSetViewportEXT(cmd, {info.renderArea.extent.width, info.renderArea.extent.height});
+	gpuSetScissorRectEXT(cmd, {info.renderArea.extent.width, info.renderArea.extent.height});
+}
+
+void gpuEndRenderPass(GpuCommandBuffer* cmd, std::optional<const GpuRenderPassDesc> desc /*= {}*/) {
+	vkCmdEndRendering(cmd->command_buffer);
+
+	if(desc) for(auto& color: desc->colorAttachments)
+		transition_image_layout(cmd->command_buffer,
+			color.texture->image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0,
+			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, color.mipLevel, color.texture->descriptor.mipCount, color.slice, color.texture->descriptor.sampleCount
+		);
+
+	cmd->state = GpuCommandBuffer::Recording;
+}
+
+namespace GPU::detail {
+	std::pair<VkBuffer, VkDeviceSize> ensureIndexBufferAvailable(GpuQueue* queue, gpu* indicesGpu, bool no_offsets, bool no_index_buffer_changes) {
+		constexpr static std::pair<VkBuffer, VkDeviceSize> null_out = {VK_NULL_HANDLE, 0};
+
+		auto [_buffer, offset, address] = GPU::detail::closest_buffer(queue, indicesGpu, no_offsets);
+		auto [source_buffer, _alloc, size] = queue->allocations[address];
+		if(!queue->gpu2index.contains(address)) {
+			VkBufferCreateInfo buffer_info {
+				.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+				.size = size,
+				.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+			};
+			VmaAllocationCreateInfo alloc_info {
+				.usage = VMA_MEMORY_USAGE_AUTO,
+				.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+			};
+
+			auto& [index_buffer, allocation, index_size] = queue->gpu2index[address];
+			index_size = size;
+			VK_CHECK(vmaCreateBuffer(queue->gpu_allocator, &buffer_info, &alloc_info, &index_buffer, &allocation, nullptr), null_out);
+
+			no_index_buffer_changes = false;
+		}
+
+		auto [index_buffer, _allocation, _size] = queue->gpu2index[address];
+		if(!no_index_buffer_changes) {
+			VkCommandBuffer tmp = VK_NULL_HANDLE;
+			VkCommandBufferAllocateInfo info {
+				.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+				.commandPool = queue->command_pool,
+				.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+				.commandBufferCount = 1
+			};
+			VK_CHECK(vkAllocateCommandBuffers(queue->device, &info, &tmp), null_out);
+
+			VkCommandBufferBeginInfo begin {
+				.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+				.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+			};
+			VK_CHECK(vkBeginCommandBuffer(tmp, &begin), null_out);
+
+			VkBufferCopy copy {
+				.srcOffset = offset,
+				.dstOffset = offset,
+				.size = size - offset
+			};
+			vkCmdCopyBuffer(tmp, source_buffer, index_buffer, 1, &copy);
+
+			VK_CHECK(vkEndCommandBuffer(tmp), null_out);
+			VkSubmitInfo submit {
+				.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+				.commandBufferCount = 1,
+				.pCommandBuffers = &tmp,
+			};
+			VK_CHECK(vkQueueSubmit(queue->queue, 1, &submit, VK_NULL_HANDLE), null_out);
+			queue->command_buffers_pending_free.emplace_back(tmp, queue->command_submission_timeline_semaphore_next_value);
+		}
+
+		return {index_buffer, offset};
+	}
+}
+
+VkIndexType index2vulkan(INDEX_TYPE_EXT index_type) {
+	switch (index_type) {
+	case INDEX_TYPE_UINT8: return VK_INDEX_TYPE_UINT8;
+	case INDEX_TYPE_UINT16: return VK_INDEX_TYPE_UINT16;
+	case INDEX_TYPE_UINT32: return VK_INDEX_TYPE_UINT32;
+	}
+	std::unreachable();
+}
+
+void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data, gpu* indices, uint32_t index_count, uint32_t instance_count, INDEX_TYPE_EXT index_type /* = INDEX_TYPE_UINT32 */, bool no_offsets /* = false */, bool no_index_buffer_changes /* = false */) {
+	GraphicsPipelinePushConstants data {
+		.vertex = vertex_data,
+		.fragment = fragment_data,
+		.index = indices,
+		.sampler_map = (gpu*)cmd->sampler_map
+	};
+	VkPushDataInfoEXT info {
+		.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
+		.offset = 0,
+		.data = {
+			.address = &data,
+			.size = sizeof(GraphicsPipelinePushConstants)
+		}
+	};
+	vkCmdPushDataEXT(cmd->command_buffer, &info);
+
+	auto [index_buffer, offset] = GPU::detail::ensureIndexBufferAvailable(cmd->queue, indices, no_offsets, no_index_buffer_changes);
+	assert(index_buffer != VK_NULL_HANDLE);
+
+	vkCmdBindIndexBuffer(cmd->command_buffer, index_buffer, offset, index2vulkan(index_type));
+	vkCmdDrawIndexed(cmd->command_buffer, index_count, instance_count, 0, 0, 0);
+}
+
+// TODO: Untested!
+void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data, gpu* indices, gpu* args, INDEX_TYPE_EXT index_type /* = INDEX_TYPE_UINT32 */, bool no_offsets /* = false */, bool no_index_buffer_changes /* = false */) {
+	GraphicsPipelinePushConstants data {
+		.vertex = vertex_data,
+		.fragment = fragment_data,
+		.index = indices,
+		.sampler_map = (gpu*)cmd->sampler_map
+	};
+	VkPushDataInfoEXT info {
+		.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
+		.offset = 0,
+		.data = {
+			.address = &data,
+			.size = sizeof(GraphicsPipelinePushConstants)
+		}
+	};
+	vkCmdPushDataEXT(cmd->command_buffer, &info);
+
+	{
+		auto [index_buffer, offset] = GPU::detail::ensureIndexBufferAvailable(cmd->queue, indices, no_offsets, no_index_buffer_changes);
+		assert(index_buffer != VK_NULL_HANDLE);
+		vkCmdBindIndexBuffer(cmd->command_buffer, index_buffer, offset, index2vulkan(index_type));
+	}
+
+	auto [_buffer, offset, address] = GPU::detail::closest_buffer(cmd->queue, args, no_offsets);
+	auto [buffer, _allocation, size] = cmd->queue->allocations[address];
+	auto count = (size - offset) / sizeof(VkDrawIndexedIndirectCommand);
+	vkCmdDrawIndexedIndirect(cmd->command_buffer, buffer, offset, count, sizeof(VkDrawIndexedIndirectCommand)); // TODO: We should we check the size of the buffer and divide by sizeof(VkDrawIndexedIndirectCommand)?
+}
+
+// TODO: Untested!
+void gpuDrawMeshlets(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, uvec3 dim) {
+	GraphicsPipelinePushConstants data {
+		.vertex = meshlet_data,
+		.fragment = fragment_data,
+		.index = nullptr,
+		.sampler_map = (gpu*)cmd->sampler_map
+	};
+	VkPushDataInfoEXT info {
+		.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
+		.offset = 0,
+		.data = {
+			.address = &data,
+			.size = sizeof(GraphicsPipelinePushConstants)
+		}
+	};
+	vkCmdPushDataEXT(cmd->command_buffer, &info);
+
+	vkCmdDrawMeshTasksEXT(cmd->command_buffer, dim.x, dim.y, dim.z);
+}
+
+// TODO: Untested!
+void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, gpu* dim, bool no_offsets /* = false */) {
+	GraphicsPipelinePushConstants data {
+		.vertex = meshlet_data,
+		.fragment = fragment_data,
+		.index = nullptr,
+		.sampler_map = (gpu*)cmd->sampler_map
+	};
+	VkPushDataInfoEXT info {
+		.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
+		.offset = 0,
+		.data = {
+			.address = &data,
+			.size = sizeof(GraphicsPipelinePushConstants)
+		}
+	};
+	vkCmdPushDataEXT(cmd->command_buffer, &info);
+
+	auto [_buffer, offset, address] = GPU::detail::closest_buffer(cmd->queue, dim, no_offsets);
+	auto [buffer, _allocation, size] = cmd->queue->allocations[address];
+	auto count = (size - offset) / sizeof(VkDrawMeshTasksIndirectCommandEXT); // VkDrawMeshTasksIndirectCommandEXT == uvec3
+	vkCmdDrawMeshTasksIndirectEXT(cmd->command_buffer, buffer, offset, count, sizeof(VkDrawMeshTasksIndirectCommandEXT));
 }
