@@ -72,4 +72,46 @@ namespace GPU::detail {
 			return VK_SAMPLE_COUNT_32_BIT;
 		else return VK_SAMPLE_COUNT_64_BIT;
 	};
+
+	inline VkImageViewType type2vulkan(TEXTURE type) {
+		switch (type) {
+		case TEXTURE_1D: return VK_IMAGE_VIEW_TYPE_1D;
+		case TEXTURE_2D: return VK_IMAGE_VIEW_TYPE_2D;
+		case TEXTURE_3D: return VK_IMAGE_VIEW_TYPE_3D;
+		case TEXTURE_2D_ARRAY: return VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+		case TEXTURE_CUBE: return VK_IMAGE_VIEW_TYPE_CUBE;
+		case TEXTURE_CUBE_ARRAY: return VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+		}
+		std::unreachable();
+	};
+
+	inline std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress> closest_buffer(GpuQueue* queue, gpu* addr, bool no_offsets) {
+		auto address = (VkDeviceAddress)addr;
+		VkDeviceAddress closest = 0; // TODO: There are probably edge cases around setting these to zero!
+		if(no_offsets)
+			closest = address;
+		else for(auto [key, _]: queue->allocations) {
+			if(closest - address > key - address)
+				closest = key;
+		}
+		return {std::get<VkBuffer>(queue->allocations[closest]), closest - address, address};
+	}
+
+	inline std::array<std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress>, 2> closest_buffer(GpuQueue* queue, gpu* addrA, gpu* addrB, bool no_offsets) {
+		auto a = (VkDeviceAddress)addrA, b = (VkDeviceAddress)addrB;
+		VkDeviceAddress closestA = 0, closestB = 0; // TODO: There are probably edge cases around setting these to zero!
+		if(no_offsets) {
+			closestA = a;
+			closestB = b;
+		} else for(auto [key, _]: queue->allocations) {
+			if(closestA - a > key - a)
+				closestA = key;
+			if(closestB - b > key - b)
+				closestB = key;
+		}
+		return {
+			std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress>{std::get<VkBuffer>(queue->allocations[closestA]), closestA - a, a}, 
+			std::tuple<VkBuffer, VkDeviceSize, VkDeviceAddress>{std::get<VkBuffer>(queue->allocations[closestB]), closestB - b, b}
+		};
+	}
 }

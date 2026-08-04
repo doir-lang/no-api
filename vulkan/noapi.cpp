@@ -12,13 +12,13 @@
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added
 
 
-std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkan(std::function_ref<VkSurfaceKHR(VkInstance)> surface_loader, std::span<const char*> instance_extensions /* = {} */, std::span<const char*> extra_layers /* = {} */, std::span<const char*> device_extensions /* = {} */, bool debug /* = true */) {
+std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(std::function_ref<VkSurfaceKHR(VkInstance)> surface_loader, std::span<const char*> instance_extensions /* = {} */, std::span<const char*> extra_layers /* = {} */, std::span<const char*> device_extensions /* = {} */, bool debug /* = true */) {
 	GpuVulkanDefault out;
 
 	// Instance
 	vkb::InstanceBuilder instance_builder;
-	instance_builder.set_app_name("noapi")
-		.set_engine_name("noapi")
+	instance_builder.set_app_name("NoAPI")
+		.set_engine_name("NoAPI")
 		.enable_extensions(instance_extensions.size(), instance_extensions.data())
 		.request_validation_layers(debug)
 		.require_api_version(1, 4, 0);
@@ -33,15 +33,16 @@ std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkan(std::function
 
 	out.surface = surface_loader(out.instance);
 
-	auto extensions = gpuRequiredVulkanDeviceExtensions();
+	auto extensions = gpuRequiredVulkanDeviceExtensionsEXT();
 	extensions.insert(extensions.end(), device_extensions.begin(), device_extensions.end());
 
 	// Physical Device
 	vkb::PhysicalDeviceSelector gpu_selector{instance};
 	auto phys = gpu_selector
-		.set_required_features(gpuEnableRequiredVulkanFeatures({}))
-		.set_required_features_12(gpuEnableRequiredVulkan12Features({}))
-		.set_required_features_13(gpuEnableRequiredVulkan13Features({}))
+		.set_required_features(gpuEnableRequiredVulkanFeaturesEXT({}))
+		.set_required_features_12(gpuEnableRequiredVulkan12FeaturesEXT({}))
+		.set_required_features_13(gpuEnableRequiredVulkan13FeaturesEXT({}))
+		.set_required_features_14(gpuEnableRequiredVulkan14FeaturesEXT({}))
 		.add_required_extensions(extensions)
 		.set_surface(out.surface)
 		.set_minimum_version(1, 4)
@@ -52,7 +53,7 @@ std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkan(std::function
 
 	// Logical Device
 	vkb::DeviceBuilder device_builder{gpu};
-	auto dev = device_builder.add_pNext(gpuRequiredVulkanDeviceCreateInfoPnext()).build();
+	auto dev = device_builder.add_pNext(gpuRequiredVulkanDeviceCreateInfoPnextEXT()).build();
 	if (!dev) return std::unexpected(dev.error().message());
 	auto device = dev.value();
 	out.device = device.device;
@@ -144,8 +145,9 @@ void gpuFreeQueue(GpuQueue* queue) {
 	if(queue->gpu_allocator)
 		vmaDestroyAllocator(queue->gpu_allocator);
 
+	auto allocator = queue->cpu_allocator;
 	queue->~GpuQueue(); // Get all of the caches to free their memory
-	queue->cpu_allocator(queue, 0);
+	allocator(queue, 0);
 }
 
 GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
@@ -166,16 +168,22 @@ GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
 		// TODO: Would it be worth the effort to deduplicate?
 
 		std::vector<VkCommandBuffer> to_free; to_free.reserve(queue->command_buffers_pending_free.size());
-		for(auto [cmd, submit]: queue->command_buffers_pending_free)
-			if(submit <= current_finished_submission)
-				to_free.push_back(cmd);
+		if(queue->command_buffers_pending_free.size())
+			for(size_t i = queue->command_buffers_pending_free.size(); i--; ) {
+				auto [cmd, submit] = queue->command_buffers_pending_free[i];
+				if(submit <= current_finished_submission) {
+					to_free.push_back(cmd);
+					queue->command_buffers_pending_free.erase(queue->command_buffers_pending_free.begin() + i);
+				}
+			}			
 
 		if(!to_free.empty())
 			vkFreeCommandBuffers(queue->device, queue->command_pool, to_free.size(), to_free.data());
 	}
 
 	auto out = (GpuCommandBuffer*)queue->cpu_allocator(nullptr, sizeof(GpuCommandBuffer));
-	*out = {.queue = queue};
+	new(out) GpuCommandBuffer{.queue = queue};
+
 	VkCommandBufferAllocateInfo info {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
 		.commandPool = queue->command_pool,
@@ -197,16 +205,26 @@ void gpuDestoryCommandBuffer(GpuCommandBuffer& cmd) {
 }
 
 uint64_t gpuSubmitNoDestroy(GpuQueue* queue, std::span<GpuCommandBuffer*> commandBuffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signalValue /* = 0 */) {
+	std::vector<VkSemaphoreSubmitInfo> waits;
 	std::vector<VkCommandBufferSubmitInfo> submits; submits.reserve(commandBuffers.size());
 	for(auto& cmd: commandBuffers) {
-		if(!cmd->ended) {
+		if(cmd->state != GpuCommandBuffer::Ended) {
+			assert(cmd->state != GpuCommandBuffer::RecordingRenderPass && "Render pass hasn't been ended!");
+
 			vkEndCommandBuffer(cmd->command_buffer);
-			cmd->ended = true;
+			cmd->state = GpuCommandBuffer::Ended;
 		}
 		submits.emplace_back(VkCommandBufferSubmitInfo{
 			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
 			.commandBuffer = cmd->command_buffer
 		});
+
+		for(auto sema: cmd->wait_semaphores)
+			waits.emplace_back(VkSemaphoreSubmitInfo{
+				.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+				.semaphore = sema,
+				.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+			});
 	}
 
 	std::array<VkSemaphoreSubmitInfo, 2> signals {
@@ -227,6 +245,8 @@ uint64_t gpuSubmitNoDestroy(GpuQueue* queue, std::span<GpuCommandBuffer*> comman
 	}
 	VkSubmitInfo2 info {
 		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+		.waitSemaphoreInfoCount = static_cast<uint32_t>(waits.size()),
+		.pWaitSemaphoreInfos = waits.data(),
 		.commandBufferInfoCount = static_cast<uint32_t>(submits.size()),
 		.pCommandBufferInfos = submits.data(),
 		.signalSemaphoreInfoCount = static_cast<uint32_t>(semaphore ? 2 : 1),
@@ -240,7 +260,7 @@ uint64_t gpuSubmit(GpuQueue* queue, std::span<GpuCommandBuffer*> commandBuffers,
 	auto submission_index = gpuSubmitNoDestroy(queue, commandBuffers, semaphore, signalValue);
 
 	for(auto& cmd: commandBuffers)
-		queue->command_buffers_pending_free.emplace_back(cmd->command_buffer, submission_index); 
+		queue->command_buffers_pending_free.emplace_back(cmd->command_buffer, submission_index);
 	return submission_index;
 }
 

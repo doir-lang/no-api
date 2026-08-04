@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(noapi CXX C)
+project(NoAPI CXX C)
 
 set(CMAKE_CXX_STANDARD 26)
 

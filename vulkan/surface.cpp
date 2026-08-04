@@ -75,8 +75,9 @@ void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSur
 
 	surface->images.resize(images.size());
 	for(size_t i = 0; i < images.size(); ++i)
-		surface->images[i] = {
+		surface->images[i] = GpuTexture {
 			images[i],
+			surface->image_views[i],
 			surface->descriptor.texture
 		};
 }
