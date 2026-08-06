@@ -11,6 +11,17 @@ set(CMAKE_CXX_STANDARD 26)
 # add_subdirectory(WebGPU-distribution)
 add_subdirectory(vulkan)
 
+find_package(glfw QUIET)
+if (NOT glfw_FOUND AND NOT TARGET glfw)
+	message(STATUS "glfw not found via find_package; fetching from GitHub")
+	include(FetchContent)
+	FetchContent_Declare(glfw
+		GIT_REPOSITORY https://github.com/glfw/glfw
+		GIT_TAG 3.5.1
+	)
+	FetchContent_MakeAvailable(glfw)
+endif()
+
 if(WIN32)
 	add_executable(test WIN32 test/test.cpp)
 else()

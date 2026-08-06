@@ -186,7 +186,7 @@ enum FORMAT {
 	FORMAT_D24_UNORM_S8_UINT,
 	FORMAT_D32_FLOAT,
 	FORMAT_D32_FLOAT_S8_UINT,
-	// ... extend with BC/ETC/ASTC compressed formats as required
+	// TODO: extend with BC/ETC/ASTC compressed formats
 };
 
 /**

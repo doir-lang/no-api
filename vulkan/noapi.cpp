@@ -12,7 +12,7 @@
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added
 
 
-std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(std::function_ref<VkSurfaceKHR(VkInstance)> surface_loader, std::span<const char*> instance_extensions /* = {} */, std::span<const char*> extra_layers /* = {} */, std::span<const char*> device_extensions /* = {} */, bool debug /* = true */) {
+std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(GPU::function_t<VkSurfaceKHR(VkInstance)> surface_loader, std::span<const char*> instance_extensions /* = {} */, std::span<const char*> extra_layers /* = {} */, std::span<const char*> device_extensions /* = {} */, bool debug /* = true */) {
 	GpuVulkanDefault out;
 
 	// Instance
