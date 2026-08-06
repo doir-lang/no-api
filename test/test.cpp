@@ -166,11 +166,12 @@ void cleanup(render_state& state) {
 	gpuFreeSurfaceEXT(state.graphics_queue, state.surface);
 	gpuFreePipeline(state.graphics_queue, state.pipeline);
 	auto device = state.graphics_queue->device;
+	auto callbacks = state.graphics_queue->callbacks;
 	gpuFreeQueue(state.graphics_queue);
-	vkDestroyDevice(state.graphics_queue->device, nullptr);
-	vkDestroySurfaceKHR(state.instance, state.vulkan_surface, nullptr);
-	vkDestroyDebugUtilsMessengerEXT(state.instance, state.debug_messenger, nullptr);
-	vkDestroyInstance(state.instance, nullptr);
+	vkDestroyDevice(device, callbacks);
+	vkDestroySurfaceKHR(state.instance, state.vulkan_surface, callbacks);
+	vkDestroyDebugUtilsMessengerEXT(state.instance, state.debug_messenger, callbacks);
+	vkDestroyInstance(state.instance, callbacks);
 	volkFinalize();
 	glfwDestroyWindow(state.window);
 	glfwTerminate();

@@ -13,6 +13,18 @@
 #include <functional>
 #include <expected>
 #include <memory>
+#include <string>
+#include <array>
+
+namespace GPU {
+#ifdef __cpp_lib_function_ref
+	template<typename T>
+	using function_t = std::function_ref<T>;
+#else 
+	template<typename T>
+	using function_t = std::function<T>;
+#endif
+}
 
 template<>
 struct std::hash<std::vector<GpuSamplerDesc>> {
@@ -42,7 +54,7 @@ struct GpuVulkanDefault {
 	uint32_t graphics_queue_family;
 };
 std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(
-	std::function_ref<VkSurfaceKHR(VkInstance)> surface_loader, std::span<const char*> instance_extensions = {}, std::span<const char*> extra_layers = {}, std::span<const char*> device_extensions = {}, bool debug = true
+	GPU::function_t<VkSurfaceKHR(VkInstance)> surface_loader, std::span<const char*> instance_extensions = {}, std::span<const char*> extra_layers = {}, std::span<const char*> device_extensions = {}, bool debug = true
 );
 
 inline VkPhysicalDeviceFeatures gpuEnableRequiredVulkanFeaturesEXT(VkPhysicalDeviceFeatures features) {
@@ -178,7 +190,7 @@ struct GpuSurface {
 	std::vector<VkSemaphore> image_available_semaphores;
 	std::vector<VkSemaphore> render_finished_semaphores;
 
-	uint32_t current_image = -1, semaphore_counter = 0;
+	uint32_t current_image = uint32_t(-1), semaphore_counter = 0;
 };
 GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, VkSurfaceKHR surface, const GpuSurfaceDescriptor& desc);
 
