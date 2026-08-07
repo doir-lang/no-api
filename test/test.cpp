@@ -1,255 +1,336 @@
-#include <glslang/Public/ShaderLang.h>
-#include <glslang/Public/ResourceLimits.h>
-#include <glslang/SPIRV/GlslangToSpv.h>
-
-#include <volk.h>
-#include <vulkan/noapi.hpp>
-
-#define GLFW_INCLUDE_VULKAN
-#include <GLFW/glfw3.h>
-
-#include <array>
-#include <print>
-#include <iostream>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <cstring>
 #include <cassert>
 
-static constexpr uint32_t WIDTH = 800;
-static constexpr uint32_t HEIGHT = 600;
+#include <GLFW/glfw3.h>
+#include "glfw3webgpu.h"
+#include <webgpu/webgpu.h>
 
-static const char* vertex_glsl = R"glsl(
-	layout(location = 0) out vec3 frag_color;
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#endif
 
-	vec2 positions[3] = vec2[](
-		vec2(-0.5, 0.5),
-		vec2( 0.5, 0.5),
-		vec2( 0.0, -0.5)
+static const char *wgsl_shaders = R"wgsl(
+struct Varyings {
+	@builtin(position) pos : vec4<f32>,
+	@location(0) color : vec3<f32>,
+}
+
+const positions = array<vec2<f32>, 3>(
+	vec2<f32>(-0.5, -0.5),
+	vec2<f32>( 0.5, -0.5),
+	vec2<f32>( 0.0,  0.5)
+);
+
+const colors = array<vec3<f32>, 3>(
+	vec3<f32>(0.0, 0.0, 1.0),
+	vec3<f32>(0.0, 1.0, 0.0),
+	vec3<f32>(1.0, 0.0, 0.0)
+);
+
+@vertex
+fn vertex(@builtin(vertex_index) vertex_index : u32) -> Varyings {
+	return Varyings(
+		vec4<f32>(positions[vertex_index], 0.0, 1.0),
+		colors[vertex_index]
 	);
-
-	vec3 colors[3] = vec3[](
-		vec3(0.0, 0.0, 1.0),
-		vec3(0.0, 1.0, 0.0),
-		vec3(1.0, 0.0, 0.0)
-	);
-
-	void main() {
-		gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
-		frag_color = colors[gl_VertexIndex];
-	}
-)glsl";
-
-static const char* fragment_glsl = R"glsl(
-	layout(location = 0) in vec3 frag_color;
-	layout(location = 0) out vec4 out_color;
-
-	void main() {
-		out_color = vec4(frag_color, 1.0);
-	}
-)glsl";
-
-struct render_state {
-	GLFWwindow* window = nullptr;
-
-	VkInstance instance = VK_NULL_HANDLE;
-	VkDebugUtilsMessengerEXT debug_messenger = VK_NULL_HANDLE;
-	VkSurfaceKHR vulkan_surface = VK_NULL_HANDLE;
-	GpuQueue* graphics_queue = nullptr;
-
-	GpuSurface* surface = nullptr;
-	GpuPipeline* pipeline = nullptr;
-	gpu* index_buffer = nullptr;
-
-	uint64_t last_submission_index = -1;
-};
-
-void ensure_glslang_initialized() {
-	static bool glslang_initialized = false;
-
-	if (!glslang_initialized) {
-		assert(glslang::InitializeProcess());
-		glslang_initialized = true;
-	}
 }
 
-static std::vector<uint32_t> compile_glsl(EShLanguage stage, std::string source) {
-	ensure_glslang_initialized();
-	const char* source_array = source.c_str();
+@fragment
+fn fragment(varyings : Varyings) -> @location(0) vec4<f32> {
+	return vec4<f32>(varyings.color, 1.0);
+})wgsl";
 
-	glslang::TShader shader(stage);
-	shader.setStrings(&source_array, 1);
-	shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 460);
-	shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_4);
-	shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_6);
 
-	const TBuiltInResource* resources = GetDefaultResources();
-	EShMessages messages = static_cast<EShMessages>(EShMsgSpvRules | EShMsgVulkanRules | EShMsgDefault);
+typedef struct AppState {
+	GLFWwindow *window;
+	WGPUInstance instance;
+	WGPUDevice device;
+	WGPUQueue queue;
+	WGPUSurface surface;
+	WGPUTextureFormat format;
+	WGPURenderPipeline pipeline;
+	uint32_t width;
+	uint32_t height;
+} AppState;
 
-	if (!shader.parse(resources, 460, false, messages)) {
-		std::string err = "glslang parse error:\n";
-		err += shader.getInfoLog();
-		err += shader.getInfoDebugLog();
-		throw std::runtime_error(err);
+
+
+typedef struct RequestAdapterResult {
+	WGPUAdapter adapter;
+	bool done;
+} RequestAdapterResult;
+
+static void on_adapter_request(WGPURequestAdapterStatus status, WGPUAdapter adapter, WGPUStringView message, void *userdata1, void *userdata2) {
+	(void)userdata2;
+	RequestAdapterResult *result = (RequestAdapterResult *)userdata1;
+	result->done = true;
+	if (status != WGPURequestAdapterStatus_Success) {
+		fprintf(stderr, "Request adapter failed: %.*s\n", (int)message.length, message.data);
+		exit(1);
 	}
+	result->adapter = adapter;
+}
 
-	glslang::TProgram program;
-	program.addShader(&shader);
-	if (!program.link(messages)) {
-		std::string err = "glslang link error:\n";
-		err += program.getInfoLog();
-		err += program.getInfoDebugLog();
-		throw std::runtime_error(err);
+typedef struct RequestDeviceResult {
+	WGPUDevice device;
+	bool done;
+} RequestDeviceResult;
+
+static void on_device_request(WGPURequestDeviceStatus status, WGPUDevice device, WGPUStringView message, void *userdata1, void *userdata2) {
+	(void)userdata2;
+	RequestDeviceResult *result = (RequestDeviceResult *)userdata1;
+	result->done = true;
+	if (status != WGPURequestDeviceStatus_Success) {
+		fprintf(stderr, "Request device failed: %.*s\n", (int)message.length, message.data);
+		exit(2);
 	}
-
-	std::vector<uint32_t> spv;
-	glslang::SpvOptions spvOpts;
-	spvOpts.validate = true;
-	glslang::GlslangToSpv(*program.getIntermediate(stage), spv, &spvOpts);
-	return spv;
+	result->device = device;
 }
 
-static VkShaderModule create_shader_module(render_state& state, const std::vector<uint32_t>& spv) {
-	VkShaderModuleCreateInfo info = {
-		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-		.codeSize = spv.size() * sizeof(uint32_t),
-		.pCode = spv.data(),
-	};
-	VkShaderModule out;
-	VK_CHECK(vkCreateShaderModule(state.graphics_queue->device, &info, nullptr, &out), nullptr);
-	return out;
+static void on_uncaptured_error(WGPUDevice const *device, WGPUErrorType type, WGPUStringView message, void *userdata1, void *userdata2) {
+	(void)device; (void)userdata1; (void)userdata2;
+	fprintf(stderr, "WGPU Device Error %d: %.*s\n", (int)type, (int)message.length, message.data);
 }
 
-void init_vulkan(render_state& state) {
-	auto vk = gpuSetupDefaultVulkanEXT([&state](VkInstance instance) -> VkSurfaceKHR{
-		VkSurfaceKHR out;
-		VK_CHECK(glfwCreateWindowSurface(instance, state.window, nullptr, &out), nullptr);
-		return out;
-	});
-	if(!vk) throw std::runtime_error(vk.error());
-	state.instance = vk->instance;
-	state.debug_messenger = vk->messenger;
-	state.vulkan_surface = vk->surface;
+static void configure_surface(AppState *state) {
+	WGPUSurfaceConfiguration config = {0};
+	config.device = state->device;
+	config.format = state->format;
+	config.usage = WGPUTextureUsage_RenderAttachment;
+	config.width = state->width;
+	config.height = state->height;
+	config.presentMode = WGPUPresentMode_Fifo;
+	config.alphaMode = WGPUCompositeAlphaMode_Auto;
 
-	auto queue = gpuCreateQueue(*vk);
-	if(!queue) throw std::runtime_error("Failed to create NoAPI queue");
-	state.graphics_queue = queue;
-
-	state.surface = gpuCreateSurfaceEXT(queue, state.vulkan_surface, GpuSurfaceDescriptor{
-		.texture = {
-			.dimensions = {WIDTH, HEIGHT, 1},
-			.format = FORMAT_RGBA8_UNORM
-		}
-	});
-
-	auto indices = gpuMalloc<uint8_t>(state.graphics_queue, 3);
-	state.index_buffer = gpuHostToDevicePointer(state.graphics_queue, indices);
-	for(size_t i = 0; i < 3; ++i)
-		indices[i] = i;
-
-	auto vertex_spirv = compile_glsl(EShLangVertex, vertex_glsl);
-	auto fragment_spirv = compile_glsl(EShLangFragment, fragment_glsl);
-
-	GpuColorTarget target { .format = FORMAT_RGBA8_UNORM };
-	state.pipeline = gpuCreateGraphicsPipeline(state.graphics_queue, byte_span<uint32_t>(vertex_spirv), byte_span<uint32_t>(fragment_spirv), {
-		.colorTargets = {&target, 1}
-	});
+	wgpuSurfaceConfigure(state->surface, &config);
 }
 
-void recreate_swapchain(render_state& state, uvec2 extent) {
-	gpuWaitIdleEXT(state.graphics_queue);
-
-	auto config = gpuSurfaceGetConfigurationEXT(state.surface);
-	config.texture.dimensions = {extent.x, extent.y, 1};
-	gpuSurfaceReconfigureEXT(state.graphics_queue, state.surface, config);
+static void on_framebuffer_resize(GLFWwindow *window, int width, int height) {
+	AppState *state = (AppState *)glfwGetWindowUserPointer(window);
+	state->width = (uint32_t)width;
+	state->height = (uint32_t)height;
 }
 
-void cleanup(render_state& state) {
-	gpuFree(state.graphics_queue, state.index_buffer);
-	gpuFreeSurfaceEXT(state.graphics_queue, state.surface);
-	gpuFreePipeline(state.graphics_queue, state.pipeline);
-	auto device = state.graphics_queue->device;
-	auto callbacks = state.graphics_queue->callbacks;
-	gpuFreeQueue(state.graphics_queue);
-	vkDestroyDevice(device, callbacks);
-	vkDestroySurfaceKHR(state.instance, state.vulkan_surface, callbacks);
-	vkDestroyDebugUtilsMessengerEXT(state.instance, state.debug_messenger, callbacks);
-	vkDestroyInstance(state.instance, callbacks);
-	volkFinalize();
-	glfwDestroyWindow(state.window);
-	glfwTerminate();
-	glslang::FinalizeProcess();
-}
 
-void draw_frame(render_state& state) {
-	int w = 0, h = 0;
-	glfwGetFramebufferSize(state.window, &w, &h);
-	while (w == 0 || h == 0) {
-		glfwGetFramebufferSize(state.window, &w, &h);
-		glfwWaitEvents();
-	}
-	uvec2 needed_size = {static_cast<uint32_t>(w), static_cast<uint32_t>(h)};
-	auto surface_config = gpuSurfaceGetConfigurationEXT(state.surface);
-	auto surface_size = surface_config.texture.dimensions;
-	if(surface_size.x != w && surface_size.y != h)
-		recreate_swapchain(state, needed_size);
+static void render_frame(AppState *state) {
+	WGPUSurfaceTexture surface_texture;
+	wgpuSurfaceGetCurrentTexture(state->surface, &surface_texture);
 
-	auto texture = gpuSurfaceNextTextureEXT(state.graphics_queue, state.surface);
-	if(errno == SURFACE_SUBOPTIMAL || errno == SURFACE_OUT_OF_DATE) {
-		recreate_swapchain(state, needed_size);
+	if (surface_texture.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal && surface_texture.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
+		fprintf(stderr, "Surface texture unavailable status=%d\n", (int)surface_texture.status);
+		configure_surface(state);
 		return;
 	}
 
-	if(state.last_submission_index != -1)
-		gpuWaitSemaphore(state.graphics_queue, gpuGetSubmissionSemaphoreEXT(state.graphics_queue), state.last_submission_index);
+	WGPUTextureView view = wgpuTextureCreateView(surface_texture.texture, NULL);
 
-	auto cmd = gpuStartCommandRecording(state.graphics_queue);
-	GpuColorAttachment target { .texture = texture };
-	GpuRenderPassDesc rp = { .colorAttachments = std::span<GpuColorAttachment>(&target, 1) };
-	gpuBeginRenderPass(cmd, rp);
-	{
-		gpuSetPipeline(cmd, state.pipeline);
-		gpuDrawIndexedInstanced(cmd, nullptr, nullptr, state.index_buffer, 3, 1, INDEX_TYPE_UINT8);
-	}
-	gpuEndRenderPass(cmd, rp);
+	WGPURenderPassColorAttachment color_attachment = {0};
+	color_attachment.view = view;
+	color_attachment.loadOp = WGPULoadOp_Clear;
+	color_attachment.storeOp = WGPUStoreOp_Store;
+	color_attachment.clearValue = (WGPUColor){0.05, 0.05, 0.08, 1.0};
+	color_attachment.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
 
-	state.last_submission_index = gpuSubmit(state.graphics_queue, {&cmd, 1});
-	gpuSurfacePresentEXT(state.graphics_queue, state.surface, state.last_submission_index);
-	if(errno == SURFACE_SUBOPTIMAL || errno == SURFACE_OUT_OF_DATE)
-		recreate_swapchain(state, needed_size);
+	WGPURenderPassDescriptor rp_descriptor = {0};
+	rp_descriptor.colorAttachmentCount = 1;
+	rp_descriptor.colorAttachments = &color_attachment;
+
+	WGPUCommandEncoderDescriptor encoder_descriptor = {0};
+	WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(state->device, &encoder_descriptor);
+
+	WGPURenderPassEncoder render_pass = wgpuCommandEncoderBeginRenderPass(encoder, &rp_descriptor);
+	wgpuRenderPassEncoderSetPipeline(render_pass, state->pipeline);
+	wgpuRenderPassEncoderDraw(render_pass, 3, 1, 0, 0);
+	wgpuRenderPassEncoderEnd(render_pass);
+	wgpuRenderPassEncoderRelease(render_pass);
+
+	WGPUCommandBufferDescriptor cb_descriptor = {0};
+	WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, &cb_descriptor);
+	wgpuCommandEncoderRelease(encoder);
+
+	wgpuQueueSubmit(state->queue, 1, &commands);
+	wgpuCommandBufferRelease(commands);
+
+	wgpuTextureViewRelease(view);
+	wgpuTextureRelease(surface_texture.texture);
+
+#ifndef __EMSCRIPTEN__
+	wgpuSurfacePresent(state->surface);
+#endif
 }
 
-int real_main() try {
-	render_state state;
-	assert(glfwInit() == GLFW_TRUE);
-	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-	state.window = glfwCreateWindow(WIDTH, HEIGHT, "NoAPI Triangle", nullptr, nullptr);
+#ifdef __EMSCRIPTEN__
+static void emscripten_frame(void *arg) {
+	AppState *state = (AppState *)arg;
+	glfwPollEvents();
+	render_frame(state);
+}
+#endif
 
-	init_vulkan(state);
+/* -------------------------------------------------------------------------
+* Entry point
+* ---------------------------------------------------------------------- */
+#ifdef _WIN32
+#include <windows.h>
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nCmdShow)
+#else
+int main(void)
+#endif
+{
+	AppState state = {0};
+	const int initial_width = 800;
+	const int initial_height = 600;
+
+	if (!glfwInit()) {
+		fprintf(stderr, "Glfw initialization failed\n");
+		return -1;
+	}
+
+	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+	state.window = glfwCreateWindow(initial_width, initial_height, "WebGPU Triangle", NULL, NULL);
+	assert(state.window && "Failed to create glfw window");
+
+	glfwSetWindowUserPointer(state.window, &state);
+	glfwSetFramebufferSizeCallback(state.window, on_framebuffer_resize);
+
+	state.instance = wgpuCreateInstance(NULL);
+	assert(state.instance && "Failed to create webgpu instance");
+
+	WGPUSurface surface = glfwCreateWindowWGPUSurface(state.instance, state.window);
+	assert(surface && "Failed to create webgpu surface");
+	state.surface = surface;
+
+	WGPUAdapter adapter = NULL;
+	{
+		WGPURequestAdapterOptions adapter_opts = {0};
+		adapter_opts.compatibleSurface = state.surface;
+		adapter_opts.powerPreference = WGPUPowerPreference_HighPerformance;
+
+		RequestAdapterResult result = {0};
+		WGPURequestAdapterCallbackInfo callback_info = {0};
+		callback_info.mode = WGPUCallbackMode_AllowSpontaneous;
+		callback_info.callback = on_adapter_request;
+		callback_info.userdata1 = &result;
+
+		wgpuInstanceRequestAdapter(state.instance, &adapter_opts, callback_info);
+		while (!result.done) {
+			wgpuInstanceProcessEvents(state.instance);
+		#ifdef __EMSCRIPTEN__
+			emscripten_sleep(1); // yields back to the browser event loop
+		#endif
+		}
+		adapter = result.adapter;
+	}
+	assert(adapter && "No adapter obtained");
+
+	{
+		WGPUDeviceDescriptor device_desc = {0};
+		device_desc.uncapturedErrorCallbackInfo.callback = on_uncaptured_error;
+
+		RequestDeviceResult result = {0};
+		WGPURequestDeviceCallbackInfo callback_info = {0};
+		callback_info.mode = WGPUCallbackMode_AllowSpontaneous;
+		callback_info.callback = on_device_request;
+		callback_info.userdata1 = &result;
+
+		wgpuAdapterRequestDevice(adapter, &device_desc, callback_info);
+		while (!result.done) {
+			wgpuInstanceProcessEvents(state.instance);
+		#ifdef __EMSCRIPTEN__
+			emscripten_sleep(1); // yields back to the browser event loop
+		#endif
+		}
+		state.device = result.device;
+	}
+	assert(state.device && "No device obtained");
+
+	state.queue = wgpuDeviceGetQueue(state.device);
+	WGPUSurfaceCapabilities caps = {0};
+	wgpuSurfaceGetCapabilities(state.surface, adapter, &caps);
+	state.format = caps.formats[0]; // preferred format first in the list
+	wgpuSurfaceCapabilitiesFreeMembers(caps);
+
+	{
+		int fb_width, fb_height;
+		glfwGetFramebufferSize(state.window, &fb_width, &fb_height);
+		state.width = (uint32_t)fb_width;
+		state.height = (uint32_t)fb_height;
+	}
+	configure_surface(&state);
+
+	WGPUShaderModule shader;
+	{
+		WGPUShaderSourceWGSL wgsl_source = {0};
+		wgsl_source.chain.sType = WGPUSType_ShaderSourceWGSL;
+		wgsl_source.code = {wgsl_shaders, WGPU_STRLEN};
+
+		WGPUShaderModuleDescriptor shader_desc = {0};
+		shader_desc.nextInChain = &wgsl_source.chain;
+		shader = wgpuDeviceCreateShaderModule(state.device, &shader_desc);
+	}
+	assert(shader && "Shader compilation failed");
+
+	{
+		WGPUBlendState blend = {};
+		blend.color.operation = WGPUBlendOperation_Add;
+		blend.color.srcFactor = WGPUBlendFactor_SrcAlpha;
+		blend.color.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+		blend.alpha.operation = WGPUBlendOperation_Add;
+		blend.alpha.srcFactor = WGPUBlendFactor_One;
+		blend.alpha.dstFactor = WGPUBlendFactor_Zero;
+
+		WGPUColorTargetState color_target = {0};
+		color_target.format = state.format;
+		color_target.blend = &blend;
+		color_target.writeMask = WGPUColorWriteMask_All;
+
+		WGPUFragmentState fragment = {0};
+		fragment.module = shader;
+		fragment.entryPoint = {"fragment", WGPU_STRLEN};
+		fragment.constantCount = 0;
+		fragment.targetCount = 1;
+		fragment.targets = &color_target;
+
+		WGPURenderPipelineDescriptor descriptor = {0};
+		descriptor.vertex.module = shader;
+		descriptor.vertex.entryPoint = {"vertex", WGPU_STRLEN};
+		descriptor.vertex.bufferCount = 0;
+		descriptor.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+		descriptor.primitive.stripIndexFormat = WGPUIndexFormat_Undefined;
+		descriptor.primitive.frontFace = WGPUFrontFace_CCW;
+		descriptor.primitive.cullMode = WGPUCullMode_None;
+		descriptor.multisample.count = 1;
+		descriptor.multisample.mask = 0xFFFFFFFF;
+		descriptor.multisample.alphaToCoverageEnabled = false;
+		descriptor.fragment = &fragment;
+
+		state.pipeline = wgpuDeviceCreateRenderPipeline(state.device, &descriptor);
+	}
+	assert(state.pipeline && "Pipeline creation failed");
+
+	wgpuShaderModuleRelease(shader);
+
+#ifdef __EMSCRIPTEN__
+	emscripten_set_main_loop_arg(emscripten_frame, &state, 0, true);
+#else
 	while (!glfwWindowShouldClose(state.window)) {
 		glfwPollEvents();
-		draw_frame(state);
+		render_frame(&state);
 	}
 
-	gpuWaitIdleEXT(state.graphics_queue);
-	cleanup(state);
-	return EXIT_SUCCESS;
-} catch (const std::exception& e) {
-	std::println(std::cerr, "Fatal: {}\n", e.what());
-	return EXIT_FAILURE;
+	wgpuRenderPipelineRelease(state.pipeline);
+	wgpuQueueRelease(state.queue);
+	wgpuSurfaceRelease(state.surface);
+	wgpuDeviceRelease(state.device);
+	wgpuAdapterRelease(adapter);
+	wgpuInstanceRelease(state.instance);
+
+	glfwDestroyWindow(state.window);
+	glfwTerminate();
+#endif
+
+	return 0;
 }
-
-
-
-
-
-#ifdef _WIN32
-	#include <windows.h>
-#endif
-
-#ifdef _WIN32
-	int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-		return real_main();
-	}
-#else
-	int main() {
-		return real_main();
-	}
-#endif
