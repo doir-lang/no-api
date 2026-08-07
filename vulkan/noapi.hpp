@@ -24,6 +24,10 @@ namespace GPU {
 	template<typename T>
 	using function_t = std::function<T>;
 #endif
+
+	namespace default_ {
+		void error_callback(void* queue, int type, std::string_view message);
+	}
 }
 
 template<>
@@ -54,7 +58,8 @@ struct GpuVulkanDefault {
 	uint32_t graphics_queue_family;
 };
 std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(
-	GPU::function_t<VkSurfaceKHR(VkInstance)> surface_loader, std::span<const char*> instance_extensions = {}, std::span<const char*> extra_layers = {}, std::span<const char*> device_extensions = {}, bool debug = true
+	GPU::function_t<VkSurfaceKHR(VkInstance)> surface_loader, void(*error_callback)(void* queue, int type, std::string_view message) = GPU::default_::error_callback, VkDebugUtilsMessageSeverityFlagBitsEXT severity_filter = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
+	std::span<const char*> instance_extensions = {}, std::span<const char*> extra_layers = {}, std::span<const char*> device_extensions = {}, bool debug = true
 );
 
 inline VkPhysicalDeviceFeatures gpuEnableRequiredVulkanFeaturesEXT(VkPhysicalDeviceFeatures features) {
@@ -132,9 +137,9 @@ struct GpuQueue {
 	uint64_t command_submission_timeline_semaphore_next_value = 1;
 	std::vector<std::pair<VkCommandBuffer, uint64_t>> command_buffers_pending_free;
 };
-GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue = VK_NULL_HANDLE, uint32_t queue_family = -1, GpuAllocatorFunc allocator = default_::gpu_allocator, VkAllocationCallbacks* callbacks = nullptr, bool is_graphics_queue = true);
+GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue = VK_NULL_HANDLE, uint32_t queue_family = -1, bool is_graphics_queue = true, GpuAllocatorFunc allocator = default_::gpu_allocator, VkAllocationCallbacks* callbacks = nullptr);
 inline GpuQueue* gpuCreateQueue(const GpuVulkanDefault& vulkan, GpuAllocatorFunc allocator = default_::gpu_allocator, VkAllocationCallbacks* callbacks = nullptr) {
-	return gpuCreateQueue(vulkan.instance, vulkan.gpu, vulkan.device, vulkan.graphics_queue, vulkan.graphics_queue_family, allocator, callbacks, true);
+	return gpuCreateQueue(vulkan.instance, vulkan.gpu, vulkan.device, vulkan.graphics_queue, vulkan.graphics_queue_family, true, allocator, callbacks);
 }
 
 struct GpuPipeline {

@@ -11,15 +11,28 @@
 
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added
 
+thread_local static VkDebugUtilsMessageSeverityFlagBitsEXT severity_filter;
 
-std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(GPU::function_t<VkSurfaceKHR(VkInstance)> surface_loader, std::span<const char*> instance_extensions /* = {} */, std::span<const char*> extra_layers /* = {} */, std::span<const char*> device_extensions /* = {} */, bool debug /* = true */) {
+std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(
+	GPU::function_t<VkSurfaceKHR(VkInstance)> surface_loader, void(*error_callback)(void* queue, int type, std::string_view message) /* = GPU::default_::error_callback */, VkDebugUtilsMessageSeverityFlagBitsEXT severity_filter_set /* = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT */,
+	std::span<const char*> instance_extensions /* = {} */, std::span<const char*> extra_layers /* = {} */, std::span<const char*> device_extensions /* = {} */, bool debug /* = true */
+) {
 	GpuVulkanDefault out;
+	severity_filter = severity_filter_set;
 
 	// Instance
 	vkb::InstanceBuilder instance_builder;
 	instance_builder.set_app_name("NoAPI")
 		.set_engine_name("NoAPI")
 		.enable_extensions(instance_extensions.size(), instance_extensions.data())
+		.set_debug_callback(+[](VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity, VkDebugUtilsMessageTypeFlagsEXT messageTypes, const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData, void* pUserData) -> VkBool32 {
+			if(messageSeverity < severity_filter) return VK_FALSE;
+
+			auto error_callback = (void(*)(void* queue, int type, std::string_view message))pUserData;
+			error_callback(nullptr, messageTypes, {pCallbackData->pMessage, strlen(pCallbackData->pMessage)});
+			return VK_FALSE;
+		})
+		.set_debug_callback_user_data_pointer((void*)error_callback)
 		.request_validation_layers(debug)
 		.require_api_version(1, 4, 0);
 	for(auto layer: extra_layers)
@@ -66,7 +79,7 @@ std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(GPU::funct
 
 std::optional<GpuSemaphore> gpuCreateSemaphoreImpl(GpuQueue* queue, uint64_t init_value);
 
-GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue /* = VK_NULL_HANDLE */, uint32_t queue_family /* = -1 */, GpuAllocatorFunc allocator /* = default_::gpu_allocator */, VkAllocationCallbacks* callbacks /* = nullptr */, bool is_graphics_queue /* = true */) {
+GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue /* = VK_NULL_HANDLE */, uint32_t queue_family /* = -1 */, bool is_graphics_queue /* = true */, GpuAllocatorFunc allocator /* = default_::gpu_allocator */, VkAllocationCallbacks* callbacks /* = nullptr */) {
 	auto out = (GpuQueue*)allocator(nullptr, sizeof(GpuQueue));
 	new(out) GpuQueue {
 		.cpu_allocator = allocator,
@@ -175,7 +188,7 @@ GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
 					to_free.push_back(cmd);
 					queue->command_buffers_pending_free.erase(queue->command_buffers_pending_free.begin() + i);
 				}
-			}			
+			}
 
 		if(!to_free.empty())
 			vkFreeCommandBuffers(queue->device, queue->command_pool, to_free.size(), to_free.data());
