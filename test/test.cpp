@@ -6,7 +6,8 @@
 
 #include <GLFW/glfw3.h>
 #include "glfw3webgpu.h"
-#include <webgpu/webgpu.h>
+
+#include <webgpu/noapi.hpp>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
@@ -46,16 +47,13 @@ fn fragment(varyings : Varyings) -> @location(0) vec4<f32> {
 
 typedef struct AppState {
 	GLFWwindow *window;
-	WGPUInstance instance;
-	WGPUDevice device;
-	WGPUQueue queue;
-	WGPUSurface surface;
+	GpuWebGPUDefault wgpu;
+	GpuQueue* queue;
 	WGPUTextureFormat format;
 	WGPURenderPipeline pipeline;
 	uint32_t width;
 	uint32_t height;
 } AppState;
-
 
 
 typedef struct RequestAdapterResult {
@@ -97,7 +95,7 @@ static void on_uncaptured_error(WGPUDevice const *device, WGPUErrorType type, WG
 
 static void configure_surface(AppState *state) {
 	WGPUSurfaceConfiguration config = {0};
-	config.device = state->device;
+	config.device = state->wgpu.device;
 	config.format = state->format;
 	config.usage = WGPUTextureUsage_RenderAttachment;
 	config.width = state->width;
@@ -105,7 +103,7 @@ static void configure_surface(AppState *state) {
 	config.presentMode = WGPUPresentMode_Fifo;
 	config.alphaMode = WGPUCompositeAlphaMode_Auto;
 
-	wgpuSurfaceConfigure(state->surface, &config);
+	wgpuSurfaceConfigure(state->wgpu.surface, &config);
 }
 
 static void on_framebuffer_resize(GLFWwindow *window, int width, int height) {
@@ -117,10 +115,9 @@ static void on_framebuffer_resize(GLFWwindow *window, int width, int height) {
 
 static void render_frame(AppState *state) {
 	WGPUSurfaceTexture surface_texture;
-	wgpuSurfaceGetCurrentTexture(state->surface, &surface_texture);
+	wgpuSurfaceGetCurrentTexture(state->wgpu.surface, &surface_texture);
 
 	if (surface_texture.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal && surface_texture.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
-		fprintf(stderr, "Surface texture unavailable status=%d\n", (int)surface_texture.status);
 		configure_surface(state);
 		return;
 	}
@@ -139,7 +136,7 @@ static void render_frame(AppState *state) {
 	rp_descriptor.colorAttachments = &color_attachment;
 
 	WGPUCommandEncoderDescriptor encoder_descriptor = {0};
-	WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(state->device, &encoder_descriptor);
+	WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(state->wgpu.device, &encoder_descriptor);
 
 	WGPURenderPassEncoder render_pass = wgpuCommandEncoderBeginRenderPass(encoder, &rp_descriptor);
 	wgpuRenderPassEncoderSetPipeline(render_pass, state->pipeline);
@@ -151,14 +148,14 @@ static void render_frame(AppState *state) {
 	WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, &cb_descriptor);
 	wgpuCommandEncoderRelease(encoder);
 
-	wgpuQueueSubmit(state->queue, 1, &commands);
+	wgpuQueueSubmit(state->queue->queue, 1, &commands);
 	wgpuCommandBufferRelease(commands);
 
 	wgpuTextureViewRelease(view);
 	wgpuTextureRelease(surface_texture.texture);
 
 #ifndef __EMSCRIPTEN__
-	wgpuSurfacePresent(state->surface);
+	wgpuSurfacePresent(state->wgpu.surface);
 #endif
 }
 
@@ -170,9 +167,7 @@ static void emscripten_frame(void *arg) {
 }
 #endif
 
-/* -------------------------------------------------------------------------
-* Entry point
-* ---------------------------------------------------------------------- */
+
 #ifdef _WIN32
 #include <windows.h>
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nCmdShow)
@@ -196,60 +191,22 @@ int main(void)
 	glfwSetWindowUserPointer(state.window, &state);
 	glfwSetFramebufferSizeCallback(state.window, on_framebuffer_resize);
 
-	state.instance = wgpuCreateInstance(NULL);
-	assert(state.instance && "Failed to create webgpu instance");
+	auto wg = gpuSetupDefaultWebGPUEXT([&state](WGPUInstance instance) -> WGPUSurface {
+		auto surface =  glfwCreateWindowWGPUSurface(instance, state.window);
+		if(!surface) throw std::runtime_error("Failed to setup WebGPU surface");
+		return surface;
+	});
+	if(!wg) throw std::runtime_error(wg.error());
+	state.wgpu = *wg;
 
-	WGPUSurface surface = glfwCreateWindowWGPUSurface(state.instance, state.window);
-	assert(surface && "Failed to create webgpu surface");
-	state.surface = surface;
+	state.queue = gpuCreateQueue(state.wgpu);
 
-	WGPUAdapter adapter = NULL;
-	{
-		WGPURequestAdapterOptions adapter_opts = {0};
-		adapter_opts.compatibleSurface = state.surface;
-		adapter_opts.powerPreference = WGPUPowerPreference_HighPerformance;
+	auto ptr = gpuMalloc<uint32_t>(state.queue, 2);
+	auto gpu = gpuHostToDevicePointer(state.queue, ptr);
+	auto dbg = gpuDecodeWebGPUAddressEXT(gpu);
 
-		RequestAdapterResult result = {0};
-		WGPURequestAdapterCallbackInfo callback_info = {0};
-		callback_info.mode = WGPUCallbackMode_AllowSpontaneous;
-		callback_info.callback = on_adapter_request;
-		callback_info.userdata1 = &result;
-
-		wgpuInstanceRequestAdapter(state.instance, &adapter_opts, callback_info);
-		while (!result.done) {
-			wgpuInstanceProcessEvents(state.instance);
-		#ifdef __EMSCRIPTEN__
-			emscripten_sleep(1); // yields back to the browser event loop
-		#endif
-		}
-		adapter = result.adapter;
-	}
-	assert(adapter && "No adapter obtained");
-
-	{
-		WGPUDeviceDescriptor device_desc = {0};
-		device_desc.uncapturedErrorCallbackInfo.callback = on_uncaptured_error;
-
-		RequestDeviceResult result = {0};
-		WGPURequestDeviceCallbackInfo callback_info = {0};
-		callback_info.mode = WGPUCallbackMode_AllowSpontaneous;
-		callback_info.callback = on_device_request;
-		callback_info.userdata1 = &result;
-
-		wgpuAdapterRequestDevice(adapter, &device_desc, callback_info);
-		while (!result.done) {
-			wgpuInstanceProcessEvents(state.instance);
-		#ifdef __EMSCRIPTEN__
-			emscripten_sleep(1); // yields back to the browser event loop
-		#endif
-		}
-		state.device = result.device;
-	}
-	assert(state.device && "No device obtained");
-
-	state.queue = wgpuDeviceGetQueue(state.device);
 	WGPUSurfaceCapabilities caps = {0};
-	wgpuSurfaceGetCapabilities(state.surface, adapter, &caps);
+	wgpuSurfaceGetCapabilities(state.wgpu.surface, state.wgpu.adapter, &caps);
 	state.format = caps.formats[0]; // preferred format first in the list
 	wgpuSurfaceCapabilitiesFreeMembers(caps);
 
@@ -269,7 +226,7 @@ int main(void)
 
 		WGPUShaderModuleDescriptor shader_desc = {0};
 		shader_desc.nextInChain = &wgsl_source.chain;
-		shader = wgpuDeviceCreateShaderModule(state.device, &shader_desc);
+		shader = wgpuDeviceCreateShaderModule(state.wgpu.device, &shader_desc);
 	}
 	assert(shader && "Shader compilation failed");
 
@@ -307,7 +264,7 @@ int main(void)
 		descriptor.multisample.alphaToCoverageEnabled = false;
 		descriptor.fragment = &fragment;
 
-		state.pipeline = wgpuDeviceCreateRenderPipeline(state.device, &descriptor);
+		state.pipeline = wgpuDeviceCreateRenderPipeline(state.wgpu.device, &descriptor);
 	}
 	assert(state.pipeline && "Pipeline creation failed");
 
@@ -322,11 +279,11 @@ int main(void)
 	}
 
 	wgpuRenderPipelineRelease(state.pipeline);
-	wgpuQueueRelease(state.queue);
-	wgpuSurfaceRelease(state.surface);
-	wgpuDeviceRelease(state.device);
-	wgpuAdapterRelease(adapter);
-	wgpuInstanceRelease(state.instance);
+	gpuFreeQueue(state.queue);
+	wgpuSurfaceRelease(state.wgpu.surface);
+	wgpuDeviceRelease(state.wgpu.device);
+	wgpuAdapterRelease(state.wgpu.adapter);
+	wgpuInstanceRelease(state.wgpu.instance);
 
 	glfwDestroyWindow(state.window);
 	glfwTerminate();
