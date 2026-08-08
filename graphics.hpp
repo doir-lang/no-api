@@ -151,7 +151,7 @@ struct GpuStencil {
 };
 
 /**
- * GpuDepthStencilDesc – Full description of depth/stencil test and write behaviour.
+ * GpuDepthStencilDesc – Full description of depth/stencil test and write behavior.
  *
  * This is intentionally separated from the PSO (unlike DX12, where most of these
  * fields are baked into the pipeline object). Separating depth/stencil state
@@ -175,7 +175,7 @@ struct GpuDepthStencilDesc {
 };
 
 /**
- * GpuBlendDesc – Alpha blending configuration for a single colour render target.
+ * GpuBlendDesc – Alpha blending configuration for a single color render target.
  *
  * Default values implement opaque (no-blending) output: src * 1 + dst * 0 = src.
  * A standard "over" alpha-blend would be:
@@ -189,8 +189,8 @@ struct GpuDepthStencilDesc {
  */
 struct GpuBlendDesc {
 	BLEND colorOp = BLEND_ADD; ///< Blend equation for RGB channels.
-	FACTOR srcColorFactor = FACTOR_ONE; ///< Scale factor applied to the source (incoming) colour.
-	FACTOR dstColorFactor = FACTOR_ZERO; ///< Scale factor applied to the destination (existing) colour.
+	FACTOR srcColorFactor = FACTOR_ONE; ///< Scale factor applied to the source (incoming) color.
+	FACTOR dstColorFactor = FACTOR_ZERO; ///< Scale factor applied to the destination (existing) color.
 	BLEND alphaOp = BLEND_ADD; ///< Blend equation for the alpha channel.
 	FACTOR srcAlphaFactor = FACTOR_ONE; ///< Scale factor applied to the source alpha.
 	FACTOR dstAlphaFactor = FACTOR_ZERO; ///< Scale factor applied to the destination alpha.
@@ -202,7 +202,7 @@ struct GpuBlendDesc {
  * ColorTarget – Render target format and write mask entry in GpuRasterDesc.
  *
  * writeMask mirrors the DX12 / Vulkan concept of per-render-target write masks.
- * Baking it into the PSO lets the shader compiler dead-code-eliminate colour
+ * Baking it into the PSO lets the shader compiler dead-code-eliminate color
  * outputs that are masked off, saving ALU and export bandwidth. This is distinct
  * from GpuBlendDesc::colorWriteMask, which applies when a dynamic GpuBlendState is
  * in use.
@@ -215,8 +215,8 @@ struct GpuColorTarget {
 /**
  * GpuRasterDesc – Minimal rasterizer state baked into a graphics PSO.
  *
- * The goal is to keep this struct small to minimise PSO permutations. States that
- * change frequently (depth/stencil behaviour, blend modes on capable hardware) are
+ * The goal is to keep this struct small to minimize PSO permutations. States that
+ * change frequently (depth/stencil behavior, blend modes on capable hardware) are
  * moved out into separate dynamically-applied state objects.
  *
  * The following fields must be baked because they affect the generated shader
@@ -235,9 +235,9 @@ struct GpuRasterDesc {
 	///< Useful for alpha-tested foliage rendered into an MSAA buffer.
 	bool alphaToCoverage = false;
 
-	///< When true, the shader compiler enables the second pixel-shader colour
+	///< When true, the shader compiler enables the second pixel-shader color
 	///< output (SV_Color1) for use as the second blend source. Only valid when
-	///< a single colour target is used. Requires blendstate to reference
+	///< a single color target is used. Requires blendstate to reference
 	///< FACTOR_SRC1_* blend factors.
 	bool supportDualSourceBlending = false;
 	// TODO: WebGPU supports?
@@ -252,14 +252,14 @@ struct GpuRasterDesc {
 	///< and stencil share the same memory allocation (e.g. FORMAT_D24_UNORM_S8_UINT).
 	FORMAT stencilFormat = FORMAT_NONE;
 
-	///< List of colour render target formats and write masks. Maximum is
-	///< hardware-defined (typically 8). An empty std::span means no colour output
+	///< List of color render target formats and write masks. Maximum is
+	///< hardware-defined (typically 8). An empty std::span means no color output
 	///< (e.g. depth-only shadow pass).
 	std::span<GpuColorTarget> colorTargets = {};
 
 	///< Optional pointer to an embedded (baked) blend state. When non-null the
 	///< blend equation is compiled into the PSO, allowing the driver to dead-code-
-	///< eliminate colour exports on the mobile shader path. When null, blending
+	///< eliminate color exports on the mobile shader path. When null, blending
 	///< must be applied dynamically via gpuSetBlendState (requires device feature).
 	std::optional<GpuBlendDesc> blendstate = std::nullopt;
 	// TODO: Should we require one by default?
@@ -300,7 +300,7 @@ enum STORE_OP {
 };
 
 /**
- * ClearColor – RGBA floating-point clear value for colour attachments.
+ * ClearColor – RGBA floating-point clear value for color attachments.
  */
 struct ClearColor {
 	float r = 0.0f;
@@ -310,7 +310,7 @@ struct ClearColor {
 };
 
 /**
- * GpuColorAttachment – Colour render target binding used by GpuRenderPassDesc.
+ * GpuColorAttachment – Color render target binding used by GpuRenderPassDesc.
  */
 struct GpuColorAttachment {
 	/**
@@ -396,7 +396,7 @@ struct GpuDepthStencilAttachment {
  * GpuRenderPassDesc – Full render pass attachment configuration.
  *
  * This describes the render targets bound for rasterization along with the
- * attachment load/store behaviour required to efficiently map onto both IMR
+ * attachment load/store behavior required to efficiently map onto both IMR
  * desktop GPUs and mobile TBDR architectures.
  *
  * Unlike Vulkan render passes, this object is lightweight and intended to be
@@ -415,7 +415,7 @@ struct GpuRenderPassDesc {
 	std::optional<GpuDepthStencilAttachment> stencilAttachment = std::nullopt;
 
 	/**
-	 * List of colour render targets.
+	 * List of color render targets.
 	 *
 	 * An empty span is valid for depth-only rendering passes such as shadow maps.
 	 */
@@ -568,14 +568,14 @@ void gpuSetScissorRectEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin = {0
  *
  * Performs the hardware-specific render-target setup and (on TBDR GPUs) triggers
  * the tile load operations described by the attachment load ops. Fast-clear
- * elimination is handled transparently by the driver when the clear colour changes.
+ * elimination is handled transparently by the driver when the clear color changes.
  *
  * Does NOT insert an automatic barrier before the pass. If a previous pass wrote
  * to any of these targets via compute shaders, the user must call gpuBarrier
  * with appropriate HAZARD_DEPTH_STENCIL or HAZARD_DESCRIPTORS flags beforehand.
  *
  * @param cmd Command buffer to record into.
- * @param desc Render target attachments and their load/store behaviour.
+ * @param desc Render target attachments and their load/store behavior.
  */
 void gpuBeginRenderPass(GpuCommandBuffer* cmd, const GpuRenderPassDesc& desc);
 
@@ -611,9 +611,9 @@ void gpuEndRenderPass(GpuCommandBuffer* cmd, std::optional<const GpuRenderPassDe
  * @param indices GPU pointer to the index buffer (uint16 or uint32 array).
  * @param index_count Number of indices to draw.
  * @param instance_count Number of instances (1 for non-instanced geometry).
- * @param index_type expected type of the bound indicies
+ * @param index_type expected type of the bound indices
  * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
- * @param no_index_buffer_changes When true reuses the last value in interal index buffer (skips copying any changed indicies)
+ * @param no_index_buffer_changes When true reuses the last value in interal index buffer (skips copying any changed indices)
  * 
  */
 void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd,
@@ -635,9 +635,9 @@ void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd,
  * @param fragment_data GPU pointer to the pixel shader root data struct.
  * @param indices GPU pointer to the index buffer.
  * @param args GPU pointer to an indirect draw argument struct
- * @param index_type expected type of the bound indicies
+ * @param index_type expected type of the bound indices
  * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
- * @param no_index_buffer_changes When true reuses the last value in interal index buffer (skips copying any changed indicies)
+ * @param no_index_buffer_changes When true reuses the last value in interal index buffer (skips copying any changed indices)
  */
 void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd,
  gpu* vertex_data, gpu* fragment_data,
@@ -663,9 +663,9 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd,
 //  * @param pxStride Stride between pixel data entries in bytes (0 = broadcast first).
 //  * @param argsGpu GPU pointer to an array of indirect draw argument structs.
 //  * @param drawCountGpu GPU pointer to a uint32 holding the actual draw count.
-//  * @param index_type expected type of the bound indicies
+//  * @param index_type expected type of the bound indices
 //  * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
-//  * @param no_index_buffer_changes When true reuses the last value in interal index buffer (skips copying any changed indicies)
+//  * @param no_index_buffer_changes When true reuses the last value in interal index buffer (skips copying any changed indices)
 //  */
 // void gpuDrawIndexedInstancedIndirectMulti(GpuCommandBuffer* cmd,
 //  gpu* dataVxGpu, uint32_t vxStride,

@@ -82,7 +82,7 @@ std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(
 
 std::optional<GpuSemaphore> gpuCreateSemaphoreImpl(GpuQueue* queue, uint64_t init_value);
 
-GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue /* = VK_NULL_HANDLE */, uint32_t queue_family /* = -1 */, bool is_graphics_queue /* = true */, GpuAllocatorFunc allocator /* = default_::gpu_allocator */, VkAllocationCallbacks* callbacks /* = nullptr */) {
+GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue /* = VK_NULL_HANDLE */, uint32_t queue_family /* = -1 */, bool is_graphics_queue /* = true */, CpuAllocatorFunc allocator /* = default_::gpu_allocator */, VkAllocationCallbacks* callbacks /* = nullptr */) {
 	auto out = (GpuQueue*)allocator(nullptr, sizeof(GpuQueue));
 	new(out) GpuQueue {
 		.cpu_allocator = allocator,
@@ -216,7 +216,7 @@ GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
 	return out;
 }
 
-void gpuDestoryCommandBuffer(GpuCommandBuffer& cmd) {
+void gpuDestroyCommandBuffer(GpuCommandBuffer& cmd) {
 	vkFreeCommandBuffers(cmd.queue->device, cmd.queue->command_pool, 1, &cmd.command_buffer);
 }
 

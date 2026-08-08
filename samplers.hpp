@@ -28,7 +28,7 @@ enum FILTER {
 
 /**
  * GpuSamplerDesc – Description of a texture sampler's addressing and filtering
- * behaviour.
+ * behavior.
  *
  * Unlike Vulkan/DX12, samplers are not created as separate API objects. Instead
  * a small, fixed set of samplers is declared up front via

@@ -15,6 +15,10 @@ void gpuWaitIdleEXT(GpuQueue* queue) {
 	vkDeviceWaitIdle(queue->device);
 }
 
+void gpuSyncMemoryEXT(GpuCommandBuffer* cmd, gpu* mem) {
+	// Do nothing!
+}
+
 struct ComputePipelinePushConstants {
 	gpu* data;
 	gpu* sampler_map;
