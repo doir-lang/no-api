@@ -99,7 +99,7 @@ struct GpuCommandBuffer;
 /**
  * GpuSemaphore
  * A monotonically-increasing 64-bit timeline counter for GPU<->CPU and
- * GPU<->GPU synchronisation. Semantically identical to DX12 / Vulkan 1.2
+ * GPU<->GPU synchronization. Semantically identical to DX12 / Vulkan 1.2
  * timeline semaphores. A single semaphore and an ever-incrementing counter value
  * replace the older Vulkan/Metal per-submit fence objects and N-buffering patterns.
  * Created by gpuCreateSemaphore(initialValue); destroyed by gpuFreeSemaphore.
@@ -123,8 +123,8 @@ struct GpuSemaphore;
  * directly. Data must first be placed in MEMORY_DEFAULT
  * (an "upload" region) and then copied with gpuMemCpy /
  * gpuCopyToTexture. The driver can apply vendor-specific
- * lossless compression (DCC, delta colour compression) and
- * Morton/tile swizzling for textures, maximising bandwidth.
+ * lossless compression (DCC, delta color compression) and
+ * Morton/tile swizzling for textures, maximizing bandwidth.
  *
  * MEMORY_READBACK – CPU-cached memory suitable for GPU->CPU readback. Slower for
  * the GPU to write due to cache-coherency with the CPU.
@@ -228,7 +228,7 @@ inline bool gpuFormatIsStencil(FORMAT format) {
 enum TEXTURE_USAGE_FLAGS {
 	USAGE_SAMPLED = 0x01, ///< Readable by texture samplers.
 	USAGE_STORAGE = 0x02, ///< Read/write access from compute shaders.
-	USAGE_COLOR_ATTACHMENT = 0x04, ///< Rasterizer colour render target.
+	USAGE_COLOR_ATTACHMENT = 0x04, ///< Rasterizer color render target.
 	USAGE_DEPTH_STENCIL_ATTACHMENT = 0x08, ///< Rasterizer depth/stencil target.
 	USAGE_TRANSFER_SRC = 0x10, ///< Source of copy operations.
 	USAGE_TRANSFER_DST = 0x20, ///< Destination of copy operations.
@@ -249,7 +249,7 @@ enum STAGE {
 	STAGE_COMPUTE = 0x002, ///< Compute shader execution.
 	STAGE_VERTEX_SHADER = 0x004, ///< Vertex or mesh shader execution.
 	STAGE_PIXEL_SHADER = 0x008, ///< Pixel / fragment shader execution.
-	STAGE_RASTER_COLOR_OUT = 0x010, ///< Rasterizer colour output (ROPs / framebuffer writes).
+	STAGE_RASTER_COLOR_OUT = 0x010, ///< Rasterizer color output (ROPs / framebuffer writes).
 	STAGE_RASTER_DEPTH_OUT = 0x020, ///< Rasterizer depth/stencil output.
 	STAGE_ALL = 0x03F, ///< All stages (conservative; use sparingly).
 	// NOTE: In WebGPU will we be able to get any more granular than all?
@@ -444,7 +444,7 @@ T* gpuMalloc(GpuQueue* queue, size_t count = 1, MEMORY memory = MEMORY_DEFAULT) 
 
 /**
  * gpuFree – Free a GPU memory block previously returned by gpuMalloc.
- * Behaviour is undefined if the GPU still has in-flight work that reads or writes
+ * Behavior is undefined if the GPU still has in-flight work that reads or writes
  * the allocation. Use gpuWaitSemaphore to drain GPU work before freeing.
  *
  * @param queue The GPU queue (device) the memory was allocated on.
@@ -615,12 +615,12 @@ GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue);
  * 
  * @param cmd The command buffer to destroy
  */
-void gpuDestoryCommandBuffer(GpuCommandBuffer* cmd);
+void gpuDestroyCommandBuffer(GpuCommandBuffer* cmd);
 
 /**
  * gpuSubmit – Submit a batch of recorded command buffers to the queue for GPU
  * execution. Optionally signals a timeline semaphore to a new value upon completion,
- * enabling frame-pacing and CPU-GPU synchronisation without per-submit fence objects.
+ * enabling frame-pacing and CPU-GPU synchronization without per-submit fence objects.
  * Returns a monotonically increasing submission number.
  *
  * Note that submitted command buffers are then destroyed unless the NoDestroy variant is used
@@ -636,7 +636,7 @@ uint64_t gpuSubmit(GpuQueue* queue, std::span<GpuCommandBuffer*> command_buffers
 /**
  * gpuSubmitNoDestroy – Identical to gpuSubmit, except the submitted command
  * buffers are NOT destroyed after submission. The caller is responsible for
- * eventually calling gpuDestoryCommandBuffer on each buffer once the GPU has
+ * eventually calling gpuDestroyCommandBuffer on each buffer once the GPU has
  * finished executing it.
  *
  * @param queue Target submission queue.
@@ -648,11 +648,11 @@ uint64_t gpuSubmit(GpuQueue* queue, std::span<GpuCommandBuffer*> command_buffers
 uint64_t gpuSubmitNoDestroy(GpuQueue* queue, std::span<GpuCommandBuffer*> commandBuffers, GpuSemaphore* semaphore = nullptr, uint64_t signal_value = 0);
 
 // ---------------------------------------------------------------------------
-// Timeline semaphores (GPU <-> CPU synchronisation)
+// Timeline semaphores (GPU <-> CPU synchronization)
 // ---------------------------------------------------------------------------
 
 /**
- * gpuCreateSemaphore – Create a timeline semaphore initialised to `initial_value`.
+ * gpuCreateSemaphore – Create a timeline semaphore initialized to `initial_value`.
  *
  * A single semaphore with a monotonically-increasing 64-bit counter replaces
  * the per-frame fence + N-buffering patterns required by older Vulkan/Metal APIs.

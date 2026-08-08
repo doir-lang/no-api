@@ -13,7 +13,7 @@
  */
 namespace default_ {
 	/**
-	 * gpu_allocator – Default CPU-side host allocator hook, implementing
+	 * cpu_allocator – Default CPU-side host allocator hook, implementing
 	 * realloc/free-style semantics:
 	 *
 	 * - If \p p is NULL and \p size > 0: allocates new memory.
@@ -24,7 +24,7 @@ namespace default_ {
 	 * @param p Existing allocation to resize or free, or NULL to allocate fresh memory.
 	 * @param size Requested size in bytes, or 0 to free \p p.
 	 */
-	inline static void* gpu_allocator(void* p, size_t size) noexcept {
+	inline static void* cpu_allocator(void* p, size_t size) noexcept {
 		if(size == 0) {
 			if(p) free(p);
 			return NULL;
@@ -35,10 +35,10 @@ namespace default_ {
 }
 
 /**
- * GpuAllocatorFunc – Function pointer type for a custom CPU-side allocator hook,
+ * CpuAllocatorFunc – Function pointer type for a custom CPU-side allocator hook,
  * matching the realloc/free semantics documented on default_::gpu_allocator.
  *
  * @param p Existing allocation to resize or free, or NULL to allocate fresh memory.
  * @param size Requested size in bytes, or 0 to free \p p.
  */
-typedef void *(*GpuAllocatorFunc)(void *p, size_t size);
+typedef void *(*CpuAllocatorFunc)(void *p, size_t size);

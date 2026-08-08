@@ -24,7 +24,7 @@
 struct GpuSurface;
 
 /**
- * PRESENT_MODE – Swapchain presentation scheduling behaviour.
+ * PRESENT_MODE – Swapchain presentation scheduling behavior.
  *
  * The exact implementation depends on platform compositor support and GPU
  * driver capabilities.
