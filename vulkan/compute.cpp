@@ -19,6 +19,10 @@ void gpuSyncMemoryEXT(GpuCommandBuffer* cmd, gpu* mem) {
 	// Do nothing!
 }
 
+void gpuSyncMemoryEXT(GpuQueue* queue, gpu* mem) {
+	// Do nothing!
+}
+
 struct ComputePipelinePushConstants {
 	gpu* data;
 	gpu* sampler_map;
