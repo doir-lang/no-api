@@ -19,7 +19,7 @@ GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, VkSurfaceKHR surface, const Gpu
 	return out;
 }
 
-void gpuDestroySurfaceNoSemaphores(GpuQueue* queue, GpuSurface* surface) { 
+void gpuFreeSurfaceNoSemaphores(GpuQueue* queue, GpuSurface* surface) { 
 	for(auto view: surface->image_views)
 		vkDestroyImageView(queue->device, view, queue->callbacks);
 	if(surface->swapchain)
@@ -31,7 +31,9 @@ void gpuFreeSurfaceEXT(GpuQueue* queue, GpuSurface* surface) {
 		vkDestroySemaphore(queue->device, semaphore, queue->callbacks);
 	for(auto semaphore: surface->render_finished_semaphores)
 		vkDestroySemaphore(queue->device, semaphore, queue->callbacks);
-	gpuDestroySurfaceNoSemaphores(queue, surface);
+	gpuFreeSurfaceNoSemaphores(queue, surface);
+	surface->~GpuSurface();
+	queue->cpu_allocator(surface, 0);
 }
 
 void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSurfaceDescriptor& desc) {
@@ -68,7 +70,7 @@ void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSur
 		.build();
 	if(!swap) errno = swap.error().value();
 
-	gpuDestroySurfaceNoSemaphores(queue, surface);
+	gpuFreeSurfaceNoSemaphores(queue, surface);
 	surface->swapchain = std::make_shared<vkb::Swapchain>(std::move(*swap));
 	std::vector<VkImage> images;
 	std::tie(images, surface->image_views) = surface->swapchain->get_images_and_image_views().value();

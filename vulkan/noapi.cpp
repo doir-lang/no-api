@@ -216,11 +216,13 @@ GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
 	return out;
 }
 
-void gpuDestroyCommandBuffer(GpuCommandBuffer& cmd) {
+void gpuFreeCommandBuffer(GpuCommandBuffer& cmd) {
 	vkFreeCommandBuffers(cmd.queue->device, cmd.queue->command_pool, 1, &cmd.command_buffer);
+	cmd.~GpuCommandBuffer();
+	cmd.queue->cpu_allocator(&cmd, 0);
 }
 
-uint64_t gpuSubmitNoDestroy(GpuQueue* queue, std::span<GpuCommandBuffer*> commandBuffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signalValue /* = 0 */) {
+uint64_t gpuSubmitNoFree(GpuQueue* queue, std::span<GpuCommandBuffer*> commandBuffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signalValue /* = 0 */) {
 	std::vector<VkSemaphoreSubmitInfo> waits;
 	std::vector<VkCommandBufferSubmitInfo> submits; submits.reserve(commandBuffers.size());
 	for(auto& cmd: commandBuffers) {
@@ -273,10 +275,14 @@ uint64_t gpuSubmitNoDestroy(GpuQueue* queue, std::span<GpuCommandBuffer*> comman
 }
 
 uint64_t gpuSubmit(GpuQueue* queue, std::span<GpuCommandBuffer*> commandBuffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signalValue /* = 0 */) {
-	auto submission_index = gpuSubmitNoDestroy(queue, commandBuffers, semaphore, signalValue);
+	auto submission_index = gpuSubmitNoFree(queue, commandBuffers, semaphore, signalValue);
 
-	for(auto& cmd: commandBuffers)
+	for(auto& cmd: commandBuffers) {
 		queue->command_buffers_pending_free.emplace_back(cmd->command_buffer, submission_index);
+
+		cmd->~GpuCommandBuffer(); // Free the buffer
+		queue->cpu_allocator(cmd, 0);
+	}
 	return submission_index;
 }
 
