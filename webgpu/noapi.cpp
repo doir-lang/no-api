@@ -4,15 +4,17 @@
 #include "webgpu/webgpu.h"
 
 #include <cassert>
+#include <iostream>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
 #endif
 
-
-
 void GPU::default_::error_callback(void* queue, int type, std::string_view message) {
-	fprintf(stderr, "WGPU Device Error %d: %.*s\n", (int)type, (int)message.size(), message.data());
+	std::cerr << "WGPU Device Error " << type << ": " << message << std::endl;
+#ifdef _WIN32
+	system("pause");
+#endif
 	exit(-1);
 }
 
@@ -43,7 +45,7 @@ std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::funct
 			.mode = WGPUCallbackMode_AllowSpontaneous,
 			.callback = +[](WGPURequestAdapterStatus status, WGPUAdapter adapter, WGPUStringView message, void* userdata1, void* userdata2) {
 				RequestAdapterResult* result = (RequestAdapterResult*)userdata1;
-				auto& error_callback = *(GPU::function_t<void(WGPUDevice const* device, WGPUErrorType type, std::string_view message)>*)userdata2;
+				auto error_callback = *(void(**)(void* queue, int type, std::string_view message))userdata2;
 				result->done = true;
 				if (status != WGPURequestAdapterStatus_Success) 
 					error_callback(nullptr, WGPUErrorType_Validation, {message.data, message.length});

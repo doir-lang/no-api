@@ -171,11 +171,15 @@ static void emscripten_frame(void *arg) {
 
 #ifdef _WIN32
 #include <windows.h>
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nCmdShow)
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nCmdShow) {
+	AllocConsole();
+    freopen("CONOUT$", "w", stdout);
+	freopen("CONOUT$", "w", stderr);
+    freopen("CONIN$", "r", stdin);
 #else
-int main(void)
+int main(void) {
 #endif
-{
+
 	AppState state = {0};
 	const int initial_width = 800;
 	const int initial_height = 600;
