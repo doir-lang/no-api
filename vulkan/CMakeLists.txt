@@ -54,4 +54,5 @@ target_link_libraries(noapi-vulkan PUBLIC
 	glslang::glslang-default-resource-limits
 	glslang::SPIRV
 )
+set_target_properties(noapi-vulkan PROPERTIES CXX_STANDARD 26)
 target_include_directories(noapi-vulkan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

@@ -1,8 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 project(NoAPI CXX C)
 
-set(CMAKE_CXX_STANDARD 26)
-
 option(NOAPI_ENABLE_VULKAN "Enable the Vulkan backend" $<NOT:$<BOOL:${EMSCRIPTEN}>>)
 option(NOAPI_ENABLE_WEBGPU "Enable the WebGPU backend" ON)
 
@@ -14,7 +12,7 @@ if(NOT NOAPI_ENABLE_VULKAN AND NOT NOAPI_ENABLE_WEBGPU)
 endif()
 
 if(NOAPI_ENABLE_VULKAN)
-	add_subdirectory(vulkan)
+	add_subdirectory(vulkan) 
 endif()
 
 if(NOAPI_ENABLE_WEBGPU)

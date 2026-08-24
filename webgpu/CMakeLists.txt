@@ -17,4 +17,5 @@ FetchContent_MakeAvailable(webgpu-distribution)
 
 add_library(noapi-webgpu noapi.cpp)
 target_link_libraries(noapi-webgpu PUBLIC webgpu)
+set_target_properties(noapi-webgpu PROPERTIES CXX_STANDARD 26)
 target_include_directories(noapi-webgpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
