@@ -101,7 +101,7 @@ gpu* gpuHostToDevicePointer(GpuQueue* queue, void* ptr) {
 	return nullptr;
 }
 
-void* gpuDeviceToHostPointer(GpuQueue* queue, gpu* ptr) {
+void* gpuDeviceToHostPointerEXT(GpuQueue* queue, gpu* ptr) {
 	auto gpu_ptr = (VkDeviceAddress)ptr;
 	if(queue->gpu2host.contains(gpu_ptr))
 		return queue->gpu2host[gpu_ptr];

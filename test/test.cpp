@@ -6,7 +6,10 @@
 #include <stdexcept>
 
 #include <GLFW/glfw3.h>
+#include "compute.hpp"
 #include "glfw3webgpu.h"
+#include "sync.hpp"
+#include "webgpu/webgpu.h"
 
 #include <webgpu/noapi.hpp>
 
@@ -206,9 +209,30 @@ int main(void) {
 
 	state.queue = gpuCreateQueue(state.wgpu);
 
-	auto ptr = gpuMalloc<uint32_t>(state.queue, 2);
-	auto gpu = gpuHostToDevicePointer(state.queue, ptr);
-	auto dbg = gpuDecodeWebGPUAddressEXT(gpu);
+	auto upload = gpuMalloc<float>(state.queue, 5, MEMORY_DEFAULT);
+	for(size_t i = 0; i < 5; ++i)
+		upload[i] = i;
+	auto upload_gpu = gpuHostToDevicePointer(state.queue, upload);
+	auto upload_range = std::get<GpuQueue::MonobufferRange>(state.queue->allocations[upload_gpu]);
+	auto download = gpuMalloc<float>(state.queue, 5, MEMORY_READBACK);
+	auto download_gpu = gpuHostToDevicePointer(state.queue, download);
+	auto download_range = std::get<GpuQueue::MonobufferRange>(state.queue->allocations[download_gpu]);
+
+	auto cmd = gpuStartCommandRecording(state.queue);
+	gpuSyncMemoryEXT(cmd, upload_gpu);
+	WGPUBufferDescriptor d {
+		.label = {"Temporary Storage", WGPU_STRLEN},
+		.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
+		.size = 5 * sizeof(float),
+	};
+	auto tmp = wgpuDeviceCreateBuffer(state.queue->device, &d);
+	wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, state.queue->monobuffers[upload_range.buffer], upload_range.start, tmp, 0, upload_range.size());
+	wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, tmp, 0, state.queue->monobuffers[download_range.buffer], download_range.start, upload_range.size());
+	auto index = gpuSubmit(state.queue, {&cmd, 1});
+
+	gpuSyncMemoryEXT(state.queue, download_gpu);
+	auto dbg = download[3];
+	wgpuBufferRelease(tmp);
 
 	WGPUSurfaceCapabilities caps = {0};
 	wgpuSurfaceGetCapabilities(state.wgpu.surface, state.wgpu.adapter, &caps);

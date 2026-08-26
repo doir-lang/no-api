@@ -1,9 +1,9 @@
 
 #include "noapi.hpp"
-#include "compute.hpp"
-#include "webgpu/webgpu.h"
+#include "common.hpp"
 
 #include <cassert>
+#include <cstring>
 #include <iostream>
 
 #ifdef __EMSCRIPTEN__
@@ -23,7 +23,7 @@ std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::funct
 
 	{ // Instance
 		WGPUInstanceDescriptor d {
-		
+
 		};
 		out.instance = wgpuCreateInstance(&d);
 	}
@@ -47,7 +47,7 @@ std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::funct
 				RequestAdapterResult* result = (RequestAdapterResult*)userdata1;
 				auto error_callback = *(void(**)(void* queue, int type, std::string_view message))userdata2;
 				result->done = true;
-				if (status != WGPURequestAdapterStatus_Success) 
+				if (status != WGPURequestAdapterStatus_Success)
 					error_callback(nullptr, WGPUErrorType_Validation, {message.data, message.length});
 				result->adapter = adapter;
 			},
@@ -130,6 +130,8 @@ GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limi
 
 	out->queue = wgpuDeviceGetQueue(device);
 
+	out->current_submission_timeline_semaphore = GPU::semaphore_initialize(out, out->next_submission_index - 1);
+
 	WGPUBufferDescriptor d {
 		.label = {"NoAPI Empty Monobuffer", WGPU_STRLEN},
 		.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
@@ -141,9 +143,10 @@ GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limi
 }
 
 void gpuFreeQueue(GpuQueue* queue) {
-	// TODO: Free stuff!
+	GPU::semaphore_destroy(queue->current_submission_timeline_semaphore);
 
 	auto allocator = queue->cpu_allocator;
+	queue->~GpuQueue();
 	allocator(queue, 0);
 }
 
@@ -166,11 +169,10 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 	constexpr static auto align_up = [](size_t addr, size_t align) {
 		return (addr + align - 1) & ~(align - 1);
 	};
-	constexpr static auto allocation_bookkeeping = [](GpuQueue* queue, uint8_t active_monobuffer, size_t gpu_address, size_t bytes) {
+	constexpr static auto allocation_bookkeeping = [](GpuQueue* queue, uint8_t active_monobuffer, size_t gpu_address, size_t bytes, MEMORY memory) {
 		auto cpu = queue->cpu_allocator(nullptr, bytes);\
 		auto gpu = gpuEncodeWebGPUAddressEXT(active_monobuffer, gpu_address);
-		queue->allocations[gpu] = {GpuQueue::MonobufferRange{active_monobuffer, gpu_address, gpu_address + bytes}, cpu};
-		queue->gpu2cpu[gpu] = cpu;
+		queue->allocations[gpu] = {GpuQueue::MonobufferRange{active_monobuffer, gpu_address, gpu_address + bytes}, cpu, memory};
 		queue->cpu2gpu[cpu] = gpu;
 		return cpu;
 	};
@@ -193,7 +195,7 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 		auto aligned = align_up(start, align);
 		if(end - aligned > bytes) {
 			start = aligned + bytes;
-			return allocation_bookkeeping(queue, active_buffer, aligned, bytes);
+			return allocation_bookkeeping(queue, active_buffer, aligned, bytes, memory);
 		}
 
 		// If each element overlaps with the previous one merge them
@@ -215,7 +217,9 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 	bool activate_next_monobuffer = false;
 	if(new_end > queue->monobuffer_capacity) {
 		if(queue->monobuffers[queue->active_monobuffer] != queue->empty_monobuffer)
-			queue->buffers_pending_free.emplace_back(queue->monobuffers[queue->active_monobuffer], queue->current_submission_index);
+			queue->code_pending_submission_finished.emplace_back([buffer = queue->monobuffers[queue->active_monobuffer]]() {
+				wgpuBufferRelease(buffer);
+			}, queue->next_submission_index);
 		else queue->monobuffer_capacity = new_end;
 
 		queue->monobuffer_capacity = std::max(queue->monobuffer_capacity * 2, new_end); // Doubles the size of the capacity each time
@@ -232,7 +236,7 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 		WGPUBufferDescriptor d {
 			.label = {"NoAPI Monobuffer", WGPU_STRLEN},
 			.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
-			.size = queue->monobuffer_capacity 
+			.size = queue->monobuffer_capacity
 		};
 		auto old_monobuffer = queue->monobuffers[queue->active_monobuffer];
 		queue->monobuffers[queue->active_monobuffer] = wgpuDeviceCreateBuffer(queue->device, &d);
@@ -242,8 +246,8 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 			wgpuCommandEncoderCopyBufferToBuffer(cmd, old_monobuffer, 0, queue->monobuffers[queue->active_monobuffer], 0, queue->monobuffer_size);
 			auto to_submit = wgpuCommandEncoderFinish(cmd, nullptr);
 			wgpuQueueSubmit(queue->queue, 1, &to_submit);
-			// TODO: need to add to_submit to the free queue
 			wgpuCommandEncoderRelease(cmd);
+			wgpuCommandBufferRelease(to_submit);
 		}
 
 		if(activate_next_monobuffer) {
@@ -259,7 +263,7 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 			WGPUBufferDescriptor d {
 				.label = {"NoAPI Monobuffer", WGPU_STRLEN},
 				.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
-				.size = bytes 
+				.size = bytes
 			};
 			queue->monobuffers[queue->active_monobuffer] = wgpuDeviceCreateBuffer(queue->device, &d);
 
@@ -271,11 +275,159 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 	}
 
 	if(!activate_next_monobuffer) queue->monobuffer_size = new_end;
-	return allocation_bookkeeping(queue, new_active_monobuffer, new_start, new_end - new_start);
+	return allocation_bookkeeping(queue, new_active_monobuffer, new_start, new_end - new_start, memory);
 }
 
 gpu* gpuHostToDevicePointer(GpuQueue* queue, void* ptr) {
 	if(queue->cpu2gpu.contains(ptr))
 		return queue->cpu2gpu[ptr];
 	return nullptr;
+}
+
+void* gpuDeviceToHostPointerEXT(GpuQueue* queue, gpu* ptr) {
+	if(queue->allocations.contains(ptr))
+		return std::get<void*>(queue->allocations[ptr]);
+	return nullptr;
+}
+
+void gpuFree(GpuQueue* queue, void* ptr) {
+	auto device = gpuHostToDevicePointer(queue, ptr);
+	if(device) gpuFree(queue, device);
+}
+void gpuFree(GpuQueue* queue, gpu* ptr) {
+	if(!queue->allocations.contains(ptr)) return;
+
+	// TODO: Extra buffers go here
+
+	auto [range, cpu, _memory_type] = queue->allocations[ptr];
+	queue->cpu_allocator(cpu, 0);
+
+	queue->allocations.erase(ptr);
+	queue->cpu2gpu.erase(cpu);
+
+	queue->freelist.push_back(range);
+	// Sort the freelist so buffers are together, and then by start
+	std::sort(queue->freelist.begin(), queue->freelist.end(), [](const GpuQueue::MonobufferRange& a, const GpuQueue::MonobufferRange& b) -> bool {
+		if(a.buffer == b.buffer)
+			return a.start < b.start;
+
+		return a.buffer < b.buffer;
+	});
+}
+
+GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
+	auto out = (GpuCommandBuffer*)queue->cpu_allocator(nullptr, sizeof(GpuCommandBuffer));
+	new(out) GpuCommandBuffer{
+		.queue = queue,
+		.encoder = wgpuDeviceCreateCommandEncoder(queue->device, nullptr)
+	};
+
+	auto current_finished_submission = GPU::semaphore_value(queue, queue->current_submission_timeline_semaphore);
+	if(queue->code_pending_submission_finished.size())
+		for(size_t i = queue->code_pending_submission_finished.size(); i--; ) {
+			auto& [code, submit] = queue->code_pending_submission_finished[i];
+			if(submit <= current_finished_submission) {
+				code();
+				queue->code_pending_submission_finished.erase(queue->code_pending_submission_finished.begin() + i);
+			}
+		}
+
+	return out;
+}
+
+void gpuFreeCommandBuffer(GpuCommandBuffer* cmd) {
+	wgpuCommandEncoderRelease(cmd->encoder);
+
+	auto allocator = cmd->queue->cpu_allocator;
+	cmd->~GpuCommandBuffer();
+	allocator(cmd, 0);
+}
+
+uint64_t gpuSubmitNoFree(GpuQueue* queue, std::span<GpuCommandBuffer*> command_buffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signal_value /* = 0 */) {
+	std::vector<WGPUCommandBuffer> buffers; buffers.reserve(command_buffers.size() + 1);
+	for(auto buffer: command_buffers)
+		buffers.emplace_back(wgpuCommandEncoderFinish(buffer->encoder, nullptr));
+
+	GpuCommandBuffer cmd {
+		.queue = queue,
+		.encoder = wgpuDeviceCreateCommandEncoder(queue->device, nullptr),
+	};
+	GPU::semaphore_gpu_increment(&cmd, queue->current_submission_timeline_semaphore);
+
+	// TODO: GpuSemaphore* semaphore /* = nullptr */ stuff
+
+	buffers.emplace_back(wgpuCommandEncoderFinish(cmd.encoder, nullptr));
+	wgpuCommandEncoderRelease(cmd.encoder);
+
+	wgpuQueueSubmit(queue->queue, buffers.size(), buffers.data());
+
+	for(auto buffer: command_buffers)
+		for(auto code: buffer->code_pending_submission_finished)
+			queue->code_pending_submission_finished.emplace_back(code, queue->next_submission_index);
+
+	return queue->next_submission_index++;
+}
+
+uint64_t gpuSubmit(GpuQueue* queue, std::span<GpuCommandBuffer*> command_buffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signal_value /* = 0 */) {
+	auto submission = gpuSubmitNoFree(queue, command_buffers, semaphore, signal_value);
+	for(auto cmd: command_buffers)
+		gpuFreeCommandBuffer(cmd);
+	return submission;
+}
+
+void gpuWaitIdleEXT(GpuQueue* queue);
+
+void gpuSyncMemoryEXT(GpuCommandBuffer* cmd, gpu* mem) {
+	auto [range, cpu, memory_type] = cmd->queue->allocations[mem];
+	auto size = range.size();
+
+	switch (memory_type) {
+	case MEMORY_DEFAULT:
+	case MEMORY_GPU:
+	case MEMORY_TEXTURE: {
+		WGPUBufferDescriptor d{
+			.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_MapWrite,
+			.size = size,
+			.mappedAtCreation = true,
+		};
+		auto tmp = wgpuDeviceCreateBuffer(cmd->queue->device, &d);
+		auto tmp_cpu = wgpuBufferGetMappedRange(tmp, 0, size);
+		memcpy(tmp_cpu, cpu, size);
+		wgpuBufferUnmap(tmp);
+
+		wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, tmp, 0, cmd->queue->monobuffers[range.buffer], range.start, size);
+		cmd->code_pending_submission_finished.emplace_back([tmp]() {
+			wgpuBufferRelease(tmp);
+		});
+	}
+	break; case MEMORY_READBACK:
+	case MEMORY_TEXTURE_READBACK: {
+		WGPUBufferDescriptor d{
+			.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead,
+			.size = size,
+		};
+		auto tmp = wgpuDeviceCreateBuffer(cmd->queue->device, &d);
+
+		wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, cmd->queue->monobuffers[range.buffer], range.start, tmp, 0, size);
+		cmd->code_pending_submission_finished.emplace_back([queue = cmd->queue, tmp, cpu, size]() {
+			GPU::wait_for_buffer_map(queue, tmp, WGPUMapMode_Read, 0, size);
+
+			auto tmp_cpu = wgpuBufferGetConstMappedRange(tmp, 0, size);
+			memcpy(cpu, tmp_cpu, size);
+
+			wgpuBufferRelease(tmp);
+		});
+	}
+	}
+}
+
+void gpuSyncMemoryEXT(GpuQueue* queue, gpu* mem) {
+	auto cmd = gpuStartCommandRecording(queue);
+	gpuSyncMemoryEXT(cmd, mem);
+	auto submit_index = gpuSubmit(queue, {&cmd, 1});
+
+	GPU::semaphore_wait(queue, queue->current_submission_timeline_semaphore, submit_index);
+
+	// TODO: Should we add an accessor function that lets us poll the pending syncs without having to use this hack?
+	gpuFreeCommandBuffer(gpuStartCommandRecording(queue));
 }
