@@ -479,7 +479,7 @@ void gpuFree(GpuQueue* queue, gpu* ptr);
 gpu* gpuHostToDevicePointer(GpuQueue* queue, void* ptr);
 
 /**
- * gpuDeviceToHostPointer – Translate a GPU pointer to a CPU-mapped pointer.
+ * gpuDeviceToHostPointerEXT – Translate a GPU pointer to a CPU-mapped pointer.
  * Will return nullptr if the backing memory is GPU only.
  *
  * This call performs a hash-map lookup in the driver and is not
@@ -489,7 +489,7 @@ gpu* gpuHostToDevicePointer(GpuQueue* queue, void* ptr);
  * @param queue The GPU queue (device) the memory was allocated on.
  * @param ptr GPU pointer to translate. Must not be null.
  */
-void* gpuDeviceToHostPointer(GpuQueue* queue, gpu* ptr);
+void* gpuDeviceToHostPointerEXT(GpuQueue* queue, gpu* ptr);
 
 // ---------------------------------------------------------------------------
 // Texture management
