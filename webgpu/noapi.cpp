@@ -1,14 +1,18 @@
-
 #include "noapi.hpp"
 #include "common.hpp"
 
+#include <bit>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <iostream>
+#include <optional>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
 #endif
+
+const GpuQueue::MonotextureRange GpuQueue::MonotextureRange::INVALID = {static_cast<uint32_t>(-1), static_cast<uint32_t>(-1), static_cast<uint32_t>(-1)};
 
 void GPU::default_::error_callback(void* queue, int type, std::string_view message) {
 	std::cerr << "WGPU Device Error " << type << ": " << message << std::endl;
@@ -39,7 +43,7 @@ std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::funct
 
 		struct RequestAdapterResult {
 			WGPUAdapter adapter;
-			bool done;
+			volatile bool done;
 		} result = {};
 		wgpuInstanceRequestAdapter(out.instance, &adapter_opts, {
 			.mode = WGPUCallbackMode_AllowSpontaneous,
@@ -91,7 +95,7 @@ std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::funct
 
 		struct RequestDeviceResult {
 			WGPUDevice device;
-			bool done;
+			volatile bool done;
 		} result = {};
 		wgpuAdapterRequestDevice(out.adapter, &device_desc, {
 			.mode = WGPUCallbackMode_AllowSpontaneous,
@@ -172,7 +176,7 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 	constexpr static auto allocation_bookkeeping = [](GpuQueue* queue, uint8_t active_monobuffer, size_t gpu_address, size_t bytes, MEMORY memory) {
 		auto cpu = queue->cpu_allocator(nullptr, bytes);\
 		auto gpu = gpuEncodeWebGPUAddressEXT(active_monobuffer, gpu_address);
-		queue->allocations[gpu] = {GpuQueue::MonobufferRange{active_monobuffer, gpu_address, gpu_address + bytes}, cpu, memory};
+		queue->allocations[gpu] = {GpuQueue::MonobufferRange{active_monobuffer, static_cast<uint32_t>(gpu_address), static_cast<uint32_t>(gpu_address + bytes)}, cpu, memory};
 		queue->cpu2gpu[cpu] = gpu;
 		return cpu;
 	};
@@ -182,11 +186,11 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 		return nullptr;
 	}
 
-	for(size_t i = 0; i < queue->freelist.size(); ++i) {
-		auto& [active_buffer, start, end] = queue->freelist[i];
+	for(size_t i = 0; i < queue->buffer_freelist.size(); ++i) {
+		auto& [active_buffer, start, end] = queue->buffer_freelist[i];
 		// Strip any empty ranges from the list
 		if(start == end) {
-			queue->freelist.erase(queue->freelist.begin() + i);
+			queue->buffer_freelist.erase(queue->buffer_freelist.begin() + i);
 			--i;
 			continue;
 		}
@@ -202,9 +206,9 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 		// assumes that the freelist is sorted by buffer index followed by starting value
 		if(i == 0) continue;
 
-		auto [prev_buffer, prev_start, prev_end] = queue->freelist[i - 1];
+		auto [prev_buffer, prev_start, prev_end] = queue->buffer_freelist[i - 1];
 		if(start > prev_start && start < prev_end && prev_buffer == active_buffer) {
-			queue->freelist.erase(queue->freelist.begin() + (i - 1));
+			queue->buffer_freelist.erase(queue->buffer_freelist.begin() + (i - 1));
 			start = prev_start;
 		}
 	}
@@ -252,7 +256,7 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 
 		if(activate_next_monobuffer) {
 			// Add the rest of the old monobuffer to the freelist
-			queue->freelist.emplace_back(queue->active_monobuffer, queue->monobuffer_size, queue->limits.maxStorageBufferBindingSize);
+			queue->buffer_freelist.emplace_back(queue->active_monobuffer, queue->monobuffer_size, queue->limits.maxStorageBufferBindingSize);
 
 			++queue->active_monobuffer;
 			if(queue->active_monobuffer >= queue->monobuffers.size()) { // Fail if monobuffer being activated is the 8th monobuffer
@@ -298,6 +302,25 @@ void gpuFree(GpuQueue* queue, gpu* ptr) {
 	if(!queue->allocations.contains(ptr)) return;
 
 	// TODO: Extra buffers go here
+	if(queue->gpu2textures.contains(ptr)) {
+		auto texture = queue->gpu2textures[ptr];
+		if(texture->range) {
+			queue->texture_freelist.emplace_back(*texture->range);
+			// Sort the freelist so entries are grouped by monotexture (storage flag + index) and then by start,
+			// mirroring buffer_freelist's sort so gpuCreateTexture's freelist search can merge adjacent free ranges
+			std::sort(queue->texture_freelist.begin(), queue->texture_freelist.end(), [](const GpuQueue::MonotextureRange& a, const GpuQueue::MonotextureRange& b) -> bool {
+				if(a.storage() != b.storage())
+					return a.storage() < b.storage();
+				if(a._index == b._index)
+					return a.start < b.start;
+				return a._index < b._index;
+			});
+		} else {
+			wgpuTextureRelease(texture->texture);
+		}
+
+		queue->cpu_allocator(texture, 0);
+	}
 
 	auto [range, cpu, _memory_type] = queue->allocations[ptr];
 	queue->cpu_allocator(cpu, 0);
@@ -305,14 +328,202 @@ void gpuFree(GpuQueue* queue, gpu* ptr) {
 	queue->allocations.erase(ptr);
 	queue->cpu2gpu.erase(cpu);
 
-	queue->freelist.push_back(range);
+	queue->buffer_freelist.push_back(range);
 	// Sort the freelist so buffers are together, and then by start
-	std::sort(queue->freelist.begin(), queue->freelist.end(), [](const GpuQueue::MonobufferRange& a, const GpuQueue::MonobufferRange& b) -> bool {
+	std::sort(queue->buffer_freelist.begin(), queue->buffer_freelist.end(), [](const GpuQueue::MonobufferRange& a, const GpuQueue::MonobufferRange& b) -> bool {
 		if(a.buffer == b.buffer)
 			return a.start < b.start;
 
 		return a.buffer < b.buffer;
 	});
+}
+
+
+
+GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue* queue, const GpuTextureDesc& desc) {
+	return {16, 16}; // Waste the minimum amount of space dealing with an allocation
+}
+
+GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* memory) {
+	// Only one texture can be associated with a memory
+	if(queue->gpu2textures.contains(memory)) {
+		errno = WGPUErrorType_Validation;
+		return nullptr;
+	}
+
+	auto hash = GpuQueue::TextureHash::from_descriptor(desc);
+	std::unordered_map<GpuQueue::TextureHash, size_t, GpuQueue::TextureHash::Hasher>* monotextures_lookup = nullptr;
+	std::vector<std::tuple<uint32_t, WGPUTexture, WGPUTextureView>>* monotextures = nullptr;
+	bool is_storage_texture = desc.usage & USAGE_STORAGE;
+	if(is_storage_texture) {
+		monotextures = &queue->storage_monotextures;
+		monotextures_lookup = &queue->storage_monotextures_lookup;
+	} else if(desc.usage & USAGE_SAMPLED) {
+		monotextures = &queue->sampled_monotextures;
+		monotextures_lookup = &queue->sampled_monotextures_lookup;
+	}
+
+	std::optional<GpuQueue::MonotextureRange> range = {};
+
+	if(monotextures != nullptr) {
+		if(!monotextures_lookup->contains(hash)) {
+			if(queue->storage_monotextures.size() >= queue->limits.maxStorageTexturesPerShaderStage) {
+				errno = WGPUErrorType_OutOfMemory;
+				return nullptr;
+			}
+			if(queue->storage_monotextures.size() >= queue->limits.maxSampledTexturesPerShaderStage) {
+				errno = WGPUErrorType_OutOfMemory;
+				return nullptr;
+			}
+			assert(desc.type != TEXTURE_1D && "1D textures aren't supported by WebGPU");
+			assert(desc.type != TEXTURE_3D || desc.layerCount == 1 && "3D textures can't be arrays in WebGPU");
+
+			(*monotextures_lookup)[hash] = monotextures->size();
+			auto& [size, texture, full_view] = monotextures->emplace_back();
+			size = 0;
+			{
+				WGPUTextureDescriptor d {
+					.usage = GPU::usage2wgpu(desc.usage),
+					.dimension = GPU::texture2wgpu(desc.type),
+					.size = {desc.dimensions.x, desc.dimensions.y, desc.type == TEXTURE_3D ? desc.dimensions.z : desc.layerCount * 2},
+					.format = GPU::format2wgpu(desc.format),
+					.mipLevelCount = static_cast<uint32_t>(std::log2(std::max(desc.dimensions.x, desc.dimensions.y)) + 1),
+					.sampleCount = desc.sampleCount,
+				};
+				texture = wgpuDeviceCreateTexture(queue->device, &d);
+			}{
+				WGPUTextureViewDescriptor d {
+					.format = GPU::format2wgpu(desc.format),
+					.dimension = GPU::texture_view2wgpu(desc.type),
+					.baseMipLevel = 0,
+					.mipLevelCount = static_cast<uint32_t>(std::log2(std::max(desc.dimensions.x, desc.dimensions.y)) + 1), // TODO: Does this need a -1
+					.baseArrayLayer = 0,
+					.arrayLayerCount = desc.type == TEXTURE_3D ? 1 : desc.layerCount * 2,
+					.aspect = WGPUTextureAspect_All, // TODO: Do we need to deal with depthonly or stencilonly?
+					.usage = GPU::usage2wgpu(desc.usage),
+				};
+				full_view = wgpuTextureCreateView(texture, &d);
+			}
+		}
+
+		auto texture_index = monotextures_lookup->at(hash);
+		auto& [size, texture, full_view] = monotextures->at(texture_index);
+
+		for(size_t i = 0; i < queue->texture_freelist.size(); ++i) {
+			auto& free = queue->texture_freelist[i];
+			// Strip any empty ranges from the list
+			if(free.start == free.end) {
+				queue->texture_freelist.erase(queue->texture_freelist.begin() + i);
+				--i;
+				continue;
+			}
+
+			// Only consider free ranges belonging to this exact monotexture atlas
+			if(free.storage() != is_storage_texture || free.index() != texture_index) continue;
+
+			// If we find a free space big enough for the allocation... use that
+			if(free.end - free.start >= desc.layerCount) {
+				range = {._index = free._index, .start = free.start, .end = free.start + desc.layerCount};
+				free.start += desc.layerCount;
+				break;
+			}
+
+			// If each element overlaps with the previous one merge them
+			// assumes that the freelist is sorted by storage then index then starting value
+			if(i == 0) continue;
+
+			auto prev = queue->texture_freelist[i - 1];
+			if(free.start > prev.start && free.start < prev.end && prev._index == free._index) {
+				queue->texture_freelist.erase(queue->texture_freelist.begin() + (i - 1));
+				free.start = prev.start;
+			}
+		}
+
+		if(!range) {
+			auto capacity = desc.type == TEXTURE_3D ? 1 : wgpuTextureGetDepthOrArrayLayers(texture);
+			if(size + desc.layerCount > capacity) {
+				{
+					queue->code_pending_submission_finished.emplace_back([texture]() {
+						wgpuTextureRelease(texture);
+					}, queue->next_submission_index);
+
+					WGPUTextureDescriptor d {
+						.usage = GPU::usage2wgpu(desc.usage),
+						.dimension = GPU::texture2wgpu(desc.type),
+						.size = {desc.dimensions.x, desc.dimensions.y, desc.type == TEXTURE_3D ? desc.dimensions.z : size * 2},
+						.format = GPU::format2wgpu(desc.format),
+						.mipLevelCount = static_cast<uint32_t>(std::log2(std::max(desc.dimensions.x, desc.dimensions.y)) + 1),
+					};
+					texture = wgpuDeviceCreateTexture(queue->device, &d);
+				}{
+					queue->code_pending_submission_finished.emplace_back([full_view]() {
+						wgpuTextureViewRelease(full_view);
+					}, queue->next_submission_index);
+
+					WGPUTextureViewDescriptor d {
+						.format = GPU::format2wgpu(desc.format),
+						.dimension = GPU::texture_view2wgpu(desc.type),
+						.baseMipLevel = 0,
+						.mipLevelCount = static_cast<uint32_t>(std::log2(std::max(desc.dimensions.x, desc.dimensions.y)) + 1), // TODO: Does this need a -1
+						.baseArrayLayer = 0,
+						.arrayLayerCount = static_cast<uint32_t>(size * 2),
+						.aspect = WGPUTextureAspect_All, // TODO: Do we need to deal with depthonly or stencilonly?
+						.usage = GPU::usage2wgpu(desc.usage),
+					};
+					full_view = wgpuTextureCreateView(texture, &d);
+				}
+			}
+
+			range = {.start = size};
+			range->set_storage(is_storage_texture);
+			range->set_index(texture_index);
+			size += desc.layerCount;
+			range->end = size; // TODO: Plus 1?
+		}
+	}
+
+	auto out = (GpuTexture*)queue->cpu_allocator(nullptr, sizeof(GpuTexture));
+	new(out) GpuTexture{.descriptor = desc, .range = range};
+	if(range) {
+		out->texture = std::get<WGPUTexture>((*monotextures)[range->_index]);
+		// TODO: Texture view?
+	} else { // If we are creating a purely bound texture rather than a lookup texture we are fine
+		WGPUTextureDescriptor d {
+			.usage = GPU::usage2wgpu(desc.usage),
+			.dimension = GPU::texture2wgpu(desc.type),
+			.size = {desc.dimensions.x, desc.dimensions.y, desc.type == TEXTURE_3D ? desc.dimensions.z : desc.layerCount},
+			.format = GPU::format2wgpu(desc.format),
+			.mipLevelCount = static_cast<uint32_t>(std::log2(std::max(desc.dimensions.x, desc.dimensions.y)) + 1),
+		};
+		out->texture = wgpuDeviceCreateTexture(queue->device, &d);
+		// TODO: Texture view?
+	}
+
+	queue->gpu2textures[memory] = out;
+	return out;
+}
+
+GpuTextureDescriptor gpuTextureViewDescriptor(GpuQueue* queue, const GpuTexture* texture, const GpuViewDesc& desc) {
+	GpuTextureDescriptorImpl out {
+		.type = texture->descriptor.type,
+		.width = texture->descriptor.dimensions.x,
+		.height = texture->descriptor.dimensions.y,
+		.baseMip = desc.baseMip,
+		.mipCount = desc.mipCount == ALL_MIPS ? texture->descriptor.mipCount - desc.baseMip : desc.mipCount,
+		.range = texture->range ? *texture->range : GpuQueue::MonotextureRange::INVALID
+	};
+	if(texture->range) {
+		auto check = texture->range;
+		out.range.start += desc.baseLayer;
+		if(desc.layerCount != ALL_LAYERS)
+			out.range.end = out.range.start + desc.layerCount;
+		assert(out.range.start >= check->start);
+		assert(out.range.end <= check->end);
+	}
+	return (GpuTextureDescriptor&)out;
+}
+GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue* queue, const GpuTexture* texture, const GpuViewDesc& desc) {
+	return gpuTextureViewDescriptor(queue, texture, desc);
 }
 
 GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
@@ -322,15 +533,7 @@ GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
 		.encoder = wgpuDeviceCreateCommandEncoder(queue->device, nullptr)
 	};
 
-	auto current_finished_submission = GPU::semaphore_value(queue, queue->current_submission_timeline_semaphore);
-	if(queue->code_pending_submission_finished.size())
-		for(size_t i = queue->code_pending_submission_finished.size(); i--; ) {
-			auto& [code, submit] = queue->code_pending_submission_finished[i];
-			if(submit <= current_finished_submission) {
-				code();
-				queue->code_pending_submission_finished.erase(queue->code_pending_submission_finished.begin() + i);
-			}
-		}
+	GPU::process_pending_code(queue);
 
 	return out;
 }
@@ -379,45 +582,16 @@ void gpuWaitIdleEXT(GpuQueue* queue);
 
 void gpuSyncMemoryEXT(GpuCommandBuffer* cmd, gpu* mem) {
 	auto [range, cpu, memory_type] = cmd->queue->allocations[mem];
-	auto size = range.size();
 
 	switch (memory_type) {
 	case MEMORY_DEFAULT:
 	case MEMORY_GPU:
-	case MEMORY_TEXTURE: {
-		WGPUBufferDescriptor d{
-			.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_MapWrite,
-			.size = size,
-			.mappedAtCreation = true,
-		};
-		auto tmp = wgpuDeviceCreateBuffer(cmd->queue->device, &d);
-		auto tmp_cpu = wgpuBufferGetMappedRange(tmp, 0, size);
-		memcpy(tmp_cpu, cpu, size);
-		wgpuBufferUnmap(tmp);
+	case MEMORY_TEXTURE:
+		GPU::push_to_monobuffer(cmd, range, cpu);
 
-		wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, tmp, 0, cmd->queue->monobuffers[range.buffer], range.start, size);
-		cmd->code_pending_submission_finished.emplace_back([tmp]() {
-			wgpuBufferRelease(tmp);
-		});
-	}
 	break; case MEMORY_READBACK:
-	case MEMORY_TEXTURE_READBACK: {
-		WGPUBufferDescriptor d{
-			.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead,
-			.size = size,
-		};
-		auto tmp = wgpuDeviceCreateBuffer(cmd->queue->device, &d);
-
-		wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, cmd->queue->monobuffers[range.buffer], range.start, tmp, 0, size);
-		cmd->code_pending_submission_finished.emplace_back([queue = cmd->queue, tmp, cpu, size]() {
-			GPU::wait_for_buffer_map(queue, tmp, WGPUMapMode_Read, 0, size);
-
-			auto tmp_cpu = wgpuBufferGetConstMappedRange(tmp, 0, size);
-			memcpy(cpu, tmp_cpu, size);
-
-			wgpuBufferRelease(tmp);
-		});
-	}
+	case MEMORY_TEXTURE_READBACK: 
+		GPU::pull_from_monobuffer(cmd, range, cpu);
 	}
 }
 
@@ -427,7 +601,5 @@ void gpuSyncMemoryEXT(GpuQueue* queue, gpu* mem) {
 	auto submit_index = gpuSubmit(queue, {&cmd, 1});
 
 	GPU::semaphore_wait(queue, queue->current_submission_timeline_semaphore, submit_index);
-
-	// TODO: Should we add an accessor function that lets us poll the pending syncs without having to use this hack?
-	gpuFreeCommandBuffer(gpuStartCommandRecording(queue));
+	GPU::process_pending_code(queue);
 }
