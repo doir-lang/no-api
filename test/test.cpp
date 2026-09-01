@@ -171,18 +171,7 @@ static void emscripten_frame(void *arg) {
 }
 #endif
 
-
-#ifdef _WIN32
-#include <windows.h>
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nCmdShow) {
-	AllocConsole();
-    freopen("CONOUT$", "w", stdout);
-	freopen("CONOUT$", "w", stderr);
-    freopen("CONIN$", "r", stdin);
-#else
-int main(void) {
-#endif
-
+int real_main() {
 	AppState state = {0};
 	const int initial_width = 800;
 	const int initial_height = 600;
@@ -233,6 +222,18 @@ int main(void) {
 	gpuSyncMemoryEXT(state.queue, download_gpu);
 	auto dbg = download[3];
 	wgpuBufferRelease(tmp);
+
+	GpuTextureDesc desc{
+		.dimensions = {256, 256, 1},
+		.format = FORMAT_RGBA8_SRGB,
+		.usage = TEXTURE_USAGE_FLAGS(USAGE_SAMPLED | USAGE_TRANSFER_DST),
+	};
+	auto texture_cpu = gpuMalloc(state.queue, gpuTextureSizeAlign(state.queue, desc));
+	auto texture_gpu = gpuHostToDevicePointer(state.queue, texture_cpu);
+	auto texture = gpuCreateTexture(state.queue, desc, texture_gpu);
+	auto texture_d = gpuTextureViewDescriptor(state.queue, texture, {});
+
+	gpuFree(state.queue, texture_cpu);
 
 	WGPUSurfaceCapabilities caps = {0};
 	wgpuSurfaceGetCapabilities(state.wgpu.surface, state.wgpu.adapter, &caps);
@@ -320,3 +321,23 @@ int main(void) {
 
 	return 0;
 }
+
+
+
+#ifdef _WIN32
+	#include <windows.h>
+#endif
+
+#ifdef _WIN32
+	int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+		AllocConsole();
+		freopen("CONOUT$", "w", stdout);
+		freopen("CONOUT$", "w", stderr);
+		freopen("CONIN$", "r", stdin);
+		return real_main();
+	}
+#else
+	int main() {
+		return real_main();
+	}
+#endif

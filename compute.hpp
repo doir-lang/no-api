@@ -159,7 +159,7 @@ enum OP {
  * TEXTURE – Texture dimensionality / view type.
  */
 enum TEXTURE {
-	TEXTURE_1D,
+	TEXTURE_1D, // NOTE: Not supported on WebGPU
 	TEXTURE_2D,
 	TEXTURE_3D,
 	TEXTURE_CUBE, // TODO: Can we emulate cubemaps since everything is getting merged into a big array?
@@ -523,6 +523,7 @@ GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue* queue, const GpuTextureDesc& d
  * texture metadata, which is not accessible through the 256-bit descriptor heap.
  *
  * @note It is assumed that only a single image is bound to each memory allocation.
+ * @note Textures are freed by freeing the bound memory.
  *
  * @param queue The GPU queue (device) on which the texture will be created.
  * @param desc Texture description matching the one passed to gpuTextureSizeAlign.

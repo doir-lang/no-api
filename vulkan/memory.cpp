@@ -1,3 +1,4 @@
+#include <cerrno>
 #include <volk.h>
 
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
@@ -152,6 +153,11 @@ GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue* queue, const GpuTextureDesc& d
 }
 
 GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* memory) {
+	if(queue->gpu2image.contains((VkDeviceAddress)memory)) {
+		errno = VK_ERROR_TOO_MANY_OBJECTS;
+		return nullptr;
+	}
+
 	auto out = (GpuTexture*)queue->cpu_allocator(nullptr, sizeof(GpuTexture));
 	*out = {.descriptor = desc};
 

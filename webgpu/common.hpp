@@ -13,6 +13,7 @@
 #endif
 
 namespace GPU {
+
 	static const char* semaphore_wgsl_code = R"WGSL(
 struct SemaphoreData {
 	lo: atomic<u32>,
@@ -233,7 +234,7 @@ fn cs_set_max() {
 	inline bool semaphore_wait(GpuQueue* queue, GpuSemaphore sema, uint64_t target_value, std::chrono::nanoseconds timeout = std::chrono::nanoseconds::max(), std::chrono::nanoseconds poll_interval = std::chrono::milliseconds(1)) {
 		const bool infinite = (timeout == std::chrono::nanoseconds::max());
 		const auto deadline = infinite ? std::chrono::steady_clock::time_point::max() : std::chrono::steady_clock::now() + timeout;
- 
+
 		while (true) {
 			if (semaphore_value(queue, sema) >= target_value)
 				return true;
@@ -303,5 +304,186 @@ fn cs_set_max() {
 		wgpuBufferRelease(sema.upload_buffer);
 		wgpuBufferRelease(sema.readback_buffer);
 		wgpuBufferRelease(sema.buffer);
+	}
+
+
+
+	// Processess all of the pending code snippets associated with already finished submissions
+	inline void process_pending_code(GpuQueue* queue) {
+		auto current_finished_submission = GPU::semaphore_value(queue, queue->current_submission_timeline_semaphore);
+		if(queue->code_pending_submission_finished.size())
+			for(size_t i = queue->code_pending_submission_finished.size(); i--; ) {
+				auto& [code, submit] = queue->code_pending_submission_finished[i];
+				if(submit <= current_finished_submission) {
+					code();
+					queue->code_pending_submission_finished.erase(queue->code_pending_submission_finished.begin() + i);
+				}
+			}
+	}
+
+	inline void push_to_monobuffer(GpuCommandBuffer* cmd, GpuQueue::MonobufferRange range, void* cpu) {
+		auto size = range.size();
+		WGPUBufferDescriptor d{
+			.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_MapWrite,
+			.size = size,
+			.mappedAtCreation = true,
+		};
+		auto tmp = wgpuDeviceCreateBuffer(cmd->queue->device, &d);
+		auto tmp_cpu = wgpuBufferGetMappedRange(tmp, 0, size);
+		memcpy(tmp_cpu, cpu, size);
+		wgpuBufferUnmap(tmp);
+
+		wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, tmp, 0, cmd->queue->monobuffers[range.buffer], range.start, size);
+		cmd->code_pending_submission_finished.emplace_back([tmp]() {
+			wgpuBufferRelease(tmp);
+		});
+	}
+
+	inline size_t push_to_monobuffer(GpuQueue* queue, GpuQueue::MonobufferRange range, void* cpu) {
+		auto cmd = gpuStartCommandRecording(queue);
+		push_to_monobuffer(cmd, range, cpu);
+		return gpuSubmit(queue, {&cmd, 1});
+
+		// If we are just pushing to the buffer I don't think we always care about making sure the process is 100% finished.
+		// So returning the submission index which we can wait on if we do care seems fine...
+		// GPU::semaphore_wait(queue, queue->current_submission_timeline_semaphore, submit_index);
+		// GPU::process_pending_code(queue);
+	}
+
+	inline void pull_from_monobuffer(GpuCommandBuffer* cmd, GpuQueue::MonobufferRange range, void* cpu) {
+		auto size = range.size();
+
+		WGPUBufferDescriptor d{
+			.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead,
+			.size = size,
+		};
+		auto tmp = wgpuDeviceCreateBuffer(cmd->queue->device, &d);
+
+		wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, cmd->queue->monobuffers[range.buffer], range.start, tmp, 0, size);
+		cmd->code_pending_submission_finished.emplace_back([queue = cmd->queue, tmp, cpu, size]() {
+			GPU::wait_for_buffer_map(queue, tmp, WGPUMapMode_Read, 0, size);
+
+			auto tmp_cpu = wgpuBufferGetConstMappedRange(tmp, 0, size);
+			memcpy(cpu, tmp_cpu, size);
+
+			wgpuBufferRelease(tmp);
+		});
+	}
+
+	inline void pull_from_monobuffer(GpuQueue* queue, GpuQueue::MonobufferRange range, void* cpu) {
+		auto cmd = gpuStartCommandRecording(queue);
+		push_to_monobuffer(cmd, range, cpu);
+		auto submit_index = gpuSubmit(queue, {&cmd, 1});
+
+		// When we pull it seems much more likely that we want the cpu memory updated before considering our work "done"
+		GPU::semaphore_wait(queue, queue->current_submission_timeline_semaphore, submit_index);
+		GPU::process_pending_code(queue);
+	}
+
+
+
+	inline WGPUTextureDimension texture2wgpu(TEXTURE type){
+		switch (type){
+		case TEXTURE_1D:
+			return WGPUTextureDimension_1D;
+
+		case TEXTURE_2D:
+		case TEXTURE_2D_ARRAY:
+		case TEXTURE_CUBE:
+		case TEXTURE_CUBE_ARRAY:
+			return WGPUTextureDimension_2D;
+
+		case TEXTURE_3D:
+			return WGPUTextureDimension_3D;
+
+		default:
+			return WGPUTextureDimension_2D;
+		}
+	}
+
+	inline WGPUTextureViewDimension texture_view2wgpu(TEXTURE type){
+		switch (type){
+		case TEXTURE_2D:
+		case TEXTURE_2D_ARRAY:
+			return WGPUTextureViewDimension_2DArray;
+		case TEXTURE_CUBE_ARRAY:
+			return WGPUTextureViewDimension_CubeArray;
+		case TEXTURE_3D:
+			return WGPUTextureViewDimension_3D;
+		default:
+			return WGPUTextureViewDimension_2D;
+		}
+	}
+
+	inline WGPUTextureFormat format2wgpu(FORMAT format){
+		switch (format) {
+		case FORMAT_RGBA8_UNORM:
+			return WGPUTextureFormat_RGBA8Unorm;
+		case FORMAT_RGBA8_SRGB:
+			return WGPUTextureFormat_RGBA8UnormSrgb;
+		case FORMAT_RGBA16_FLOAT:
+			return WGPUTextureFormat_RGBA16Float;
+		case FORMAT_RGBA32_FLOAT:
+			return WGPUTextureFormat_RGBA32Float;
+		case FORMAT_RG11B10_FLOAT:
+			return WGPUTextureFormat_RG11B10Ufloat;
+		case FORMAT_RGB10_A2_UNORM:
+			return WGPUTextureFormat_RGB10A2Unorm;
+		case FORMAT_R8_UNORM:
+			return WGPUTextureFormat_R8Unorm;
+		case FORMAT_R16_FLOAT:
+			return WGPUTextureFormat_R16Float;
+		case FORMAT_R32_FLOAT:
+			return WGPUTextureFormat_R32Float;
+		case FORMAT_D16_UNORM:
+			return WGPUTextureFormat_Depth16Unorm;
+		case FORMAT_D24_UNORM_S8_UINT:
+			return WGPUTextureFormat_Depth24PlusStencil8;
+		case FORMAT_D32_FLOAT:
+			return WGPUTextureFormat_Depth32Float;
+		case FORMAT_D32_FLOAT_S8_UINT:
+			return WGPUTextureFormat_Depth32FloatStencil8;
+		default:
+			return WGPUTextureFormat_Undefined;
+		}
+	}
+
+	inline WGPUTextureUsage usage2wgpu(TEXTURE_USAGE_FLAGS flags) {
+		WGPUTextureUsage usage = WGPUTextureUsage_None;
+
+		if (flags & USAGE_TRANSFER_SRC)
+			usage |= WGPUTextureUsage_CopySrc;
+
+		if (flags & USAGE_TRANSFER_DST)
+			usage |= WGPUTextureUsage_CopyDst;
+
+		if (flags & USAGE_SAMPLED)
+			usage |= WGPUTextureUsage_TextureBinding;
+
+		if (flags & USAGE_STORAGE)
+			usage |= WGPUTextureUsage_StorageBinding;
+
+		if (flags & USAGE_COLOR_ATTACHMENT || flags & USAGE_DEPTH_STENCIL_ATTACHMENT)
+			usage |= WGPUTextureUsage_RenderAttachment;
+
+		return usage;
+	}
+
+	inline WGPUTextureDescriptor texture2wgpu(const GpuTextureDesc& src, std::string_view label = "") {
+		return WGPUTextureDescriptor{
+			.label = { .data = label.data(), .length = label.size() },
+			.usage = usage2wgpu(src.usage),
+			.dimension = texture2wgpu(src.type),
+			.size = {
+				.width  = src.dimensions.x,
+				.height = src.dimensions.y,
+				.depthOrArrayLayers = (src.type == TEXTURE_2D_ARRAY || src.type == TEXTURE_CUBE_ARRAY) ? src.layerCount : src.dimensions.z,
+			},
+			.format = format2wgpu(src.format),
+			.mipLevelCount = src.mipCount,
+			.sampleCount   = src.sampleCount,
+			.viewFormatCount = 0,
+			.viewFormats     = nullptr,
+		};
 	}
 }
