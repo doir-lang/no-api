@@ -3,10 +3,12 @@
 
 #include <bit>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <optional>
+#include <variant>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
@@ -123,6 +125,195 @@ std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::funct
 	return out;
 }
 
+void update_pipeline_layouts(GpuQueue* queue, bool compute) {
+	auto visibility = compute ? WGPUShaderStage_Compute : WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+
+	auto create_layout = [&](std::vector<WGPUBindGroupLayoutEntry>& entries) {
+		WGPUBindGroupLayoutDescriptor d{
+			.entryCount = static_cast<uint32_t>(entries.size()),
+			.entries = entries.data(),
+		};
+
+		return wgpuDeviceCreateBindGroupLayout(queue->device, &d);
+	};
+
+	auto& bg0 = compute ? queue->current_compute_bind_group_layout0 : queue->current_graphics_bind_group_layout0;
+
+	//
+	// Group 0: buffers
+	//
+	uint32_t binding = 0;
+
+	if(!bg0) { // The layout of buffers isn't dynamic so if it already exists we don't need to generate it again!
+		std::vector<WGPUBindGroupLayoutEntry> group0;
+
+		for(uint32_t i = 0; i < 6; ++i)
+			group0.push_back({
+				.binding = binding++,
+				.visibility = visibility,
+				.buffer = {
+					.type = compute ? WGPUBufferBindingType_Storage : WGPUBufferBindingType_ReadOnlyStorage,
+					.hasDynamicOffset = false,
+					.minBindingSize = 0,
+				}
+			});
+
+		group0.push_back({
+			.binding = binding++,
+			.visibility = visibility,
+			.buffer = {
+				.type = WGPUBufferBindingType_ReadOnlyStorage,
+				.hasDynamicOffset = false,
+				.minBindingSize = 0,
+			}
+		});
+
+		group0.push_back({
+			.binding = binding++,
+			.visibility = visibility,
+			.buffer = {
+				.type = WGPUBufferBindingType_Uniform,
+				.hasDynamicOffset = false,
+				.minBindingSize = 0,
+			}
+		});
+
+		bg0 = create_layout(group0);
+	}
+
+	//
+	// Group 1: storage textures
+	//
+	std::vector<WGPUBindGroupLayoutEntry> group1;
+
+	binding = 0;
+
+	for(auto const& [_cap, texture, view, desc] : queue->storage_monotextures)
+		group1.push_back({
+			.binding = binding++,
+			.visibility = visibility,
+			.storageTexture = {
+				.access = WGPUStorageTextureAccess_ReadWrite,
+				.format = GPU::format2wgpu(desc.format),
+				.viewDimension = GPU::texture_view2wgpu(desc.type),
+			}
+		});
+
+	//
+	// Group 2: sampled textures
+	//
+	std::vector<WGPUBindGroupLayoutEntry> group2;
+
+	binding = 0;
+
+	for(auto const& [_cap, texture, view, desc] : queue->sampled_monotextures)
+		group2.push_back({
+			.binding = binding++,
+			.visibility = visibility,
+			.texture = {
+				.sampleType = WGPUTextureSampleType_Float,
+				.viewDimension = GPU::texture_view2wgpu(desc.type),
+				.multisampled = desc.sampleCount > 1,
+			}
+		});
+
+	auto& bg1 = compute ? queue->current_compute_bind_group_layout1 : queue->current_graphics_bind_group_layout1;
+	if(bg1) queue->code_pending_submission_finished.emplace_back([l = bg1](){ wgpuBindGroupLayoutRelease(l); }, queue->next_submission_index);
+	bg1 = create_layout(group1);
+
+	auto& bg2 = compute ? queue->current_compute_bind_group_layout2 : queue->current_graphics_bind_group_layout2;
+	if(bg2) queue->code_pending_submission_finished.emplace_back([l = bg2](){ wgpuBindGroupLayoutRelease(l); }, queue->next_submission_index);
+	bg2 = create_layout(group2);
+
+	WGPUBindGroupLayout layouts[] = {
+		bg0,
+		bg1,
+		bg2
+	};
+	auto& pipeline_layout = compute ? queue->current_compute_pipeline_layout : queue->current_graphics_pipeline_layout;
+	if(pipeline_layout) wgpuPipelineLayoutRelease(pipeline_layout);
+
+	WGPUPipelineLayoutDescriptor pd{
+		.bindGroupLayoutCount = 3,
+		.bindGroupLayouts = layouts,
+	};
+	pipeline_layout = wgpuDeviceCreatePipelineLayout(queue->device, &pd);
+}
+void update_pipeline_layouts(GpuQueue* queue) {
+	update_pipeline_layouts(queue, true);
+	update_pipeline_layouts(queue, false);
+}
+
+
+
+std::string generate_binding_prologue(GpuQueue* queue, bool compute) {
+	constexpr static auto texture_dimension_suffix = [](TEXTURE type) {
+		switch (type) {
+		case TEXTURE_1D: return "1d";
+		// case TEXTURE_2D: return "2d";
+		case TEXTURE_3D: return "3d";
+		case TEXTURE_CUBE: return "cube";
+		case TEXTURE_2D_ARRAY: return "2d_array";
+		case TEXTURE_CUBE_ARRAY: return "cube_array";
+		default: return "2d";
+		}
+	};
+	constexpr static auto wgsl_format = [](FORMAT f) {
+		switch (f) {
+		case FORMAT_RGBA8_UNORM:
+			return "rgba8unorm";
+		case FORMAT_RGBA8_SRGB:
+			return "rgba8snorm";
+		case FORMAT_RGBA16_FLOAT:
+			return "rgba16float";
+		case FORMAT_RGBA32_FLOAT:
+			return "rgba32float";
+		// case FORMAT_RG11B10_FLOAT:
+		// case FORMAT_RGB10_A2_UNORM:
+		// case FORMAT_R8_UNORM:
+		// case FORMAT_R16_FLOAT:
+		// case FORMAT_R32_FLOAT:
+		// case FORMAT_D16_UNORM:
+		// case FORMAT_D24_UNORM_S8_UINT:
+		// case FORMAT_D32_FLOAT:
+		// case FORMAT_D32_FLOAT_S8_UINT:
+		default:
+			assert(false && "Unsupported storage texture format");
+			return "rgba8unorm";
+		}
+	};
+
+	std::string out = "@group(0) @binding(0) var<storage, read_write> mono0 : array<u32>;\n"
+	"@group(0) @binding(1) var<storage, read_write> mono1 : array<u32>;\n"
+	"@group(0) @binding(2) var<storage, read_write> mono2 : array<u32>;\n"
+	"@group(0) @binding(3) var<storage, read_write> mono3 : array<u32>;\n"
+	"@group(0) @binding(4) var<storage, read_write> mono4 : array<u32>;\n"
+	"@group(0) @binding(5) var<storage, read_write> mono5 : array<u32>;\n"
+	"\n"
+	"@group(0) @binding(6) var<storage> texture_heap : array<u32>;\n"
+	"struct GPUComputeData {\n"
+	"	upload_buffer: vec2<u32>,\n"
+	"	download_buffer: vec2<u32>\n"
+	"}\n"
+	"@group(0) @binding(7) var<uniform> shader_data : GPUComputeData;\n";
+
+	uint32_t binding = 0;
+
+	for (auto const& [_cap, texture, view, desc] : queue->storage_monotextures) {
+		out += std::format("@group(1) @binding({}) var storage_tex_{} : texture_storage_{}<{}, read_write>;\n", binding, binding, texture_dimension_suffix(desc.type), wgsl_format(desc.format));
+		++binding;
+	}
+
+	binding = 0;
+
+	for (auto const& [_cap, texture, view, desc] : queue->sampled_monotextures) {
+		out += std::format("@group(2) @binding({}) var sampled_tex_{} : texture_{}<f32>;\n", binding, binding, texture_dimension_suffix(desc.type));
+		++binding;
+	}
+
+	return out;
+}
+
 GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limits, CpuAllocatorFunc allocator /* = default_::gpu_allocator */) {
 	auto out = (GpuQueue*)allocator(nullptr, sizeof(GpuQueue));
 	new(out) GpuQueue{
@@ -143,6 +334,8 @@ GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limi
 	};
 	out->empty_monobuffer = wgpuDeviceCreateBuffer(out->device, &d);
 	std::fill(out->monobuffers.begin(), out->monobuffers.end(), out->empty_monobuffer);
+
+	update_pipeline_layouts(out);
 	return out;
 }
 
@@ -353,7 +546,7 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 
 	auto hash = GpuQueue::TextureHash::from_descriptor(desc);
 	std::unordered_map<GpuQueue::TextureHash, size_t, GpuQueue::TextureHash::Hasher>* monotextures_lookup = nullptr;
-	std::vector<std::tuple<uint32_t, WGPUTexture, WGPUTextureView>>* monotextures = nullptr;
+	std::vector<std::tuple<uint32_t, WGPUTexture, WGPUTextureView, GpuQueue::TextureHash>>* monotextures = nullptr;
 	bool is_storage_texture = desc.usage & USAGE_STORAGE;
 	if(is_storage_texture) {
 		monotextures = &queue->storage_monotextures;
@@ -379,7 +572,8 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 			assert(desc.type != TEXTURE_3D || desc.layerCount == 1 && "3D textures can't be arrays in WebGPU");
 
 			(*monotextures_lookup)[hash] = monotextures->size();
-			auto& [size, texture, full_view] = monotextures->emplace_back();
+			auto& [size, texture, full_view, description] = monotextures->emplace_back();
+			description = hash;
 			size = 0;
 			{
 				WGPUTextureDescriptor d {
@@ -404,10 +598,13 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 				};
 				full_view = wgpuTextureCreateView(texture, &d);
 			}
+
+			// We have a new monotexture the pipeline layouts should be aware of
+			update_pipeline_layouts(queue);
 		}
 
 		auto texture_index = monotextures_lookup->at(hash);
-		auto& [size, texture, full_view] = monotextures->at(texture_index);
+		auto& [size, texture, full_view, _description] = monotextures->at(texture_index);
 
 		for(size_t i = 0; i < queue->texture_freelist.size(); ++i) {
 			auto& free = queue->texture_freelist[i];
@@ -526,6 +723,65 @@ GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue* queue, const GpuTextur
 	return gpuTextureViewDescriptor(queue, texture, desc);
 }
 
+void update_compute_pipeline(GpuQueue* queue, GpuPipeline* pipeline) {
+	auto& cache = std::get<GpuPipeline::ComputeCache>(pipeline->cache);
+	// if(cache.module) wgpuShaderModuleRelease(cache.module);
+	if(cache.pipeline) wgpuComputePipelineRelease(cache.pipeline);
+
+	constexpr std::string_view marker = "@generated_noapi_bindings";
+	std::string wgsl_source = cache.IR;
+	auto generated_bindings = generate_binding_prologue(queue, true);
+	std::size_t pos = 0;
+	while ((pos = wgsl_source.find(marker, pos)) != std::string::npos) {
+		wgsl_source.replace(pos, marker.size(), generated_bindings);
+		pos += generated_bindings.size();
+	}
+
+	WGPUShaderSourceWGSL source {
+		.chain {.sType = WGPUSType_ShaderSourceWGSL },
+		.code = {wgsl_source.data(), wgsl_source.size()}
+	};
+	WGPUShaderModuleDescriptor module {
+		.nextInChain = &source.chain
+	};
+	WGPUComputePipelineDescriptor d {
+		.layout = pipeline->reference_layout = queue->current_compute_pipeline_layout,
+		.compute = {
+			.module = wgpuDeviceCreateShaderModule(queue->device, &module),
+			.entryPoint = {"main", WGPU_STRLEN},
+		}
+	};
+	cache.pipeline = wgpuDeviceCreateComputePipeline(queue->device, &d);
+
+	wgpuShaderModuleRelease(d.compute.module);
+}
+
+GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, std::span<const std::byte> computeIR) {
+	auto out = (GpuPipeline*)queue->cpu_allocator(nullptr, sizeof(GpuPipeline));
+	new(out) GpuPipeline{
+		.reference_layout = nullptr,
+		.cache = GpuPipeline::ComputeCache {
+			.IR = {(char*)computeIR.data(), (char*)(computeIR.data() + computeIR.size())},
+		}
+	};
+
+	update_compute_pipeline(queue, out);
+	return out;
+}
+
+void gpuFreePipeline(GpuQueue* queue, GpuPipeline* pipeline) {
+	if(std::holds_alternative<GpuPipeline::ComputeCache>(pipeline->cache)) {
+		auto& cache = std::get<GpuPipeline::ComputeCache>(pipeline->cache);
+		// wgpuShaderModuleRelease(cache.module);
+		wgpuComputePipelineRelease(cache.pipeline);
+	} else {
+		// TODO: implement graphics side
+	}
+
+	pipeline->~GpuPipeline();
+	queue->cpu_allocator(pipeline, 0);
+}
+
 GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
 	auto out = (GpuCommandBuffer*)queue->cpu_allocator(nullptr, sizeof(GpuCommandBuffer));
 	new(out) GpuCommandBuffer{
@@ -590,7 +846,7 @@ void gpuSyncMemoryEXT(GpuCommandBuffer* cmd, gpu* mem) {
 		GPU::push_to_monobuffer(cmd, range, cpu);
 
 	break; case MEMORY_READBACK:
-	case MEMORY_TEXTURE_READBACK: 
+	case MEMORY_TEXTURE_READBACK:
 		GPU::pull_from_monobuffer(cmd, range, cpu);
 	}
 }

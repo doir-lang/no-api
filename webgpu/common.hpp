@@ -151,9 +151,10 @@ fn cs_set_max() {
 		wgpuBufferMapAsync(buffer, mode, offset, size, callback);
 
 		while (!wait.done) {
-			wgpuDeviceTick(queue->device);
 		#ifdef __EMSCRIPTEN__
 			emscripten_sleep(1); // yields back to the browser event loop
+		#else
+			wgpuDeviceTick(queue->device);
 		#endif
 		}
 	}
