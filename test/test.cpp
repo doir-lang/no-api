@@ -207,6 +207,99 @@ int real_main() {
 	auto download_gpu = gpuHostToDevicePointer(state.queue, download);
 	auto download_range = std::get<GpuQueue::MonobufferRange>(state.queue->allocations[download_gpu]);
 
+	auto pipe = gpuCreateComputePipeline(state.queue, string_to_bytes(R"wgsl(
+		@generated_noapi_bindings
+
+		const GPU_ADDRESS_MAX_HI : u32 = 0x1FFFFFFFu; // lower 29 bits
+
+		struct DecodedAddress {
+			monobuffer: u32,
+			address: vec2<u32>,
+		};
+
+		fn gpuEncodeAddress(monobuffer: u32, address: vec2<u32>) -> vec2<u32> {
+			let tag = monobuffer + 1u;
+
+			return vec2<u32>(
+				address.x,
+				(address.y & GPU_ADDRESS_MAX_HI) | (tag << 29u)
+			);
+		}
+
+		// Decodes the monobuffer and recovers the original 61-bit address.
+		fn gpuDecodeAddress(encoded: vec2<u32>) -> DecodedAddress {
+			let tag = encoded.y >> 29u;
+
+			return DecodedAddress(
+				tag - 1u,
+				vec2<u32>(
+					encoded.x,
+					encoded.y & GPU_ADDRESS_MAX_HI
+				)
+			);
+		}
+
+		fn loadMonobuffer(address: vec2<u32>) -> u32 {
+			let buf = gpuDecodeAddress(address);
+			switch buf.monobuffer {
+				case 1: {
+					return mono1[buf.address.x / 4];
+				}
+				case 2: {
+					return mono2[buf.address.x / 4];
+				}
+				case 3: {
+					return mono3[buf.address.x / 4];
+				}
+				case 4: {
+					return mono4[buf.address.x / 4];
+				}
+				case 5: {
+					return mono5[buf.address.x / 4];
+				}
+				default: {
+					return mono0[buf.address.x / 4];
+				}
+			}
+		}
+
+		fn storeMonobuffer(address: vec2<u32>, value: u32) {
+			let buf = gpuDecodeAddress(address);
+			switch buf.monobuffer {
+				case 1: {
+					mono1[buf.address.x / 4] = value;
+				}
+				case 2: {
+					mono2[buf.address.x / 4] = value;
+				}
+				case 3: {
+					mono3[buf.address.x / 4] = value;
+				}
+				case 4: {
+					mono4[buf.address.x / 4] = value;
+				}
+				case 5: {
+					mono5[buf.address.x / 4] = value;
+				}
+				default: {
+					mono0[buf.address.x / 4] = value;
+				}
+			}
+		}
+
+		// End Prologue
+
+		@compute @workgroup_size(16)
+		fn main(@builtin(global_invocation_id) global_id : vec3u) {
+			var u = shader_data.upload_buffer;
+			u.x += global_id.x * 4;
+			var d = shader_data.download_buffer;
+			d.x += global_id.x * 4;
+			let tmp = loadMonobuffer(u);
+			storeMonobuffer(d, tmp * 5);
+		}
+	)wgsl"));
+
 	auto cmd = gpuStartCommandRecording(state.queue);
 	gpuSyncMemoryEXT(cmd, upload_gpu);
 	WGPUBufferDescriptor d {
@@ -223,17 +316,7 @@ int real_main() {
 	auto dbg = download[3];
 	wgpuBufferRelease(tmp);
 
-	GpuTextureDesc desc{
-		.dimensions = {256, 256, 1},
-		.format = FORMAT_RGBA8_SRGB,
-		.usage = TEXTURE_USAGE_FLAGS(USAGE_SAMPLED | USAGE_TRANSFER_DST),
-	};
-	auto texture_cpu = gpuMalloc(state.queue, gpuTextureSizeAlign(state.queue, desc));
-	auto texture_gpu = gpuHostToDevicePointer(state.queue, texture_cpu);
-	auto texture = gpuCreateTexture(state.queue, desc, texture_gpu);
-	auto texture_d = gpuTextureViewDescriptor(state.queue, texture, {});
-
-	gpuFree(state.queue, texture_cpu);
+	gpuFreePipeline(state.queue, pipe);
 
 	WGPUSurfaceCapabilities caps = {0};
 	wgpuSurfaceGetCapabilities(state.wgpu.surface, state.wgpu.adapter, &caps);

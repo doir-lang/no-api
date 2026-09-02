@@ -13,7 +13,9 @@
 #include <unordered_map>
 // #include <map>
 #include <array>
+#include <variant>
 #include <vector>
+#include <bit>
 
 #include <webgpu/webgpu.h>
 
@@ -127,9 +129,9 @@ struct GpuQueue {
 		// 	}
 		// };
 	};
-	std::vector<std::tuple<uint32_t, WGPUTexture, WGPUTextureView>> storage_monotextures;
+	std::vector<std::tuple<uint32_t, WGPUTexture, WGPUTextureView, TextureHash>> storage_monotextures;
 	std::unordered_map<TextureHash, size_t, TextureHash::Hasher> storage_monotextures_lookup;
-	std::vector<std::tuple<uint32_t, WGPUTexture, WGPUTextureView>> sampled_monotextures;
+	std::vector<std::tuple<uint32_t, WGPUTexture, WGPUTextureView, TextureHash>> sampled_monotextures;
 	std::unordered_map<TextureHash, size_t, TextureHash::Hasher> sampled_monotextures_lookup;
 
 	struct MonotextureRange {
@@ -160,6 +162,17 @@ struct GpuQueue {
 		}
 	};
 	std::vector<MonotextureRange> texture_freelist;
+
+
+	WGPUBindGroupLayout current_compute_bind_group_layout0 = nullptr; // 0 == buffers
+	WGPUBindGroupLayout current_compute_bind_group_layout1 = nullptr; // 1 == storage textures
+	WGPUBindGroupLayout current_compute_bind_group_layout2 = nullptr; // 2 == sampled textures
+	WGPUPipelineLayout current_compute_pipeline_layout = nullptr;
+
+	WGPUBindGroupLayout current_graphics_bind_group_layout0 = nullptr; // 0 == buffers
+	WGPUBindGroupLayout current_graphics_bind_group_layout1 = nullptr; // 1 == storage textures
+	WGPUBindGroupLayout current_graphics_bind_group_layout2 = nullptr; // 2 == sampled textures
+	WGPUPipelineLayout current_graphics_pipeline_layout = nullptr;
 };
 
 GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limits, CpuAllocatorFunc allocator = default_::cpu_allocator);
@@ -189,3 +202,17 @@ struct GpuTextureDescriptorImpl {
 	GpuQueue::MonotextureRange range;
 };
 static_assert(sizeof(GpuTextureDescriptorImpl) == sizeof(GpuTextureDescriptor), "GPU Texture Descriptors of The Wrong Size");
+
+struct GpuPipeline {
+	struct ComputeCache {
+		std::string IR;
+		WGPUComputePipeline pipeline;
+	};
+
+	struct RenderCache {
+		WGPURenderPipeline pipeline;
+	};
+
+	WGPUPipelineLayout reference_layout; // The layout that the currently cached variant of this pipeline is built against
+	std::variant<ComputeCache, RenderCache> cache;
+};
