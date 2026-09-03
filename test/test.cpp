@@ -310,9 +310,10 @@ int real_main() {
 	auto tmp = wgpuDeviceCreateBuffer(state.queue->device, &d);
 	wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, state.queue->monobuffers[upload_range.buffer], upload_range.start, tmp, 0, upload_range.size());
 	wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, tmp, 0, state.queue->monobuffers[download_range.buffer], download_range.start, upload_range.size());
+	gpuSyncMemoryEXT(cmd, download_gpu);
 	auto index = gpuSubmit(state.queue, {&cmd, 1});
+	gpuWaitSemaphore(state.queue, gpuGetSubmissionSemaphoreEXT(state.queue), index);
 
-	gpuSyncMemoryEXT(state.queue, download_gpu);
 	auto dbg = download[3];
 	wgpuBufferRelease(tmp);
 
@@ -390,6 +391,8 @@ int real_main() {
 		glfwPollEvents();
 		render_frame(&state);
 	}
+
+	gpuWaitIdleEXT(state.queue);
 
 	wgpuRenderPipelineRelease(state.pipeline);
 	gpuFreeQueue(state.queue);

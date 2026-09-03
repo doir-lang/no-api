@@ -679,7 +679,7 @@ GpuSemaphore* gpuCreateSemaphore(GpuQueue* queue, uint64_t initial_value);
  * @param queue The GPU queue (device) the semaphore was created on.
  * @param semaphore Timeline semaphore to wait on.
  * @param value Counter value to wait for, or GPU_GET_VALUE to return the current value immediately.
- * @param timeout Maximum time to wait, in implementation-defined units (default: wait forever).
+ * @param timeout Maximum time to wait, in nanoseconds (default: wait forever).
  */
 uint64_t gpuWaitSemaphore(GpuQueue* queue, const GpuSemaphore* semaphore, uint64_t value, uint64_t timeout = UINT64_MAX);
 
