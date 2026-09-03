@@ -812,8 +812,8 @@ uint64_t gpuSubmitNoFree(GpuQueue* queue, std::span<GpuCommandBuffer*> command_b
 		.encoder = wgpuDeviceCreateCommandEncoder(queue->device, nullptr),
 	};
 	GPU::semaphore_gpu_increment(&cmd, queue->current_submission_timeline_semaphore);
-
-	// TODO: GpuSemaphore* semaphore /* = nullptr */ stuff
+	if(semaphore)
+		GPU::semaphore_gpu_set_max(&cmd, *semaphore, signal_value);
 
 	buffers.emplace_back(wgpuCommandEncoderFinish(cmd.encoder, nullptr));
 	wgpuCommandEncoderRelease(cmd.encoder);
@@ -834,7 +834,29 @@ uint64_t gpuSubmit(GpuQueue* queue, std::span<GpuCommandBuffer*> command_buffers
 	return submission;
 }
 
-void gpuWaitIdleEXT(GpuQueue* queue);
+void gpuWaitIdleEXT(GpuQueue* queue) {
+	struct Wait { volatile bool done = false; } wait;
+
+    wgpuQueueOnSubmittedWorkDone(
+        queue->queue,
+		WGPUQueueWorkDoneCallbackInfo {
+			.mode = WGPUCallbackMode_AllowSpontaneous,
+			.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView message, WGPU_NULLABLE void* userdata1, WGPU_NULLABLE void* userdata2) {
+				static_cast<Wait*>(userdata1)->done = true;
+			},
+        	.userdata1 = &wait
+		}
+	);
+        
+    while (!wait.done) {
+#ifdef __EMSCRIPTEN__
+		emscripten_sleep(1); // yields back to the browser event loop
+#else
+		wgpuDeviceTick(queue->device);
+#endif
+    }
+	GPU::process_pending_code(queue);
+}
 
 void gpuSyncMemoryEXT(GpuCommandBuffer* cmd, gpu* mem) {
 	auto [range, cpu, memory_type] = cmd->queue->allocations[mem];
@@ -858,4 +880,29 @@ void gpuSyncMemoryEXT(GpuQueue* queue, gpu* mem) {
 
 	GPU::semaphore_wait(queue, queue->current_submission_timeline_semaphore, submit_index);
 	GPU::process_pending_code(queue);
+}
+
+const GpuSemaphore* gpuGetSubmissionSemaphoreEXT(GpuQueue* queue) {
+	return (GpuSemaphore*)&queue->current_submission_timeline_semaphore;
+}
+
+GpuSemaphore* gpuCreateSemaphore(GpuQueue* queue, uint64_t initial_value) {
+	auto out = (GpuSemaphore*)queue->cpu_allocator(nullptr, sizeof(GpuSemaphore));
+
+	*out = GPU::semaphore_initialize(queue, initial_value);
+	return out;
+}
+
+uint64_t gpuWaitSemaphore(GpuQueue* queue, const GpuSemaphore* semaphore, uint64_t value, uint64_t timeout /* = UINT64_MAX */) {
+	if(value == GPU_GET_VALUE) 
+		return GPU::semaphore_value(queue, *semaphore);
+	
+	GPU::semaphore_wait(queue, *semaphore, value, std::chrono::nanoseconds(timeout));
+	GPU::process_pending_code(queue);
+	return value;
+}
+
+void gpuFreeSemaphore(GpuQueue* queue, GpuSemaphore* semaphore) {
+	GPU::semaphore_destroy(*semaphore);
+	queue->cpu_allocator(semaphore, 0);
 }
