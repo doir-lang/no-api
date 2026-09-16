@@ -7,7 +7,9 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <optional>
+#include <stdexcept>
 #include <variant>
 
 #ifdef __EMSCRIPTEN__
@@ -841,9 +843,15 @@ void gpuWaitIdleEXT(GpuQueue* queue) {
         queue->queue,
 		WGPUQueueWorkDoneCallbackInfo {
 			.mode = WGPUCallbackMode_AllowSpontaneous,
+#ifdef __EMSCRIPTEN__
+			.callback = [](WGPUQueueWorkDoneStatus status, WGPU_NULLABLE void* userdata1, WGPU_NULLABLE void* userdata2) {
+				static_cast<Wait*>(userdata1)->done = true;
+			},
+#else
 			.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView message, WGPU_NULLABLE void* userdata1, WGPU_NULLABLE void* userdata2) {
 				static_cast<Wait*>(userdata1)->done = true;
 			},
+#endif
         	.userdata1 = &wait
 		}
 	);
@@ -905,4 +913,117 @@ uint64_t gpuWaitSemaphore(GpuQueue* queue, const GpuSemaphore* semaphore, uint64
 void gpuFreeSemaphore(GpuQueue* queue, GpuSemaphore* semaphore) {
 	GPU::semaphore_destroy(*semaphore);
 	queue->cpu_allocator(semaphore, 0);
+}
+
+
+
+
+namespace GPU::detail {
+	inline std::tuple<GpuQueue::MonobufferRange, ptrdiff_t, gpu*> closest_buffer(GpuQueue* queue, gpu* addr, bool no_offsets) {
+		gpu* closest = gpuEncodeWebGPUAddressEXT(queue->monobuffers.size() - 1, gpu_address_max - 1);
+		if(no_offsets)
+			closest = addr;
+		else for(auto [key, _]: queue->allocations) {
+			if(closest - addr > size_t(key - addr))
+				closest = key;
+		}
+		return {std::get<GpuQueue::MonobufferRange>(queue->allocations[closest]), closest - addr, closest};
+	}
+
+	inline std::array<std::tuple<GpuQueue::MonobufferRange, ptrdiff_t, gpu*>, 2> closest_buffer(GpuQueue* queue, gpu* addrA, gpu* addrB, bool no_offsets) {
+		auto last_monobuffer = queue->monobuffers.size() - 1;
+		gpu* closestA = gpuEncodeWebGPUAddressEXT(last_monobuffer, gpu_address_max - 1), *closestB = gpuEncodeWebGPUAddressEXT(last_monobuffer, gpu_address_max - 1); // TODO: There are probably edge cases around setting these to zero!
+		if(no_offsets) {
+			closestA = addrA;
+			closestB = addrB;
+		} else for(auto [key, _]: queue->allocations) {
+			if(closestA - addrA > size_t(key - addrA))
+				closestA = key;
+			if(closestB - addrB > size_t(key - addrB))
+				closestB = key;
+		}
+		return {
+			std::tuple<GpuQueue::MonobufferRange, ptrdiff_t, gpu*>{std::get<GpuQueue::MonobufferRange>(queue->allocations[closestA]), closestA - addrA, closestA},
+			std::tuple<GpuQueue::MonobufferRange, ptrdiff_t, gpu*>{std::get<GpuQueue::MonobufferRange>(queue->allocations[closestB]), closestB - addrB, closestB}
+		};
+	}
+}
+
+void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes, bool no_offsets /* = false */) {
+	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_, no_offsets);
+	auto [dest_range, dest_offset, dest_addr] = dest; auto [src_range, src_offset, src_addr] = src;
+
+	if(src_range.buffer == dest_range.buffer) {
+		// We can't copy from a buffer to itself for some reason... so we need to create a temporary transfer buffer.
+		WGPUBufferDescriptor d {
+			.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
+			.size = bytes
+		};
+		auto tmp = wgpuDeviceCreateBuffer(cmd->queue->device, &d);
+
+		wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, cmd->queue->monobuffers[src_range.buffer], src_range.start + src_offset, tmp, 0, bytes);
+		wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, tmp, 0, cmd->queue->monobuffers[dest_range.buffer], dest_range.start + dest_offset, bytes);
+
+		cmd->queue->code_pending_submission_finished.emplace_back([tmp](){ wgpuBufferRelease(tmp); }, cmd->queue->next_submission_index);
+	} else wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, cmd->queue->monobuffers[src_range.buffer], src_range.start + src_offset, cmd->queue->monobuffers[dest_range.buffer], dest_range.start + dest_offset, bytes);
+}
+
+// TODO: Untested!
+void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* texture, bool no_offsets /* = false */) {
+	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_, no_offsets);
+	auto [dest_range, dest_offset, dest_addr] = dest; auto [src_range, src_offset, src_addr] = src;
+
+	assert(cmd->queue->gpu2textures[dest_addr] == texture);
+	
+	WGPUTexelCopyBufferInfo source {
+		.layout = {
+			.offset = static_cast<uint64_t>(src_range.start + src_offset),
+			.bytesPerRow = texture->descriptor.dimensions.x * texture->descriptor.format,
+			.rowsPerImage = texture->descriptor.dimensions.y,
+		},
+		.buffer = cmd->queue->monobuffers[src_range.buffer],
+	};
+	WGPUTexelCopyTextureInfo destination = {
+		.texture = texture->texture,
+		.mipLevel = 0, // TODO: How do we allow more control over this?
+		.origin = {0, 0, 0},
+		.aspect = WGPUTextureAspect_All
+	};
+	if(texture->range) destination.origin = {0, 0, texture->range->start};
+	WGPUExtent3D size {
+		.width = texture->descriptor.dimensions.x,
+		.height = texture->descriptor.dimensions.y,
+		.depthOrArrayLayers = texture->range ? texture->range->start - texture->range->end : texture->descriptor.dimensions.z
+	};
+	wgpuCommandEncoderCopyBufferToTexture(cmd->encoder, &source, &destination, &size);
+}
+
+// TODO: Untested!
+void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuTexture* texture, bool no_offsets /* = false */) {
+	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_, no_offsets);
+	auto [dest_range, dest_offset, dest_addr] = dest; auto [src_range, src_offset, src_addr] = src;
+
+	assert(cmd->queue->gpu2textures[src_addr] == texture);
+	
+	WGPUTexelCopyTextureInfo source = {
+		.texture = texture->texture,
+		.mipLevel = 0, // TODO: How do we allow more control over this?
+		.origin = {0, 0, 0},
+		.aspect = WGPUTextureAspect_All
+	};
+	if(texture->range) source.origin = {0, 0, texture->range->start};
+	WGPUTexelCopyBufferInfo destination {
+		.layout = {
+			.offset = static_cast<uint64_t>(src_range.start + src_offset),
+			.bytesPerRow = texture->descriptor.dimensions.x * texture->descriptor.format,
+			.rowsPerImage = texture->descriptor.dimensions.y,
+		},
+		.buffer = cmd->queue->monobuffers[src_range.buffer],
+	};
+	WGPUExtent3D size {
+		.width = texture->descriptor.dimensions.x,
+		.height = texture->descriptor.dimensions.y,
+		.depthOrArrayLayers = texture->range ? texture->range->start - texture->range->end : texture->descriptor.dimensions.z
+	};
+	wgpuCommandEncoderCopyTextureToBuffer(cmd->encoder, &source, &destination, &size);
 }

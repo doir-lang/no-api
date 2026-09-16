@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cassert>
+#include <print>
 #include <stdexcept>
 
 #include <GLFW/glfw3.h>
@@ -302,20 +303,12 @@ int real_main() {
 
 	auto cmd = gpuStartCommandRecording(state.queue);
 	gpuSyncMemoryEXT(cmd, upload_gpu);
-	WGPUBufferDescriptor d {
-		.label = {"Temporary Storage", WGPU_STRLEN},
-		.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
-		.size = 5 * sizeof(float),
-	};
-	auto tmp = wgpuDeviceCreateBuffer(state.queue->device, &d);
-	wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, state.queue->monobuffers[upload_range.buffer], upload_range.start, tmp, 0, upload_range.size());
-	wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, tmp, 0, state.queue->monobuffers[download_range.buffer], download_range.start, upload_range.size());
+	gpuMemCpy(cmd, download_gpu, upload_gpu, 5 * sizeof(float));
 	gpuSyncMemoryEXT(cmd, download_gpu);
 	auto index = gpuSubmit(state.queue, {&cmd, 1});
 	gpuWaitSemaphore(state.queue, gpuGetSubmissionSemaphoreEXT(state.queue), index);
 
-	auto dbg = download[3];
-	wgpuBufferRelease(tmp);
+	std::println("upload: {}, download: {}", upload[3], download[3]);
 
 	gpuFreePipeline(state.queue, pipe);
 
