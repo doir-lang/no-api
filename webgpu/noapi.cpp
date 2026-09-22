@@ -138,18 +138,31 @@ void update_pipeline_layouts(GpuQueue* queue, bool compute) {
 
 		return wgpuDeviceCreateBindGroupLayout(queue->device, &d);
 	};
+	auto create_layout_and_group = [&](std::vector<WGPUBindGroupLayoutEntry>& layoutEntries, std::vector<WGPUBindGroupEntry>& entries) -> std::pair<WGPUBindGroupLayout, WGPUBindGroup> {
+		WGPUBindGroupLayoutDescriptor layout{
+			.entryCount = static_cast<uint32_t>(layoutEntries.size()),
+			.entries = layoutEntries.data(),
+		};
 
-	auto& bg0 = compute ? queue->current_compute_bind_group_layout0 : queue->current_graphics_bind_group_layout0;
+		WGPUBindGroupDescriptor d {
+			.layout = wgpuDeviceCreateBindGroupLayout(queue->device, &layout),
+			.entryCount = static_cast<uint32_t>(entries.size()),
+			.entries = entries.data(),
+		};
+		return {d.layout, wgpuDeviceCreateBindGroup(queue->device, &d)};
+	};
+
+	auto& bgl0 = compute ? queue->current_compute_bind_group_layout0 : queue->current_graphics_bind_group_layout0;
 
 	//
 	// Group 0: buffers
 	//
 	uint32_t binding = 0;
 
-	if(!bg0) { // The layout of buffers isn't dynamic so if it already exists we don't need to generate it again!
+	if(!bgl0) { // The layout of buffers isn't dynamic so if it already exists we don't need to generate it again!
 		std::vector<WGPUBindGroupLayoutEntry> group0;
 
-		for(uint32_t i = 0; i < 6; ++i)
+		for(uint32_t i = 0; i < queue->monobuffers.size(); ++i)
 			group0.push_back({
 				.binding = binding++,
 				.visibility = visibility,
@@ -180,19 +193,21 @@ void update_pipeline_layouts(GpuQueue* queue, bool compute) {
 			}
 		});
 
-		bg0 = create_layout(group0);
+		bgl0 = create_layout(group0);
+
 	}
 
 	//
 	// Group 1: storage textures
 	//
 	std::vector<WGPUBindGroupLayoutEntry> group1;
+	std::vector<WGPUBindGroupEntry> group1entries;
 
 	binding = 0;
 
-	for(auto const& [_cap, texture, view, desc] : queue->storage_monotextures)
+	for(auto const& [_cap, texture, view, desc] : queue->storage_monotextures) {
 		group1.push_back({
-			.binding = binding++,
+			.binding = binding,
 			.visibility = visibility,
 			.storageTexture = {
 				.access = WGPUStorageTextureAccess_ReadWrite,
@@ -200,15 +215,21 @@ void update_pipeline_layouts(GpuQueue* queue, bool compute) {
 				.viewDimension = GPU::texture_view2wgpu(desc.type),
 			}
 		});
+		group1entries.push_back({
+			.binding = binding++,
+			.textureView = view,
+		});
+	}
 
 	//
 	// Group 2: sampled textures
 	//
 	std::vector<WGPUBindGroupLayoutEntry> group2;
+	std::vector<WGPUBindGroupEntry> group2entries;
 
 	binding = 0;
 
-	for(auto const& [_cap, texture, view, desc] : queue->sampled_monotextures)
+	for(auto const& [_cap, texture, view, desc] : queue->sampled_monotextures) {
 		group2.push_back({
 			.binding = binding++,
 			.visibility = visibility,
@@ -218,19 +239,28 @@ void update_pipeline_layouts(GpuQueue* queue, bool compute) {
 				.multisampled = desc.sampleCount > 1,
 			}
 		});
+		group2entries.push_back({
+			.binding = binding++,
+			.textureView = view,
+		});
+	}
 
-	auto& bg1 = compute ? queue->current_compute_bind_group_layout1 : queue->current_graphics_bind_group_layout1;
-	if(bg1) queue->code_pending_submission_finished.emplace_back([l = bg1](){ wgpuBindGroupLayoutRelease(l); }, queue->next_submission_index);
-	bg1 = create_layout(group1);
+	if(queue->current_bind_group_layout1) queue->code_pending_submission_finished.emplace_back([l = queue->current_bind_group_layout1, gp = queue->current_bind_group1](){ 
+		wgpuBindGroupLayoutRelease(l); 
+		wgpuBindGroupRelease(gp); 
+	}, queue->next_submission_index);
+	std::tie(queue->current_bind_group_layout1, queue->current_bind_group1) = create_layout_and_group(group1, group1entries);
 
-	auto& bg2 = compute ? queue->current_compute_bind_group_layout2 : queue->current_graphics_bind_group_layout2;
-	if(bg2) queue->code_pending_submission_finished.emplace_back([l = bg2](){ wgpuBindGroupLayoutRelease(l); }, queue->next_submission_index);
-	bg2 = create_layout(group2);
+	if(queue->current_bind_group_layout2) queue->code_pending_submission_finished.emplace_back([l = queue->current_bind_group_layout2, gp = queue->current_bind_group2](){ 
+		wgpuBindGroupLayoutRelease(l); 
+		wgpuBindGroupRelease(gp); 
+	}, queue->next_submission_index);
+	std::tie(queue->current_bind_group_layout2, queue->current_bind_group2) = create_layout_and_group(group2, group2entries);
 
 	WGPUBindGroupLayout layouts[] = {
-		bg0,
-		bg1,
-		bg2
+		bgl0,
+		queue->current_bind_group_layout1,
+		queue->current_bind_group_layout2
 	};
 	auto& pipeline_layout = compute ? queue->current_compute_pipeline_layout : queue->current_graphics_pipeline_layout;
 	if(pipeline_layout) wgpuPipelineLayoutRelease(pipeline_layout);
@@ -293,11 +323,16 @@ std::string generate_binding_prologue(GpuQueue* queue, bool compute) {
 	"@group(0) @binding(5) var<storage, read_write> mono5 : array<u32>;\n"
 	"\n"
 	"@group(0) @binding(6) var<storage> texture_heap : array<u32>;\n"
-	"struct GPUComputeData {\n"
-	"	upload_buffer: vec2<u32>,\n"
-	"	download_buffer: vec2<u32>\n"
-	"}\n"
-	"@group(0) @binding(7) var<uniform> shader_data : GPUComputeData;\n";
+	"\n"
+	+ std::string(compute ? 
+		"struct GPUShaderData {\n"
+		"	compute: vec2<u32>,\n"
+		"}\n"
+		: "struct GPUShaderData {\n"
+		"	vertex: vec2<u32>,\n"
+		"	fragment: vec2<u32>,\n"
+		"}\n")
+	+ "@group(0) @binding(7) var<uniform> shader_data : GPUShaderData;\n";
 
 	uint32_t binding = 0;
 
@@ -332,10 +367,12 @@ GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limi
 	WGPUBufferDescriptor d {
 		.label = {"NoAPI Empty Monobuffer", WGPU_STRLEN},
 		.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
-		.size = 1
+		.size = 4
 	};
-	out->empty_monobuffer = wgpuDeviceCreateBuffer(out->device, &d);
-	std::fill(out->monobuffers.begin(), out->monobuffers.end(), out->empty_monobuffer);
+	out->empty_buffer = wgpuDeviceCreateBuffer(out->device, &d);
+	for(auto& buffer: out->monobuffers)
+		buffer = wgpuDeviceCreateBuffer(out->device, &d);
+	std::fill(out->monobuffer_sizes.begin(), out->monobuffer_sizes.end(), d.size);
 
 	update_pipeline_layouts(out);
 	return out;
@@ -408,22 +445,22 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 		}
 	}
 
-	auto new_start = align_up(queue->monobuffer_size, align);
+	auto new_start = align_up(queue->active_monobuffer_size, align);
 	auto new_end = new_start + bytes;
 	auto new_active_monobuffer = queue->active_monobuffer;
 
 	// Reallocate the monobuffer if necessary
 	bool activate_next_monobuffer = false;
-	if(new_end > queue->monobuffer_capacity) {
-		if(queue->monobuffers[queue->active_monobuffer] != queue->empty_monobuffer)
+	if(new_end > queue->active_monobuffer_capacity) {
+		if(queue->monobuffers[queue->active_monobuffer] != queue->empty_buffer)
 			queue->code_pending_submission_finished.emplace_back([buffer = queue->monobuffers[queue->active_monobuffer]]() {
 				wgpuBufferRelease(buffer);
 			}, queue->next_submission_index);
-		else queue->monobuffer_capacity = new_end;
+		else queue->active_monobuffer_capacity = new_end;
 
-		queue->monobuffer_capacity = std::max(queue->monobuffer_capacity * 2, new_end); // Doubles the size of the capacity each time
-		if(queue->monobuffer_capacity > queue->limits.maxStorageBufferBindingSize) {
-			queue->monobuffer_capacity = queue->limits.maxStorageBufferBindingSize;
+		queue->active_monobuffer_capacity = std::max(queue->active_monobuffer_capacity * 2, new_end); // Doubles the size of the capacity each time
+		if(queue->active_monobuffer_capacity > queue->limits.maxStorageBufferBindingSize) {
+			queue->active_monobuffer_capacity = queue->limits.maxStorageBufferBindingSize;
 			activate_next_monobuffer = true;
 		}
 		if(new_end > queue->limits.maxStorageBufferBindingSize) {
@@ -435,14 +472,14 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 		WGPUBufferDescriptor d {
 			.label = {"NoAPI Monobuffer", WGPU_STRLEN},
 			.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
-			.size = queue->monobuffer_capacity
+			.size = queue->active_monobuffer_capacity
 		};
 		auto old_monobuffer = queue->monobuffers[queue->active_monobuffer];
 		queue->monobuffers[queue->active_monobuffer] = wgpuDeviceCreateBuffer(queue->device, &d);
 
-		if(old_monobuffer != queue->empty_monobuffer) {
+		if(old_monobuffer != queue->empty_buffer) {
 			auto cmd = wgpuDeviceCreateCommandEncoder(queue->device, nullptr);
-			wgpuCommandEncoderCopyBufferToBuffer(cmd, old_monobuffer, 0, queue->monobuffers[queue->active_monobuffer], 0, queue->monobuffer_size);
+			wgpuCommandEncoderCopyBufferToBuffer(cmd, old_monobuffer, 0, queue->monobuffers[queue->active_monobuffer], 0, queue->active_monobuffer_size);
 			auto to_submit = wgpuCommandEncoderFinish(cmd, nullptr);
 			wgpuQueueSubmit(queue->queue, 1, &to_submit);
 			wgpuCommandEncoderRelease(cmd);
@@ -451,7 +488,7 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 
 		if(activate_next_monobuffer) {
 			// Add the rest of the old monobuffer to the freelist
-			queue->buffer_freelist.emplace_back(queue->active_monobuffer, queue->monobuffer_size, queue->limits.maxStorageBufferBindingSize);
+			queue->buffer_freelist.emplace_back(queue->active_monobuffer, queue->active_monobuffer_size, queue->limits.maxStorageBufferBindingSize);
 
 			++queue->active_monobuffer;
 			if(queue->active_monobuffer >= queue->monobuffers.size()) { // Fail if monobuffer being activated is the 8th monobuffer
@@ -467,13 +504,13 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 			queue->monobuffers[queue->active_monobuffer] = wgpuDeviceCreateBuffer(queue->device, &d);
 
 			if(new_start == 0)
-				queue->monobuffer_size = 0;
-			else queue->monobuffer_size = bytes;
-			queue->monobuffer_capacity = bytes;
+				queue->monobuffer_sizes[queue->active_monobuffer] = queue->active_monobuffer_size = 0;
+			else queue->monobuffer_sizes[queue->active_monobuffer] = queue->active_monobuffer_size = bytes;
+			queue->active_monobuffer_capacity = bytes;
 		}
 	}
 
-	if(!activate_next_monobuffer) queue->monobuffer_size = new_end;
+	if(!activate_next_monobuffer) queue->monobuffer_sizes[queue->active_monobuffer] = queue->active_monobuffer_size = new_end;
 	return allocation_bookkeeping(queue, new_active_monobuffer, new_start, new_end - new_start, memory);
 }
 
@@ -725,7 +762,7 @@ GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue* queue, const GpuTextur
 	return gpuTextureViewDescriptor(queue, texture, desc);
 }
 
-void update_compute_pipeline(GpuQueue* queue, GpuPipeline* pipeline) {
+void update_compute_pipeline(GpuQueue* queue, const GpuPipeline* pipeline) {
 	auto& cache = std::get<GpuPipeline::ComputeCache>(pipeline->cache);
 	// if(cache.module) wgpuShaderModuleRelease(cache.module);
 	if(cache.pipeline) wgpuComputePipelineRelease(cache.pipeline);
@@ -754,6 +791,7 @@ void update_compute_pipeline(GpuQueue* queue, GpuPipeline* pipeline) {
 		}
 	};
 	cache.pipeline = wgpuDeviceCreateComputePipeline(queue->device, &d);
+	pipeline->reference_layout = queue->current_compute_pipeline_layout;
 
 	wgpuShaderModuleRelease(d.compute.module);
 }
@@ -796,6 +834,23 @@ GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
 	return out;
 }
 
+void endCurrentPass(GpuCommandBuffer* cmd) {
+	if(cmd->render_pass) {
+		wgpuRenderPassEncoderEnd(cmd->render_pass);
+		cmd->queue->code_pending_submission_finished.emplace_back([pass = cmd->render_pass] {
+			wgpuRenderPassEncoderRelease(pass);
+		}, cmd->queue->next_submission_index);
+		cmd->render_pass = nullptr;
+	}
+	if(cmd->compute_pass) {
+		wgpuComputePassEncoderEnd(cmd->compute_pass);
+		cmd->queue->code_pending_submission_finished.emplace_back([pass = cmd->compute_pass] {
+			wgpuComputePassEncoderRelease(pass);
+		}, cmd->queue->next_submission_index);
+		cmd->compute_pass = nullptr;
+	}
+}
+
 void gpuFreeCommandBuffer(GpuCommandBuffer* cmd) {
 	wgpuCommandEncoderRelease(cmd->encoder);
 
@@ -806,8 +861,10 @@ void gpuFreeCommandBuffer(GpuCommandBuffer* cmd) {
 
 uint64_t gpuSubmitNoFree(GpuQueue* queue, std::span<GpuCommandBuffer*> command_buffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signal_value /* = 0 */) {
 	std::vector<WGPUCommandBuffer> buffers; buffers.reserve(command_buffers.size() + 1);
-	for(auto buffer: command_buffers)
+	for(auto buffer: command_buffers) {
+		endCurrentPass(buffer);
 		buffers.emplace_back(wgpuCommandEncoderFinish(buffer->encoder, nullptr));
+	}
 
 	GpuCommandBuffer cmd {
 		.queue = queue,
@@ -855,7 +912,7 @@ void gpuWaitIdleEXT(GpuQueue* queue) {
         	.userdata1 = &wait
 		}
 	);
-        
+
     while (!wait.done) {
 #ifdef __EMSCRIPTEN__
 		emscripten_sleep(1); // yields back to the browser event loop
@@ -867,6 +924,7 @@ void gpuWaitIdleEXT(GpuQueue* queue) {
 }
 
 void gpuSyncMemoryEXT(GpuCommandBuffer* cmd, gpu* mem) {
+	endCurrentPass(cmd);
 	auto [range, cpu, memory_type] = cmd->queue->allocations[mem];
 
 	switch (memory_type) {
@@ -902,9 +960,9 @@ GpuSemaphore* gpuCreateSemaphore(GpuQueue* queue, uint64_t initial_value) {
 }
 
 uint64_t gpuWaitSemaphore(GpuQueue* queue, const GpuSemaphore* semaphore, uint64_t value, uint64_t timeout /* = UINT64_MAX */) {
-	if(value == GPU_GET_VALUE) 
+	if(value == GPU_GET_VALUE)
 		return GPU::semaphore_value(queue, *semaphore);
-	
+
 	GPU::semaphore_wait(queue, *semaphore, value, std::chrono::nanoseconds(timeout));
 	GPU::process_pending_code(queue);
 	return value;
@@ -974,7 +1032,7 @@ void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* 
 	auto [dest_range, dest_offset, dest_addr] = dest; auto [src_range, src_offset, src_addr] = src;
 
 	assert(cmd->queue->gpu2textures[dest_addr] == texture);
-	
+
 	WGPUTexelCopyBufferInfo source {
 		.layout = {
 			.offset = static_cast<uint64_t>(src_range.start + src_offset),
@@ -1004,7 +1062,7 @@ void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuT
 	auto [dest_range, dest_offset, dest_addr] = dest; auto [src_range, src_offset, src_addr] = src;
 
 	assert(cmd->queue->gpu2textures[src_addr] == texture);
-	
+
 	WGPUTexelCopyTextureInfo source = {
 		.texture = texture->texture,
 		.mipLevel = 0, // TODO: How do we allow more control over this?
@@ -1026,4 +1084,143 @@ void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuT
 		.depthOrArrayLayers = texture->range ? texture->range->start - texture->range->end : texture->descriptor.dimensions.z
 	};
 	wgpuCommandEncoderCopyTextureToBuffer(cmd->encoder, &source, &destination, &size);
+}
+
+
+
+void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap, bool no_offsets /* = false */) {
+	// TODO: Should we add some validation to check that what is provided is a valid texture heap?
+	auto [dest_range, dest_offset, dest_addr] = GPU::detail::closest_buffer(cmd->queue, texture_heap, no_offsets);
+	dest_range.start += dest_offset;
+	dest_range.end -= dest_offset;
+	cmd->active_texture_heap = dest_range;
+}
+
+
+
+void gpuBarrier(GpuCommandBuffer* cmd, STAGE before, STAGE after, HAZARD_FLAGS hazards /* = (HAZARD_FLAGS)0 */) {
+	// TODO: I believe webgpu handles these internally... is there any reason to not make them noops?
+}
+void gpuSignalAfter(GpuCommandBuffer* cmd, STAGE before, gpu* ptr, uint64_t value, SIGNAL signal) {
+	// TODO: I believe webgpu handles these internally... is there any reason to not make them noops?
+}
+void gpuWaitBefore(GpuCommandBuffer* cmd, STAGE after, gpu* ptr, uint64_t value, OP op, HAZARD_FLAGS hazards /* = (HAZARD_FLAGS)0 */, uint64_t mask /* = ~uint64_t(0) */) {
+	// TODO: I believe webgpu handles these internally... is there any reason to not make them noops?
+}
+
+
+
+void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline) {
+	if(std::holds_alternative<GpuPipeline::ComputeCache>(pipeline->cache)) {
+		if(pipeline->reference_layout != cmd->queue->current_compute_pipeline_layout)
+			update_compute_pipeline(cmd->queue, pipeline);
+
+		if(cmd->render_pass) {
+			wgpuRenderPassEncoderEnd(cmd->render_pass);
+			cmd->queue->code_pending_submission_finished.emplace_back([pass = cmd->render_pass] {
+				wgpuRenderPassEncoderRelease(pass);
+			}, cmd->queue->next_submission_index);
+			cmd->render_pass = nullptr;
+		}
+
+		if(!cmd->compute_pass) cmd->compute_pass = wgpuCommandEncoderBeginComputePass(cmd->encoder, nullptr);
+
+		wgpuComputePassEncoderSetPipeline(cmd->compute_pass, std::get<GpuPipeline::ComputeCache>(pipeline->cache).pipeline);
+	} else {
+		if(cmd->compute_pass) {
+			wgpuComputePassEncoderEnd(cmd->compute_pass);
+			cmd->queue->code_pending_submission_finished.emplace_back([pass = cmd->compute_pass] {
+				wgpuComputePassEncoderRelease(pass);
+			}, cmd->queue->next_submission_index);
+			cmd->compute_pass = nullptr;
+		}
+
+		// TODO: Graphics is not implemented yet
+		throw std::runtime_error("Graphics is not implemented yet!");
+	}
+}
+
+struct ComputeShaderData {
+	gpu* compute;
+};
+
+WGPUBindGroup createBufferBindGroup(GpuCommandBuffer* cmd, gpu* data, bool no_offsets) {
+	uint32_t binding = 0;
+	std::vector<WGPUBindGroupEntry> group0;
+	for(uint32_t i = 0; i < cmd->queue->monobuffers.size(); ++i)
+		group0.push_back({
+			.binding = binding++,
+			.buffer = cmd->queue->monobuffers[i],
+			.offset = 0,
+			.size = cmd->queue->monobuffer_sizes[i]
+		});
+
+	// If there is no active texture heap bind the empty buffer
+	if(cmd->active_texture_heap)
+		group0.push_back({
+			.binding = binding++,
+			.buffer = cmd->queue->monobuffers[cmd->active_texture_heap->buffer],
+			.offset = cmd->active_texture_heap->start,
+			.size = cmd->active_texture_heap->size()
+		});
+	else group0.push_back({
+		.binding = binding++,
+		.buffer = cmd->queue->empty_buffer,
+		.offset = 0,
+		.size = 4
+	});
+
+	{
+		WGPUBufferDescriptor d {
+			.label = {"NoAPI ShaderData", WGPU_STRLEN},
+			.usage = WGPUBufferUsage_Uniform,
+			.size = sizeof(ComputeShaderData),
+			.mappedAtCreation = true,
+		};
+		auto tmp = wgpuDeviceCreateBuffer(cmd->queue->device, &d);
+		cmd->queue->code_pending_submission_finished.emplace_back([tmp] { wgpuBufferRelease(tmp); }, cmd->queue->next_submission_index);
+		auto data_ptr = (ComputeShaderData*)wgpuBufferGetMappedRange(tmp, 0, d.size);
+		data_ptr->compute = data;
+		wgpuBufferUnmap(tmp);
+
+		group0.push_back({
+			.binding = binding++,
+			.buffer = tmp,
+			.offset = 0,
+			.size = d.size
+		});
+	}
+
+	WGPUBindGroupDescriptor d {
+		.layout = cmd->queue->current_compute_bind_group_layout0,
+		.entryCount = group0.size(),
+		.entries = group0.data()
+	};
+	return wgpuDeviceCreateBindGroup(cmd->queue->device, &d);
+}
+
+void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions, bool no_offsets /* = false */) {
+	assert(cmd->compute_pass);
+
+	auto group0 = createBufferBindGroup(cmd, data, no_offsets);
+	cmd->queue->code_pending_submission_finished.emplace_back([group0] { wgpuBindGroupRelease(group0); }, cmd->queue->next_submission_index);
+	wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 0, group0, 0, nullptr);
+	wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 1, cmd->queue->current_bind_group1, 0, nullptr);
+	wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 2, cmd->queue->current_bind_group2, 0, nullptr);
+
+	wgpuComputePassEncoderDispatchWorkgroups(cmd->compute_pass, grid_dimensions.x, grid_dimensions.y, grid_dimensions.z);
+}
+void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* data, gpu* grid_dimensions_gpu, bool no_offsets /* = false */) {
+	assert(cmd->compute_pass);
+	assert(grid_dimensions_gpu);
+
+	auto [grid_range, grid_offset, grid_addr] = GPU::detail::closest_buffer(cmd->queue, grid_dimensions_gpu, no_offsets);
+
+	auto group0 = createBufferBindGroup(cmd, data, no_offsets);
+	cmd->queue->code_pending_submission_finished.emplace_back([group0] { wgpuBindGroupRelease(group0); }, cmd->queue->next_submission_index);
+	wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 0, group0, 0, nullptr);
+	wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 1, cmd->queue->current_bind_group1, 0, nullptr);
+	wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 2, cmd->queue->current_bind_group2, 0, nullptr);
+
+	wgpuComputePassEncoderDispatchWorkgroupsIndirect(cmd->compute_pass, cmd->queue->monobuffers[grid_range.buffer], grid_range.start + grid_offset);
 }

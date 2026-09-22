@@ -67,9 +67,11 @@ struct GpuQueue {
 	size_t next_submission_index = 1;
 	GpuSemaphore current_submission_timeline_semaphore;
 
-	size_t monobuffer_size = 0, monobuffer_capacity = 0;
-	WGPUBuffer empty_monobuffer = nullptr;
+	size_t active_monobuffer_size = 0, active_monobuffer_capacity = 0;
+	WGPUBuffer empty_buffer = nullptr;
 	std::array<WGPUBuffer, 6> monobuffers;
+	std::array<size_t, 6> monobuffer_sizes;
+	// static_assert(GpuQueue{}.monobuffers.size() == GpuQueue{}.monobuffer_sizes.size());
 	uint8_t active_monobuffer = 0;
 
 	struct MonobufferRange {
@@ -164,14 +166,15 @@ struct GpuQueue {
 	std::vector<MonotextureRange> texture_freelist;
 
 
+	WGPUBindGroupLayout current_bind_group_layout1 = nullptr; // 1 == storage textures
+	WGPUBindGroup current_bind_group1 = nullptr;
+	WGPUBindGroupLayout current_bind_group_layout2 = nullptr; // 2 == sampled textures
+	WGPUBindGroup current_bind_group2 = nullptr;
+
 	WGPUBindGroupLayout current_compute_bind_group_layout0 = nullptr; // 0 == buffers
-	WGPUBindGroupLayout current_compute_bind_group_layout1 = nullptr; // 1 == storage textures
-	WGPUBindGroupLayout current_compute_bind_group_layout2 = nullptr; // 2 == sampled textures
 	WGPUPipelineLayout current_compute_pipeline_layout = nullptr;
 
 	WGPUBindGroupLayout current_graphics_bind_group_layout0 = nullptr; // 0 == buffers
-	WGPUBindGroupLayout current_graphics_bind_group_layout1 = nullptr; // 1 == storage textures
-	WGPUBindGroupLayout current_graphics_bind_group_layout2 = nullptr; // 2 == sampled textures
 	WGPUPipelineLayout current_graphics_pipeline_layout = nullptr;
 };
 
@@ -182,8 +185,10 @@ inline GpuQueue* gpuCreateQueue(GpuWebGPUDefault def, CpuAllocatorFunc allocator
 
 struct GpuCommandBuffer {
 	GpuQueue* queue;
+	std::optional<GpuQueue::MonobufferRange> active_texture_heap = {};
 	WGPUCommandEncoder encoder;
-	// WGPURenderPassEncoder render_pass;
+	WGPUComputePassEncoder compute_pass = nullptr;
+	WGPURenderPassEncoder render_pass = nullptr;
 
 	std::vector<std::function<void()>> code_pending_submission_finished;
 };
@@ -206,13 +211,13 @@ static_assert(sizeof(GpuTextureDescriptorImpl) == sizeof(GpuTextureDescriptor), 
 struct GpuPipeline {
 	struct ComputeCache {
 		std::string IR;
-		WGPUComputePipeline pipeline;
+		mutable WGPUComputePipeline pipeline;
 	};
 
 	struct RenderCache {
-		WGPURenderPipeline pipeline;
+		mutable WGPURenderPipeline pipeline;
 	};
 
-	WGPUPipelineLayout reference_layout; // The layout that the currently cached variant of this pipeline is built against
+	mutable WGPUPipelineLayout reference_layout; // The layout that the currently cached variant of this pipeline is built against
 	std::variant<ComputeCache, RenderCache> cache;
 };

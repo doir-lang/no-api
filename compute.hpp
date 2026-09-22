@@ -862,7 +862,7 @@ void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline);
  * @param data GPU pointer to the root data struct (see root arguments design).
  * @param grid_dimensions Thread group grid (x * y * z total groups).
  */
-void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions);
+void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions, bool no_offsets = false);
 
 /**
  * gpuDispatchIndirect – Like gpuDispatch but reads the thread group dimensions from

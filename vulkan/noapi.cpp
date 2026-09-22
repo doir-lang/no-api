@@ -981,7 +981,7 @@ void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline) {
 	cmd->bound_pipeline = pipeline;
 }
 
-void gpuDispatch(GpuCommandBuffer* cmd, gpu* dataGpu, uvec3 gridDimensions) {
+void gpuDispatch(GpuCommandBuffer* cmd, gpu* dataGpu, uvec3 gridDimensions, bool /*no_offsets = false */) {
 	ComputePipelinePushConstants data {
 		.data = dataGpu,
 		.sampler_map = (gpu*)cmd->sampler_map

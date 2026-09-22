@@ -202,11 +202,20 @@ int real_main() {
 	auto upload = gpuMalloc<float>(state.queue, 5, MEMORY_DEFAULT);
 	for(size_t i = 0; i < 5; ++i)
 		upload[i] = i;
-	auto upload_gpu = gpuHostToDevicePointer(state.queue, upload);
-	auto upload_range = std::get<GpuQueue::MonobufferRange>(state.queue->allocations[upload_gpu]);
+	
 	auto download = gpuMalloc<float>(state.queue, 5, MEMORY_READBACK);
-	auto download_gpu = gpuHostToDevicePointer(state.queue, download);
-	auto download_range = std::get<GpuQueue::MonobufferRange>(state.queue->allocations[download_gpu]);
+	
+	struct ShaderData {
+		gpu* upload;
+		gpu* download;
+	};
+	auto data = gpuMalloc<ShaderData>(state.queue);
+	data->upload = gpuHostToDevicePointer(state.queue, upload);
+	data->download = gpuHostToDevicePointer(state.queue, download);
+	auto data_gpu = gpuHostToDevicePointer(state.queue, data);
+	gpuSyncMemoryEXT(state.queue, data_gpu);
+	auto upload_range = std::get<GpuQueue::MonobufferRange>(state.queue->allocations[data->upload]);
+	auto download_range = std::get<GpuQueue::MonobufferRange>(state.queue->allocations[data->download]);
 
 	auto pipe = gpuCreateComputePipeline(state.queue, string_to_bytes(R"wgsl(
 		@generated_noapi_bindings
@@ -217,6 +226,10 @@ int real_main() {
 			monobuffer: u32,
 			address: vec2<u32>,
 		};
+
+		fn ptrOffset(offset: u32) -> vec2<u32> {
+			return vec2<u32>(offset, 0);
+		}
 
 		fn gpuEncodeAddress(monobuffer: u32, address: vec2<u32>) -> vec2<u32> {
 			let tag = monobuffer + 1u;
@@ -240,7 +253,7 @@ int real_main() {
 			);
 		}
 
-		fn loadMonobuffer(address: vec2<u32>) -> u32 {
+		fn loadMonobufferU32(address: vec2<u32>) -> u32 {
 			let buf = gpuDecodeAddress(address);
 			switch buf.monobuffer {
 				case 1: {
@@ -264,7 +277,7 @@ int real_main() {
 			}
 		}
 
-		fn storeMonobuffer(address: vec2<u32>, value: u32) {
+		fn storeMonobufferU32(address: vec2<u32>, value: u32) {
 			let buf = gpuDecodeAddress(address);
 			switch buf.monobuffer {
 				case 1: {
@@ -288,23 +301,36 @@ int real_main() {
 			}
 		}
 
+		fn loadMonobufferF32(address: vec2<u32>) -> f32 {
+			return bitcast<f32>(loadMonobufferU32(address));
+		}
+
+		fn storeMonobufferF32(address: vec2<u32>, value: f32) {
+			storeMonobufferU32(address, bitcast<u32>(value));
+		}
+
 		// End Prologue
 
 		@compute @workgroup_size(16)
 		fn main(@builtin(global_invocation_id) global_id : vec3u) {
-			var u = shader_data.upload_buffer;
-			u.x += global_id.x * 4;
-			var d = shader_data.download_buffer;
-			d.x += global_id.x * 4;
-			let tmp = loadMonobuffer(u);
-			storeMonobuffer(d, tmp * 5);
+			let sizeof_int : u32 = 4;
+			let data = shader_data.compute;
+			var u = vec2<u32>(loadMonobufferU32(data), loadMonobufferU32(data + ptrOffset(4)));
+			u += ptrOffset(global_id.x * sizeof_int);
+			var d = vec2<u32>(loadMonobufferU32(data + ptrOffset(8)), loadMonobufferU32(data + ptrOffset(12)));
+			d += ptrOffset(global_id.x * sizeof_int);
+
+			let tmp = loadMonobufferF32(u);
+			storeMonobufferF32(d, tmp * 6);
 		}
 	)wgsl"));
 
 	auto cmd = gpuStartCommandRecording(state.queue);
-	gpuSyncMemoryEXT(cmd, upload_gpu);
-	gpuMemCpy(cmd, download_gpu, upload_gpu, 5 * sizeof(float));
-	gpuSyncMemoryEXT(cmd, download_gpu);
+	gpuSyncMemoryEXT(cmd, data->upload);
+	// gpuMemCpy(cmd, data->download, data->upload, 5 * sizeof(float));
+	gpuSetPipeline(cmd, pipe);
+	gpuDispatch(cmd, data_gpu, {1, 1, 1});
+	gpuSyncMemoryEXT(cmd, data->download);
 	auto index = gpuSubmit(state.queue, {&cmd, 1});
 	gpuWaitSemaphore(state.queue, gpuGetSubmissionSemaphoreEXT(state.queue), index);
 
