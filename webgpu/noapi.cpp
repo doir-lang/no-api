@@ -127,9 +127,10 @@ std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::funct
 	return out;
 }
 
-// Group 0 describes the monobuffers, the active texture heap, and the shader data uniform.
-// Its layout never changes, but compute and graphics need separate ones since WebGPU forbids
-// writable storage buffers in the vertex stage (so graphics binds the monobuffers read only).
+// Group 0 describes the monobuffers, the active texture heap, the sampler/texture metadata buffer,
+// and the shader data uniform. Its layout never changes, but compute and graphics need separate ones
+// since WebGPU forbids writable storage buffers in the vertex stage (so graphics binds the
+// monobuffers read only).
 WGPUBindGroupLayout create_buffer_bind_group_layout(GpuQueue* queue, bool compute) {
 	auto visibility = compute ? WGPUShaderStage_Compute : WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
 
@@ -147,15 +148,17 @@ WGPUBindGroupLayout create_buffer_bind_group_layout(GpuQueue* queue, bool comput
 			}
 		});
 
-	group0.push_back({
-		.binding = binding++,
-		.visibility = visibility,
-		.buffer = {
-			.type = WGPUBufferBindingType_ReadOnlyStorage,
-			.hasDynamicOffset = false,
-			.minBindingSize = 0,
-		}
-	});
+	// The texture heap, then the sampler lookup map and monotexture sizes; both read only
+	for(uint32_t i = 0; i < 2; ++i)
+		group0.push_back({
+			.binding = binding++,
+			.visibility = visibility,
+			.buffer = {
+				.type = WGPUBufferBindingType_ReadOnlyStorage,
+				.hasDynamicOffset = false,
+				.minBindingSize = 0,
+			}
+		});
 
 	group0.push_back({
 		.binding = binding++,
@@ -172,6 +175,124 @@ WGPUBindGroupLayout create_buffer_bind_group_layout(GpuQueue* queue, bool comput
 		.entries = group0.data(),
 	};
 	return wgpuDeviceCreateBindGroupLayout(queue->device, &d);
+}
+
+// Group 3 is one binding per sampler slot. Its shape is fixed, so unlike the texture groups it is
+// built once and shared by every sampler set.
+WGPUBindGroupLayout create_sampler_bind_group_layout(GpuQueue* queue) {
+	std::vector<WGPUBindGroupLayoutEntry> group3;
+	for(uint32_t i = 0; i < gpu_sampler_slot_count; ++i)
+		group3.push_back({
+			.binding = i,
+			.visibility = WGPUShaderStage_Compute | WGPUShaderStage_Vertex | WGPUShaderStage_Fragment,
+			.sampler = {
+				// Filtering accepts a nearest sampler too, and group 2 already declares every sampled
+				// monotexture as a filterable float texture
+				.type = WGPUSamplerBindingType_Filtering,
+			}
+		});
+
+	WGPUBindGroupLayoutDescriptor d{
+		.entryCount = static_cast<uint32_t>(group3.size()),
+		.entries = group3.data(),
+	};
+	return wgpuDeviceCreateBindGroupLayout(queue->device, &d);
+}
+
+namespace GPU::detail {
+	// Sampler descriptions pack into 16 bits but only ever reach max_packed(), so the lookup map
+	// needs one word per value in [0, max_packed()]
+	constexpr static uint32_t sampler_lookup_size = GpuSamplerDesc::max_packed() + 1;
+
+	constexpr static WGPUAddressMode address2wgpu(ADDRESS_MODE mode) {
+		switch (mode) {
+		case ADDRESS_MODE_CLAMP: return WGPUAddressMode_ClampToEdge;
+		case ADDRESS_MODE_MIRROR_REPEAT: return WGPUAddressMode_MirrorRepeat;
+		case ADDRESS_MODE_REPEAT: return WGPUAddressMode_Repeat;
+		}
+		return WGPUAddressMode_Repeat;
+	}
+
+	constexpr static WGPUFilterMode filter2wgpu(FILTER filter) {
+		return filter == FILTER_NEAREST ? WGPUFilterMode_Nearest : WGPUFilterMode_Linear;
+	}
+
+	constexpr static WGPUMipmapFilterMode mip_filter2wgpu(FILTER filter) {
+		return filter == FILTER_NEAREST ? WGPUMipmapFilterMode_Nearest : WGPUMipmapFilterMode_Linear;
+	}
+
+	// Looks up (or builds) the sampler set for a list of enabled samplers. Slot 0 is always the
+	// default sampler, matching the Vulkan backend, so a packed description that was never enabled
+	// still resolves to something valid.
+	inline GpuQueue::SamplerSet* ensure_sampler_set(GpuQueue* queue, std::span<const GpuSamplerDesc> requested) {
+		// One slot is spent on the default sampler, so the caller gets the rest
+		assert(requested.size() < gpu_sampler_slot_count && "More samplers enabled at once than there are sampler slots");
+		auto count = std::min<size_t>(requested.size(), gpu_sampler_slot_count - 1);
+
+		std::vector<GpuSamplerDesc> enabled(count + 1, GpuSamplerDesc{});
+		std::copy_n(requested.begin(), count, enabled.begin() + 1);
+
+		if(auto found = queue->sampler_cache.find(enabled); found != queue->sampler_cache.end())
+			return &found->second;
+
+		auto& set = queue->sampler_cache[enabled];
+
+		// Every slot has to be filled for the bind group to match the layout, so the ones the caller
+		// didn't ask for get a copy of the default sampler
+		set.samplers.reserve(gpu_sampler_slot_count);
+		for(uint32_t i = 0; i < gpu_sampler_slot_count; ++i) {
+			auto& desc = enabled[i < enabled.size() ? i : 0];
+			WGPUSamplerDescriptor d {
+				.label = {"NoAPI Sampler", WGPU_STRLEN},
+				.addressModeU = address2wgpu(desc.address_mode_u),
+				.addressModeV = address2wgpu(desc.address_mode_v),
+				.addressModeW = address2wgpu(desc.address_mode_w),
+				.magFilter = filter2wgpu(desc.mag_filter),
+				.minFilter = filter2wgpu(desc.min_filter),
+				.mipmapFilter = mip_filter2wgpu(desc.mip_filter),
+				.lodMinClamp = 0,
+				.lodMaxClamp = 32, // Well past the mip count of any texture WebGPU can allocate
+				.maxAnisotropy = 1,
+			};
+			set.samplers.emplace_back(wgpuDeviceCreateSampler(queue->device, &d));
+		}
+
+		std::vector<WGPUBindGroupEntry> entries; entries.reserve(set.samplers.size());
+		for(uint32_t i = 0; i < set.samplers.size(); ++i)
+			entries.push_back({
+				.binding = i,
+				.sampler = set.samplers[i],
+			});
+		WGPUBindGroupDescriptor bind_group {
+			.label = {"NoAPI Samplers", WGPU_STRLEN},
+			.layout = queue->current_bind_group_layout3,
+			.entryCount = static_cast<uint32_t>(entries.size()),
+			.entries = entries.data(),
+		};
+		set.bind_group = wgpuDeviceCreateBindGroup(queue->device, &bind_group);
+
+		// Walked backwards so that the lowest slot wins if the same description was enabled twice
+		std::vector<uint32_t> lookup(sampler_lookup_size, 0);
+		for(size_t i = enabled.size(); i--; )
+			lookup[enabled[i].pack()] = i;
+
+		WGPUBufferDescriptor buffer {
+			.label = {"NoAPI Sampler Map", WGPU_STRLEN},
+			.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+			.size = lookup.size() * sizeof(uint32_t),
+		};
+		set.lookup_buffer = wgpuDeviceCreateBuffer(queue->device, &buffer);
+		wgpuQueueWriteBuffer(queue->queue, set.lookup_buffer, 0, lookup.data(), buffer.size);
+
+		return &set;
+	}
+
+	inline void free_sampler_set(GpuQueue::SamplerSet& set) {
+		if(set.lookup_buffer) wgpuBufferRelease(set.lookup_buffer);
+		if(set.bind_group) wgpuBindGroupRelease(set.bind_group);
+		for(auto sampler: set.samplers)
+			wgpuSamplerRelease(sampler);
+	}
 }
 
 void update_pipeline_layouts(GpuQueue* queue) {
@@ -261,15 +382,24 @@ void update_pipeline_layouts(GpuQueue* queue) {
 	}, queue->next_submission_index);
 	std::tie(queue->current_bind_group_layout2, queue->current_bind_group2) = create_layout_and_group(group2, group2entries);
 
+	//
+	// Group 3: samplers
+	//
+	// Only its contents ever change, never its shape, so the layout outlives every sampler set
+	//
+	if(!queue->current_bind_group_layout3)
+		queue->current_bind_group_layout3 = create_sampler_bind_group_layout(queue);
+
 	auto create_pipeline_layout = [&](WGPUBindGroupLayout bgl0) {
 		WGPUBindGroupLayout layouts[] = {
 			bgl0,
 			queue->current_bind_group_layout1,
-			queue->current_bind_group_layout2
+			queue->current_bind_group_layout2,
+			queue->current_bind_group_layout3
 		};
 
 		WGPUPipelineLayoutDescriptor pd{
-			.bindGroupLayoutCount = 3,
+			.bindGroupLayoutCount = 4,
 			.bindGroupLayouts = layouts,
 		};
 		return wgpuDeviceCreatePipelineLayout(queue->device, &pd);
@@ -285,14 +415,16 @@ void update_pipeline_layouts(GpuQueue* queue) {
 
 
 std::string generate_binding_prologue(GpuQueue* queue, bool compute) {
+	// Has to name the same view dimension GPU::texture_view2wgpu puts in the bind group layouts, or
+	// the declaration won't match the view that gets bound. A plain 2D texture is still an array
+	// view, since that is how several of them get packed into one monotexture.
 	constexpr static auto texture_dimension_suffix = [](TEXTURE type) {
-		switch (type) {
-		case TEXTURE_1D: return "1d";
-		// case TEXTURE_2D: return "2d";
-		case TEXTURE_3D: return "3d";
-		case TEXTURE_CUBE: return "cube";
-		case TEXTURE_2D_ARRAY: return "2d_array";
-		case TEXTURE_CUBE_ARRAY: return "cube_array";
+		switch (GPU::texture_view2wgpu(type)) {
+		case WGPUTextureViewDimension_1D: return "1d";
+		case WGPUTextureViewDimension_3D: return "3d";
+		case WGPUTextureViewDimension_Cube: return "cube";
+		case WGPUTextureViewDimension_CubeArray: return "cube_array";
+		case WGPUTextureViewDimension_2DArray: return "2d_array";
 		default: return "2d";
 		}
 	};
@@ -321,16 +453,43 @@ std::string generate_binding_prologue(GpuQueue* queue, bool compute) {
 		}
 	};
 
+	// A texture only owns part of the monotexture holding it, so its [0, 1] coordinates have to be
+	// scaled down by its share of the atlas before they are sampled. Cube coordinates are a direction
+	// rather than a position, so they pass through untouched.
+	constexpr static auto texture_sample_remap = [](TEXTURE type) {
+		switch (GPU::texture_view2wgpu(type)) {
+		case WGPUTextureViewDimension_1D: return "uv.x * f32(size.x) / f32(textureDimensions(sampled_tex_{0}, 0))";
+		case WGPUTextureViewDimension_3D: return "uv * vec3<f32>(size) / vec3<f32>(textureDimensions(sampled_tex_{0}, 0))";
+		case WGPUTextureViewDimension_Cube:
+		case WGPUTextureViewDimension_CubeArray: return "uv";
+		default: return "uv.xy * vec2<f32>(size.xy) / vec2<f32>(textureDimensions(sampled_tex_{0}, 0))";
+		}
+	};
+
+	// textureSampleLevel's argument list depends on the view dimension too, so every per slot wrapper
+	// spells its own call out. The dimensions that have no array index simply drop it.
+	constexpr static auto texture_sample_arguments = [](TEXTURE type) {
+		switch (GPU::texture_view2wgpu(type)) {
+		case WGPUTextureViewDimension_2DArray:
+		case WGPUTextureViewDimension_CubeArray: return "at, layer, mip";
+		default: return "at, mip";
+		}
+	};
+
 	// WebGPU forbids writable storage buffers in the vertex stage, so the rasterizer only ever gets
 	// read only access to the monobuffers (matching what create_buffer_bind_group_layout declares)
 	std::string out;
+	uint32_t binding = 0;
 	for(uint32_t i = 0; i < queue->monobuffers.size(); ++i)
-		out += std::format("@group(0) @binding({}) var<storage, {}> mono{} : array<u32>;\n", i, compute ? "read_write" : "read", i);
+		out += std::format("@group(0) @binding({}) var<storage, {}> mono{} : array<u32>;\n", binding++, compute ? "read_write" : "read", i);
 
-	out += "\n"
-	"@group(0) @binding(6) var<storage> texture_heap : array<u32>;\n"
-	"\n"
-	+ std::string(compute ? 
+	out += std::format("\n"
+		"@group(0) @binding({}) var<storage> texture_heap : array<u32>;\n"
+		"@group(0) @binding({}) var<storage> noapi_sampler_map : array<u32>;\n"
+		"\n", binding, binding + 1);
+	binding += 2;
+
+	out += std::string(compute ?
 		"struct GPUShaderData {\n"
 		"	compute: vec2<u32>,\n"
 		"}\n"
@@ -338,9 +497,9 @@ std::string generate_binding_prologue(GpuQueue* queue, bool compute) {
 		"	vertex: vec2<u32>,\n"
 		"	fragment: vec2<u32>,\n"
 		"}\n")
-	+ "@group(0) @binding(7) var<uniform> shader_data : GPUShaderData;\n";
+	+ std::format("@group(0) @binding({}) var<uniform> shader_data : GPUShaderData;\n\n", binding++);
 
-	uint32_t binding = 0;
+	binding = 0;
 
 	for (auto const& [_cap, texture, view, desc] : queue->storage_monotextures) {
 		out += std::format("@group(1) @binding({}) var storage_tex_{} : texture_storage_{}<{}, read_write>;\n", binding, binding, texture_dimension_suffix(desc.type), wgsl_format(desc.format));
@@ -354,6 +513,101 @@ std::string generate_binding_prologue(GpuQueue* queue, bool compute) {
 		++binding;
 	}
 
+	//
+	// Samplers, and the metadata buffer that makes them addressable
+	//
+	out += "\n";
+	for (uint32_t i = 0; i < gpu_sampler_slot_count; ++i)
+		out += std::format("@group(3) @binding({}) var noapi_sampler_{} : sampler;\n", i, i);
+
+	auto storage_count = static_cast<uint32_t>(queue->storage_monotextures.size());
+	auto sampled_count = static_cast<uint32_t>(queue->sampled_monotextures.size());
+
+	out += std::format("\n"
+		"const NOAPI_SAMPLER_SLOT_COUNT : u32 = {}u;\n"
+		"const NOAPI_SAMPLER_LOOKUP_SIZE : u32 = {}u;\n"
+		"const NOAPI_STORAGE_TEXTURE_COUNT : u32 = {}u;\n"
+		"const NOAPI_SAMPLED_TEXTURE_COUNT : u32 = {}u;\n"
+		"\n"
+		"// Turns a packed GpuSamplerDesc into the slot holding it, or slot 0 (the default sampler)\n"
+		"// when that description was never handed to gpuSetEnabledSamplersEXT\n"
+		"fn noapi_sampler_slot(packed : u32) -> u32 {{\n"
+		"	if (packed >= NOAPI_SAMPLER_LOOKUP_SIZE) {{ return 0u; }}\n"
+		"	return noapi_sampler_map[packed];\n"
+		"}}\n"
+		"\n"
+		"const NOAPI_MONOTEXTURE_STORAGE_BIT : u32 = 0x80000000u;\n"
+		"const NOAPI_MONOTEXTURE_INDEX_MASK : u32 = 0x7FFFFFFFu;\n"
+		"\n"
+		"// One entry of the texture heap, as gpuTextureViewDescriptor lays it out: eight words, the\n"
+		"// first of which packs three bytes. `size` is the texture's own, not the monotexture's --\n"
+		"// WGSL can report the monotexture's itself, but not how much of it this texture owns.\n"
+		"struct GPUTextureDescriptor {{\n"
+		"	texture_type : u32,\n"
+		"	base_mip : u32,\n"
+		"	mip_count : u32,\n"
+		"	size : vec3<u32>, // width, height, depth\n"
+		"	monotexture : u32, // Top bit set means a storage monotexture, the rest is the index\n"
+		"	first_layer : u32, // Absolute layer within that monotexture\n"
+		"	end_layer : u32,\n"
+		"}}\n"
+		"\n"
+		"fn noapi_texture_descriptor(heap_index : u32) -> GPUTextureDescriptor {{\n"
+		"	let at = heap_index * 8u;\n"
+		"	let packed = texture_heap[at];\n"
+		"	return GPUTextureDescriptor(packed & 0xFFu, (packed >> 8u) & 0xFFu, (packed >> 16u) & 0xFFu,\n"
+		"		vec3<u32>(texture_heap[at + 1u], texture_heap[at + 2u], texture_heap[at + 3u]),\n"
+		"		texture_heap[at + 4u], texture_heap[at + 5u], texture_heap[at + 6u]);\n"
+		"}}\n"
+		"\n"
+		"fn noapi_monotexture_index(descriptor : GPUTextureDescriptor) -> u32 {{\n"
+		"	return descriptor.monotexture & NOAPI_MONOTEXTURE_INDEX_MASK;\n"
+		"}}\n"
+		"\n"
+		"fn noapi_monotexture_is_storage(descriptor : GPUTextureDescriptor) -> bool {{\n"
+		"	return (descriptor.monotexture & NOAPI_MONOTEXTURE_STORAGE_BIT) != 0u;\n"
+		"}}\n"
+		"\n",
+		gpu_sampler_slot_count, GPU::detail::sampler_lookup_size, storage_count, sampled_count);
+
+	// WGSL can't index an array of samplers or of textures, so the only way to pick either one at
+	// runtime is a switch over every combination the queue currently has
+	binding = 0;
+	for (auto const& [_cap, texture, view, desc] : queue->sampled_monotextures) {
+		auto arguments = texture_sample_arguments(desc.type);
+		auto remap = std::vformat(texture_sample_remap(desc.type), std::make_format_args(binding));
+		out += std::format("fn noapi_sample_tex_{}(slot : u32, size : vec3<u32>, uv : vec3<f32>, layer : u32, mip : f32) -> vec4<f32> {{\n"
+			"	let at = {};\n"
+			"	switch slot {{\n", binding, remap);
+		for (uint32_t i = 1; i < gpu_sampler_slot_count; ++i)
+			out += std::format("		case {}u: {{ return textureSampleLevel(sampled_tex_{}, noapi_sampler_{}, {}); }}\n", i, binding, i, arguments);
+		out += std::format("		default: {{ return textureSampleLevel(sampled_tex_{}, noapi_sampler_0, {}); }}\n"
+			"	}}\n"
+			"}}\n"
+			"\n", binding, arguments);
+		++binding;
+	}
+
+	out += "// Samples monotexture `texture` on `layer`, through the sampler in `slot` (see\n"
+		"// noapi_sampler_slot). `uv` runs 0..1 over a texture of `size`, which is scaled down onto\n"
+		"// whatever part of the monotexture that texture occupies. `layer` and `mip` are absolute.\n"
+		"fn noapi_sample_texture(texture : u32, slot : u32, size : vec3<u32>, uv : vec3<f32>, layer : u32, mip : f32) -> vec4<f32> {\n"
+		"	switch texture {\n";
+	for (uint32_t i = 0; i < sampled_count; ++i)
+		out += std::format("		case {}u: {{ return noapi_sample_tex_{}(slot, size, uv, layer, mip); }}\n", i, i);
+	out += "		default: { return vec4<f32>(0.0); }\n"
+		"	}\n"
+		"}\n"
+		"\n"
+		"// Samples a texture straight out of the heap. `uv` runs 0..1 over the texture, and `layer`\n"
+		"// and `mip` are relative to the view the descriptor describes rather than to the monotexture.\n"
+		"fn noapi_sample(heap_index : u32, slot : u32, uv : vec3<f32>, layer : u32, mip : f32) -> vec4<f32> {\n"
+		"	let descriptor = noapi_texture_descriptor(heap_index);\n"
+		"	let level = f32(descriptor.base_mip) + clamp(mip, 0.0, max(f32(descriptor.mip_count), 1.0) - 1.0);\n"
+		"	let at = descriptor.first_layer + min(layer, descriptor.end_layer - descriptor.first_layer - 1u);\n"
+		"	return noapi_sample_texture(noapi_monotexture_index(descriptor), slot, descriptor.size, uv, at, level);\n"
+		"}\n";
+
 	return out;
 }
 
@@ -365,6 +619,7 @@ GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limi
 		.limits = limits,
 		.cpu_allocator = allocator,
 	};
+	assert(limits.maxSamplersPerShaderStage >= gpu_sampler_slot_count && "Device is below the sampler limit WebGPU guarantees");
 
 	out->queue = wgpuDeviceGetQueue(device);
 
@@ -381,11 +636,19 @@ GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limi
 	std::fill(out->monobuffer_sizes.begin(), out->monobuffer_sizes.end(), d.size);
 
 	update_pipeline_layouts(out);
+
+	// A command buffer that never calls gpuSetEnabledSamplersEXT still has to bind something, and
+	// every set resolves an unknown description to slot 0 anyway, so the default is a set of one
+	out->default_sampler_set = GPU::detail::ensure_sampler_set(out, {});
 	return out;
 }
 
 void gpuFreeQueue(GpuQueue* queue) {
 	GPU::semaphore_destroy(queue->current_submission_timeline_semaphore);
+
+	for(auto& [_enabled, set]: queue->sampler_cache)
+		GPU::detail::free_sampler_set(set);
+	if(queue->current_bind_group_layout3) wgpuBindGroupLayoutRelease(queue->current_bind_group_layout3);
 
 	for(auto [_key, pipeline]: queue->blit_pipelines)
 		wgpuRenderPipelineRelease(pipeline);
@@ -704,6 +967,7 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 						.size = {desc.dimensions.x, desc.dimensions.y, desc.type == TEXTURE_3D ? desc.dimensions.z : size * 2},
 						.format = GPU::format2wgpu(desc.format),
 						.mipLevelCount = static_cast<uint32_t>(std::log2(std::max(desc.dimensions.x, desc.dimensions.y)) + 1),
+						.sampleCount = desc.sampleCount,
 					};
 					texture = wgpuDeviceCreateTexture(queue->device, &d);
 				}{
@@ -736,7 +1000,7 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 	auto out = (GpuTexture*)queue->cpu_allocator(nullptr, sizeof(GpuTexture));
 	new(out) GpuTexture{.descriptor = desc, .range = range};
 	if(range) {
-		out->texture = std::get<WGPUTexture>((*monotextures)[range->_index]);
+		out->texture = std::get<WGPUTexture>((*monotextures)[range->index()]);
 		// TODO: Texture view?
 	} else { // If we are creating a purely bound texture rather than a lookup texture we are fine
 		WGPUTextureDescriptor d {
@@ -745,6 +1009,7 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 			.size = {desc.dimensions.x, desc.dimensions.y, desc.type == TEXTURE_3D ? desc.dimensions.z : desc.layerCount},
 			.format = GPU::format2wgpu(desc.format),
 			.mipLevelCount = static_cast<uint32_t>(std::log2(std::max(desc.dimensions.x, desc.dimensions.y)) + 1),
+			.sampleCount = desc.sampleCount,
 		};
 		out->texture = wgpuDeviceCreateTexture(queue->device, &d);
 		// TODO: Texture view?
@@ -756,11 +1021,12 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 
 GpuTextureDescriptor gpuTextureViewDescriptor(GpuQueue* queue, const GpuTexture* texture, const GpuViewDesc& desc) {
 	GpuTextureDescriptorImpl out {
-		.type = texture->descriptor.type,
+		.type = static_cast<uint8_t>(texture->descriptor.type),
+		.baseMip = desc.baseMip,
+		.mipCount = static_cast<uint8_t>(desc.mipCount == ALL_MIPS ? texture->descriptor.mipCount - desc.baseMip : desc.mipCount),
 		.width = texture->descriptor.dimensions.x,
 		.height = texture->descriptor.dimensions.y,
-		.baseMip = desc.baseMip,
-		.mipCount = desc.mipCount == ALL_MIPS ? texture->descriptor.mipCount - desc.baseMip : desc.mipCount,
+		.depth = texture->descriptor.dimensions.z,
 		.range = texture->range ? *texture->range : GpuQueue::MonotextureRange::INVALID
 	};
 	if(texture->range) {
@@ -890,6 +1156,9 @@ void update_render_pipeline(GpuQueue* queue, const GpuPipeline* pipeline, const 
 
 	WGPUFragmentState fragment {
 		.module = fragment_module,
+		// Undefined rather than left alone: a zeroed WGPUStringView is the empty string, which Dawn
+		// then goes looking for as an entry point name
+		.entryPoint = WGPU_STRING_VIEW_INIT,
 		.targetCount = targets.size(),
 		.targets = targets.data(),
 	};
@@ -1438,11 +1707,40 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap, bool n
 	// TODO: Should we add some validation to check that what is provided is a valid texture heap?
 	auto [dest_range, dest_offset, dest_addr] = GPU::detail::closest_buffer(cmd->queue, texture_heap, no_offsets);
 	dest_range.start += dest_offset;
-	dest_range.end -= dest_offset;
-	cmd->active_texture_heap = dest_range;
+	// dest_range.end -= dest_offset;
+
+	// The heap lives in a monobuffer, and group 0 binds every monobuffer as writable storage for
+	// compute. WebGPU refuses to have one buffer bound writable and read only in the same pass, so
+	// binding the heap out of the monobuffer directly would fail validation on the first dispatch.
+	//
+	// Copying instead of keeping a shadow buffer around: the heap is written through a raw mapped
+	// pointer, so there is no way to tell whether it changed since last time and a persistent buffer
+	// would have to re-copy on every activation anyway. A copy recorded here is also ordered in the
+	// command stream, so it picks up whatever the commands before it wrote into the heap, and two
+	// command buffers in flight with different heaps each get their own.
+	endCurrentPass(cmd); // A copy can't be recorded with a pass open
+
+	auto size = dest_range.size();
+	WGPUBufferDescriptor d {
+		.label = {"NoAPI Texture Heap", WGPU_STRLEN},
+		.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+		.size = size,
+	};
+	auto snapshot = wgpuDeviceCreateBuffer(cmd->queue->device, &d);
+	wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, cmd->queue->monobuffers[dest_range.buffer], dest_range.start, snapshot, 0, size);
+	cmd->queue->code_pending_submission_finished.emplace_back([snapshot](){ wgpuBufferRelease(snapshot); }, cmd->queue->next_submission_index);
+
+	cmd->active_texture_heap = snapshot;
+	cmd->active_texture_heap_size = size;
 }
 
 
+
+void gpuSetEnabledSamplersEXT(GpuCommandBuffer* cmd, std::span<GpuSamplerDesc> enabled_samplers) {
+	// Nothing is recorded into the encoder: the set only decides which group 3 (and which copy of the
+	// metadata buffer in group 0) the next dispatch or draw binds
+	cmd->sampler_set = GPU::detail::ensure_sampler_set(cmd->queue, enabled_samplers);
+}
 
 void gpuBarrier(GpuCommandBuffer* cmd, STAGE before, STAGE after, HAZARD_FLAGS hazards /* = (HAZARD_FLAGS)0 */) {
 	// TODO: I believe webgpu handles these internally... is there any reason to not make them noops?
@@ -1530,9 +1828,9 @@ WGPUBindGroup createBufferBindGroup(GpuCommandBuffer* cmd, const void* shader_da
 	if(cmd->active_texture_heap)
 		group0.push_back({
 			.binding = binding++,
-			.buffer = cmd->queue->monobuffers[cmd->active_texture_heap->buffer],
-			.offset = cmd->active_texture_heap->start,
-			.size = cmd->active_texture_heap->size()
+			.buffer = cmd->active_texture_heap,
+			.offset = 0,
+			.size = cmd->active_texture_heap_size
 		});
 	else group0.push_back({
 		.binding = binding++,
@@ -1540,6 +1838,16 @@ WGPUBindGroup createBufferBindGroup(GpuCommandBuffer* cmd, const void* shader_da
 		.offset = 0,
 		.size = 4
 	});
+
+	{
+		auto& sampler_set = cmd->sampler_set ? *cmd->sampler_set : *cmd->queue->default_sampler_set;
+		group0.push_back({
+			.binding = binding++,
+			.buffer = sampler_set.lookup_buffer,
+			.offset = 0,
+			.size = GPU::detail::sampler_lookup_size * sizeof(uint32_t)
+		});
+	}
 
 	{
 		WGPUBufferDescriptor d {
@@ -1579,14 +1887,18 @@ void bindGroups(GpuCommandBuffer* cmd, const void* shader_data, size_t shader_da
 	auto group0 = createBufferBindGroup(cmd, shader_data, shader_data_size, compute);
 	cmd->queue->code_pending_submission_finished.emplace_back([group0] { wgpuBindGroupRelease(group0); }, cmd->queue->next_submission_index);
 
+	auto group3 = (cmd->sampler_set ? cmd->sampler_set : cmd->queue->default_sampler_set)->bind_group;
+
 	if(compute) {
 		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 0, group0, 0, nullptr);
 		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 1, cmd->queue->current_bind_group1, 0, nullptr);
 		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 2, cmd->queue->current_bind_group2, 0, nullptr);
+		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 3, group3, 0, nullptr);
 	} else {
 		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 0, group0, 0, nullptr);
 		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 1, cmd->queue->current_bind_group1, 0, nullptr);
 		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 2, cmd->queue->current_bind_group2, 0, nullptr);
+		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 3, group3, 0, nullptr);
 	}
 }
 

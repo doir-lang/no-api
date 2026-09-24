@@ -374,7 +374,7 @@ fn cs_set_max() {
 
 	inline void pull_from_monobuffer(GpuQueue* queue, GpuQueue::MonobufferRange range, void* cpu) {
 		auto cmd = gpuStartCommandRecording(queue);
-		push_to_monobuffer(cmd, range, cpu);
+		pull_from_monobuffer(cmd, range, cpu);
 		auto submit_index = gpuSubmit(queue, {&cmd, 1});
 
 		// When we pull it seems much more likely that we want the cpu memory updated before considering our work "done"

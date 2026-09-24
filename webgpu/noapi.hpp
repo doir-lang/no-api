@@ -19,6 +19,18 @@
 
 #include <webgpu/webgpu.h>
 
+// Lets the list of samplers enabled by gpuSetEnabledSamplersEXT be used as a cache key.
+// Order matters: the position of a description in the list is the sampler slot it lands in.
+template<>
+struct std::hash<std::vector<GpuSamplerDesc>> {
+	size_t operator()(const std::vector<GpuSamplerDesc>& descs) const noexcept {
+		size_t out = descs.size();
+		for(auto& desc: descs)
+			out = out * 31 + desc.pack();
+		return out;
+	}
+};
+
 namespace GPU {
 #ifdef __cpp_lib_function_ref
 	template<typename T>
@@ -41,6 +53,12 @@ struct GpuWebGPUDefault {
 	WGPUSurface surface;
 };
 std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::function_t<WGPUSurface(WGPUInstance)> surface_loader, void(*error_callback)(void* queue, int type, std::string_view message) = GPU::default_::error_callback, bool prefer_high_power = true);
+
+// WebGPU can't index an array of samplers, so every slot gets its own binding and shaders pick
+// between them with a switch over the slot the lookup map handed back. Shaders are compiled against
+// however many slots exist, so this is the 16 maxSamplersPerShaderStage guarantees rather than
+// whatever a particular device offers.
+constexpr static uint32_t gpu_sampler_slot_count = 16;
 
 gpu* gpuEncodeWebGPUAddressEXT(uint8_t monobuffer, uint64_t address);
 std::pair<uint8_t, uint64_t> gpuDecodeWebGPUAddressEXT(gpu* addr);\
@@ -67,10 +85,13 @@ struct GpuQueue {
 	size_t next_submission_index = 1;
 	GpuSemaphore current_submission_timeline_semaphore;
 
+	// Group 0 has to fit inside maxStorageBuffersPerShaderStage, whose guaranteed minimum is 8.
+	// Five of those slots are monobuffers, the sixth is the active texture heap, and the seventh is
+	// the sampler lookup map (see SamplerSet::lookup_buffer).
 	size_t active_monobuffer_size = 0, active_monobuffer_capacity = 0;
 	WGPUBuffer empty_buffer = nullptr;
-	std::array<WGPUBuffer, 6> monobuffers;
-	std::array<size_t, 6> monobuffer_sizes;
+	std::array<WGPUBuffer, 5> monobuffers;
+	std::array<size_t, 5> monobuffer_sizes;
 	// static_assert(GpuQueue{}.monobuffers.size() == GpuQueue{}.monobuffer_sizes.size());
 	uint8_t active_monobuffer = 0;
 
@@ -170,6 +191,22 @@ struct GpuQueue {
 	WGPUBindGroup current_bind_group1 = nullptr;
 	WGPUBindGroupLayout current_bind_group_layout2 = nullptr; // 2 == sampled textures
 	WGPUBindGroup current_bind_group2 = nullptr;
+	WGPUBindGroupLayout current_bind_group_layout3 = nullptr; // 3 == samplers
+
+	// Everything gpuSetEnabledSamplersEXT produces for one list of enabled samplers. It is cached per
+	// queue (and pointed at by the command buffers that enabled it) so that alternating between two
+	// sampler sets doesn't rebuild either of them.
+	struct SamplerSet {
+		std::vector<WGPUSampler> samplers; // exactly gpu_sampler_slot_count of them, padded with the default
+		WGPUBindGroup bind_group = nullptr; // group 3
+
+		// Maps a packed GpuSamplerDesc onto the slot holding that sampler, or onto 0 (the default
+		// sampler) when it was never enabled. A pure function of which samplers are enabled, so it is
+		// a fixed size and gets written once, when the set is built.
+		WGPUBuffer lookup_buffer = nullptr;
+	};
+	std::unordered_map<std::vector<GpuSamplerDesc>, SamplerSet> sampler_cache;
+	SamplerSet* default_sampler_set = nullptr; // What a command buffer gets when it never enables any
 
 	WGPUBindGroupLayout current_compute_bind_group_layout0 = nullptr; // 0 == buffers
 	WGPUPipelineLayout current_compute_pipeline_layout = nullptr;
@@ -196,7 +233,14 @@ inline GpuQueue* gpuCreateQueue(GpuWebGPUDefault def, CpuAllocatorFunc allocator
 
 struct GpuCommandBuffer {
 	GpuQueue* queue;
-	std::optional<GpuQueue::MonobufferRange> active_texture_heap = {};
+
+	// A snapshot of the active texture heap rather than the monobuffer range it lives in: group 0
+	// binds every monobuffer writable for compute, and WebGPU won't have a buffer bound writable and
+	// read only in the same pass. See gpuSetActiveTextureHeapPtr.
+	WGPUBuffer active_texture_heap = nullptr;
+	size_t active_texture_heap_size = 0;
+
+	const GpuQueue::SamplerSet* sampler_set = nullptr; // Null means the queue's default_sampler_set
 	WGPUCommandEncoder encoder;
 	WGPUComputePassEncoder compute_pass = nullptr;
 	WGPURenderPassEncoder render_pass = nullptr;
@@ -227,12 +271,20 @@ struct GpuTexture {
 	WGPUTexture texture;
 };
 
+// The 256 bits behind a GpuTextureDescriptor. Everything a shader needs to sample the texture:
+// which monotexture holds it, which layers of it are the view's, how big the texture itself is (the
+// monotexture is bigger, and WGSL can report its size on its own), and which mips are in range.
+//
+// type, baseMip and mipCount share a word. None of them needs more than a byte, and the space buys
+// depth, without which a 3D view couldn't scale its coordinates.
 struct GpuTextureDescriptorImpl {
-	TEXTURE type = TEXTURE_2D; ///< Dimensionality and view type.
-	uint32_t width = 1, height = 1; ///< Dimensions in texels.
-	uint32_t baseMip = 0;
-	uint32_t mipCount = 1;
+	uint8_t type = TEXTURE_2D; ///< Dimensionality and view type (a TEXTURE).
+	uint8_t baseMip = 0; ///< First mip level the view covers.
+	uint8_t mipCount = 1; ///< Number of mip levels it covers.
+	uint8_t _reserved0 = 0;
+	uint32_t width = 1, height = 1, depth = 1; ///< The texture's own dimensions in texels.
 	GpuQueue::MonotextureRange range;
+	uint32_t _reserved1 = 0;
 };
 static_assert(sizeof(GpuTextureDescriptorImpl) == sizeof(GpuTextureDescriptor), "GPU Texture Descriptors of The Wrong Size");
 

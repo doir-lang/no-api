@@ -1069,8 +1069,11 @@ void gpuSetEnabledSamplersEXT(GpuCommandBuffer* cmd, std::span<GpuSamplerDesc> e
 	if(!cmd->queue->sampler_cache.contains(enabled_samplers)) {
 		auto& sampler_mapping = cmd->queue->sampler_cache[enabled_samplers];
 
-		uint32_t* sampler_mapping_cpu = gpuMalloc<uint32_t>(cmd->queue, GpuSamplerDesc::max_packed());
-		std::memset(sampler_mapping_cpu, 0, GpuSamplerDesc::max_packed() * sizeof(uint32_t));
+		// max_packed() is a valid index (it is what the default sampler packs to), so the map needs
+		// one word per value in [0, max_packed()]
+		constexpr static auto sampler_lookup_size = GpuSamplerDesc::max_packed() + 1;
+		uint32_t* sampler_mapping_cpu = gpuMalloc<uint32_t>(cmd->queue, sampler_lookup_size);
+		std::memset(sampler_mapping_cpu, 0, sampler_lookup_size * sizeof(uint32_t));
 		for(size_t i = 0; i < enabled_samplers.size(); ++i)
 			sampler_mapping_cpu[enabled_samplers[i].pack()] = i;
 		sampler_mapping = (VkDeviceAddress)gpuHostToDevicePointer(cmd->queue, sampler_mapping_cpu);
