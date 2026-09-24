@@ -136,6 +136,20 @@ struct GpuQueue {
 	VkSemaphore command_submission_timeline_semaphore = VK_NULL_HANDLE;
 	uint64_t command_submission_timeline_semaphore_next_value = 1;
 	std::vector<std::pair<VkCommandBuffer, uint64_t>> command_buffers_pending_free;
+
+	// gpuBlitTextureEXT's internal pipeline. It samples one texture into another and binds nothing
+	// else, so rather than going through the descriptor heap every other pipeline here uses it keeps
+	// a classic combined image sampler layout of its own, built lazily on the first blit.
+	std::array<VkShaderModule, 2> blit_shader_modules = {}; // vertex, fragment
+	VkDescriptorSetLayout blit_descriptor_set_layout = VK_NULL_HANDLE;
+	VkPipelineLayout blit_pipeline_layout = VK_NULL_HANDLE;
+	std::array<VkSampler, 2> blit_samplers = {}; // indexed by "linear"
+	std::unordered_map<uint64_t, VkPipeline> blit_pipelines; // keyed by destination VkFormat
+	std::vector<VkDescriptorPool> blit_descriptor_pools;
+	// Sets and views are recycled (or destroyed) once the submission that referenced them has finished
+	std::vector<VkDescriptorSet> blit_descriptor_sets_free;
+	std::vector<std::pair<VkDescriptorSet, uint64_t>> blit_descriptor_sets_in_flight;
+	std::vector<std::pair<VkImageView, uint64_t>> blit_views_in_flight;
 };
 GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue = VK_NULL_HANDLE, uint32_t queue_family = -1, bool is_graphics_queue = true, CpuAllocatorFunc allocator = default_::cpu_allocator, VkAllocationCallbacks* callbacks = nullptr);
 inline GpuQueue* gpuCreateQueue(const GpuVulkanDefault& vulkan, CpuAllocatorFunc allocator = default_::cpu_allocator, VkAllocationCallbacks* callbacks = nullptr) {

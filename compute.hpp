@@ -742,6 +742,44 @@ void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, GpuTexture* te
  */
 void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, const GpuTexture* texture, bool no_offsets = false);
 
+/**
+ * gpuBlitTextureEXT – Copy one texture subresource onto another by sampling it in a
+ * small internal fullscreen pass.
+ *
+ * Unlike the copies above this goes through the rasterizer rather than the copy engine,
+ * so the two subresources may differ in size (the source is rescaled by the sampler) and
+ * in format (the color is converted on the way out). The whole of the destination mip is
+ * written, and its previous contents are discarded. The pipeline and sampler it needs are
+ * internal to the backend and built the first time they are asked for; none of the state
+ * the command buffer had bound is disturbed.
+ *
+ * The source must have been created with USAGE_SAMPLED and the destination with
+ * USAGE_COLOR_ATTACHMENT. Only color formats are supported — depth/stencil textures need
+ * the copy engine or a shader written against the depth sampling intrinsics. 3D textures
+ * can't be addressed a slice at a time; blit out of a 2D array instead.
+ *
+ * Because it rasterizes, this is the one command here that a compute-only queue cannot
+ * record, and it must not be recorded inside a render pass — it opens one of its own.
+ *
+ * Does NOT insert an automatic barrier on either side. If the source was just written by
+ * a compute pass, or the destination is about to be sampled, call gpuBarrier as usual.
+ *
+ * @param cmd Command buffer to record into.
+ * @param destination Texture rendered into.
+ * @param source Texture sampled from.
+ * @param linear_filter When true the source is sampled bilinearly, otherwise the nearest
+ * texel is taken. Formats a sampler can't filter (the 32-bit float ones) always fall back
+ * to nearest.
+ * @param destination_mip Mip level rendered into.
+ * @param destination_slice Array layer / cube face rendered into.
+ * @param source_mip Mip level sampled from.
+ * @param source_slice Array layer / cube face sampled from.
+ */
+void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const GpuTexture* source,
+	bool linear_filter = true,
+	uint32_t destination_mip = 0, uint32_t destination_slice = 0,
+	uint32_t source_mip = 0, uint32_t source_slice = 0);
+
 // ---------------------------------------------------------------------------
 // GPU commands – texture heap
 // ---------------------------------------------------------------------------

@@ -387,6 +387,15 @@ GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limi
 void gpuFreeQueue(GpuQueue* queue) {
 	GPU::semaphore_destroy(queue->current_submission_timeline_semaphore);
 
+	for(auto [_key, pipeline]: queue->blit_pipelines)
+		wgpuRenderPipelineRelease(pipeline);
+	for(size_t i = 0; i < queue->blit_bind_group_layouts.size(); ++i) {
+		if(queue->blit_samplers[i]) wgpuSamplerRelease(queue->blit_samplers[i]);
+		if(queue->blit_pipeline_layouts[i]) wgpuPipelineLayoutRelease(queue->blit_pipeline_layouts[i]);
+		if(queue->blit_bind_group_layouts[i]) wgpuBindGroupLayoutRelease(queue->blit_bind_group_layouts[i]);
+	}
+	if(queue->blit_shader) wgpuShaderModuleRelease(queue->blit_shader);
+
 	auto allocator = queue->cpu_allocator;
 	queue->~GpuQueue();
 	allocator(queue, 0);
@@ -1182,6 +1191,162 @@ namespace GPU::detail {
 	}
 }
 
+namespace GPU::detail {
+	// Bytes per texel for the uncompressed, single plane formats the API exposes
+	inline uint32_t format_bytes(FORMAT format) {
+		switch (format) {
+		case FORMAT_R8_UNORM: return 1;
+		case FORMAT_R16_FLOAT:
+		case FORMAT_D16_UNORM: return 2;
+		case FORMAT_RGBA8_UNORM:
+		case FORMAT_RGBA8_SRGB:
+		case FORMAT_RG11B10_FLOAT:
+		case FORMAT_RGB10_A2_UNORM:
+		case FORMAT_R32_FLOAT:
+		case FORMAT_D24_UNORM_S8_UINT:
+		case FORMAT_D32_FLOAT: return 4;
+		case FORMAT_RGBA16_FLOAT:
+		case FORMAT_D32_FLOAT_S8_UINT: return 8;
+		case FORMAT_RGBA32_FLOAT: return 16;
+		default: return 0;
+		}
+	}
+
+	// The extent of the monotexture slot a texture sits in, at one mip level. A monotexture is
+	// sized by the first texture to land in its bucket and the bucket keys on power of two rounded
+	// dimensions, so a later, smaller texture only covers the top left corner of its slot. Both
+	// round up to the same power of two, so a slot is never as much as twice the image.
+	inline uvec2 monotexture_slot_extent(const GpuTexture* texture, uint32_t mip) {
+		return {
+			std::max(wgpuTextureGetWidth(texture->texture) >> mip, 1u),
+			std::max(wgpuTextureGetHeight(texture->texture) >> mip, 1u)
+		};
+	}
+
+	// Replicates a freshly uploaded texture's right and bottom edges across the rest of its slot.
+	// Whatever the gap holds is otherwise undefined, and it gets sampled the moment normalized
+	// coordinates run past the image or the sampler filters across its last row or column.
+	//
+	// The replication has to come out of the same staging buffer the upload did: WebGPU rejects a
+	// texture to texture copy whose source and destination are the same mip of the same layer, so
+	// the texture can't be used to widen itself.
+	//
+	// Naming bytesPerRow at all forces it to be 256 byte aligned, so every copy that can get away
+	// with leaving it undefined does — that is any copy of a single row of a single layer, which
+	// covers all of this but the one strip that has to walk down the image.
+	inline void pad_monotexture_slot(GpuCommandBuffer* cmd, const GpuTexture* texture,
+			WGPUBuffer buffer, uint64_t base, uint32_t layer, uint32_t layers) {
+		const uint32_t width = texture->descriptor.dimensions.x, height = texture->descriptor.dimensions.y;
+		auto slot = monotexture_slot_extent(texture, 0);
+		const uint32_t gap_x = slot.x > width ? slot.x - width : 0;
+		const uint32_t gap_y = slot.y > height ? slot.y - height : 0;
+		if(!gap_x && !gap_y) return;
+
+		const uint32_t bytes = format_bytes(texture->descriptor.format);
+		const uint64_t row = uint64_t(width) * bytes;
+		const uint64_t image = row * height; // What one array layer of the staging data spans
+
+		WGPUTexelCopyTextureInfo destination {
+			.texture = texture->texture,
+			.mipLevel = 0,
+			.aspect = WGPUTextureAspect_All,
+		};
+
+		// The last column, stretched across every column the image doesn't reach. This is the only
+		// strip that spans rows, so it is the only one carrying the upload's row alignment.
+		for(uint32_t x = width; x < slot.x; ++x) {
+			WGPUTexelCopyBufferInfo source {
+				.layout = {
+					.offset = base + uint64_t(width - 1) * bytes,
+					.bytesPerRow = static_cast<uint32_t>(row),
+					.rowsPerImage = height,
+				},
+				.buffer = buffer,
+			};
+			destination.origin = {x, 0, layer};
+			WGPUExtent3D size {1, height, layers};
+			wgpuCommandEncoderCopyBufferToTexture(cmd->encoder, &source, &destination, &size);
+		}
+
+		// The last row, stretched down every row the image doesn't reach. Each layer keeps its own
+		// last row, so they are written one at a time rather than strided over in a single copy.
+		for(uint32_t l = 0; l < layers; ++l)
+			for(uint32_t y = height; y < slot.y; ++y) {
+				WGPUTexelCopyBufferInfo source {
+					.layout = {
+						.offset = base + l * image + (height - 1) * row,
+						.bytesPerRow = WGPU_COPY_STRIDE_UNDEFINED,
+						.rowsPerImage = WGPU_COPY_STRIDE_UNDEFINED,
+					},
+					.buffer = buffer,
+				};
+				destination.origin = {0, y, layer + l};
+				WGPUExtent3D size {width, 1, 1};
+				wgpuCommandEncoderCopyBufferToTexture(cmd->encoder, &source, &destination, &size);
+			}
+
+		if(!gap_x || !gap_y) return;
+
+		// Where the two gaps meet every texel is the image's bottom right one. Copying it out of the
+		// staging buffer directly would cost a command per texel, so each layer's corner texel is
+		// first smeared across a scratch row that its remaining rows fill from in one command each.
+		const bool alignable = bytes % 4 == 0 && (base + (height - 1) * row + uint64_t(width - 1) * bytes) % 4 == 0 && image % 4 == 0;
+		if(alignable) {
+			WGPUBufferDescriptor scratch_desc {
+				.label = {"NoAPI Monotexture Corner", WGPU_STRLEN},
+				.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst,
+				.size = uint64_t(gap_x) * bytes * layers,
+			};
+			auto scratch = wgpuDeviceCreateBuffer(cmd->queue->device, &scratch_desc);
+			cmd->queue->code_pending_submission_finished.emplace_back([scratch] {
+				wgpuBufferRelease(scratch);
+			}, cmd->queue->next_submission_index);
+
+			for(uint32_t l = 0; l < layers; ++l) {
+				auto corner = base + l * image + (height - 1) * row + uint64_t(width - 1) * bytes;
+				for(uint32_t i = 0; i < gap_x; ++i)
+					wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, buffer, corner,
+						scratch, (uint64_t(l) * gap_x + i) * bytes, bytes);
+			}
+
+			for(uint32_t l = 0; l < layers; ++l)
+				for(uint32_t y = height; y < slot.y; ++y) {
+					WGPUTexelCopyBufferInfo source {
+						.layout = {
+							.offset = uint64_t(l) * gap_x * bytes,
+							.bytesPerRow = WGPU_COPY_STRIDE_UNDEFINED,
+							.rowsPerImage = WGPU_COPY_STRIDE_UNDEFINED,
+						},
+						.buffer = scratch,
+					};
+					destination.origin = {width, y, layer + l};
+					WGPUExtent3D size {gap_x, 1, 1};
+					wgpuCommandEncoderCopyBufferToTexture(cmd->encoder, &source, &destination, &size);
+				}
+		} else {
+			// A buffer to buffer copy has to be 4 byte aligned, which the narrow formats can't
+			// promise, so those fall back to writing the corner a texel at a time
+			for(uint32_t l = 0; l < layers; ++l) {
+				auto corner = base + l * image + (height - 1) * row + uint64_t(width - 1) * bytes;
+				for(uint32_t y = height; y < slot.y; ++y)
+					for(uint32_t x = width; x < slot.x; ++x) {
+						WGPUTexelCopyBufferInfo source {
+							.layout = {
+								.offset = corner,
+								.bytesPerRow = WGPU_COPY_STRIDE_UNDEFINED,
+								.rowsPerImage = WGPU_COPY_STRIDE_UNDEFINED,
+							},
+							.buffer = buffer,
+						};
+						destination.origin = {x, y, layer + l};
+						WGPUExtent3D size {1, 1, 1};
+						wgpuCommandEncoderCopyBufferToTexture(cmd->encoder, &source, &destination, &size);
+					}
+			}
+		}
+	}
+}
+
 void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes, bool no_offsets /* = false */) {
 	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_, no_offsets);
 	auto [dest_range, dest_offset, dest_addr] = dest; auto [src_range, src_offset, src_addr] = src;
@@ -1208,10 +1373,11 @@ void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* 
 
 	assert(cmd->queue->gpu2textures[dest_addr] == texture);
 
+	auto base = static_cast<uint64_t>(src_range.start + src_offset);
 	WGPUTexelCopyBufferInfo source {
 		.layout = {
-			.offset = static_cast<uint64_t>(src_range.start + src_offset),
-			.bytesPerRow = texture->descriptor.dimensions.x * texture->descriptor.format,
+			.offset = base,
+			.bytesPerRow = texture->descriptor.dimensions.x * GPU::detail::format_bytes(texture->descriptor.format),
 			.rowsPerImage = texture->descriptor.dimensions.y,
 		},
 		.buffer = cmd->queue->monobuffers[src_range.buffer],
@@ -1226,9 +1392,14 @@ void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* 
 	WGPUExtent3D size {
 		.width = texture->descriptor.dimensions.x,
 		.height = texture->descriptor.dimensions.y,
-		.depthOrArrayLayers = texture->range ? texture->range->start - texture->range->end : texture->descriptor.dimensions.z
+		.depthOrArrayLayers = texture->range ? texture->range->end - texture->range->start : texture->descriptor.dimensions.z
 	};
 	wgpuCommandEncoderCopyBufferToTexture(cmd->encoder, &source, &destination, &size);
+
+	// The texture may not fill the slot it was handed in its monotexture, and the gap would
+	// otherwise be sampled as undefined data the moment a coordinate ran past the image
+	if(texture->range)
+		GPU::detail::pad_monotexture_slot(cmd, texture, source.buffer, base, destination.origin.z, size.depthOrArrayLayers);
 }
 
 // TODO: Untested!
@@ -1575,6 +1746,275 @@ void gpuBeginRenderPass(GpuCommandBuffer* cmd, const GpuRenderPassDesc& desc) {
 void gpuEndRenderPass(GpuCommandBuffer* cmd, std::optional<const GpuRenderPassDesc> desc /* = {} */) {
 	// The descriptor is only needed by backends that transition images by hand, WebGPU tracks that itself
 	endRenderPass(cmd);
+}
+
+
+
+namespace GPU::detail {
+	// The blit's fullscreen triangle. Both bind group layout flavors compile this same module; they
+	// only differ in the sampler and texture types they declare, which the WGSL never names.
+	constexpr static std::string_view BLIT_WGSL_CODE = R"WGSL(
+@group(0) @binding(0) var blit_source : texture_2d<f32>;
+@group(0) @binding(1) var blit_sampler : sampler;
+// xy = the viewport's size over the destination image's, so that uv reaches 1 exactly at the
+// image's edge even when the viewport was opened up to cover the rest of a monotexture slot
+@group(0) @binding(2) var<uniform> blit_uv_scale : vec4<f32>;
+
+struct Varyings {
+	@builtin(position) position : vec4<f32>,
+	@location(0) uv : vec2<f32>,
+}
+
+@vertex
+fn vertex(@builtin(vertex_index) index : u32) -> Varyings {
+	// An oversized triangle covering the whole viewport, its uvs run 0..1 across the covered area
+	let uv = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
+	return Varyings(
+		// WebGPU's clip space puts +Y at the top of the viewport, but v = 0 is the top texel row
+		vec4<f32>(uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0),
+		uv * blit_uv_scale.xy
+	);
+}
+
+@fragment
+fn fragment(varyings : Varyings) -> @location(0) vec4<f32> {
+	// The view covers a single mip, so there is never another level to pick between
+	return textureSampleLevel(blit_source, blit_sampler, varyings.uv, 0.0);
+}
+)WGSL";
+
+	// A WebGPU sampler can only interpolate between texels of a filterable format, and the 32 bit
+	// float ones only become filterable with an optional feature we never ask the device for
+	inline bool format_is_filterable(FORMAT format) {
+		return !(format == FORMAT_R32_FLOAT || format == FORMAT_RGBA32_FLOAT);
+	}
+
+	inline void ensure_blit_layouts(GpuQueue* queue, bool filtering) {
+		if(queue->blit_bind_group_layouts[filtering]) return;
+
+		std::array<WGPUBindGroupLayoutEntry, 3> entries = {
+			WGPUBindGroupLayoutEntry{
+				.binding = 0,
+				.visibility = WGPUShaderStage_Fragment,
+				.texture = {
+					.sampleType = filtering ? WGPUTextureSampleType_Float : WGPUTextureSampleType_UnfilterableFloat,
+					.viewDimension = WGPUTextureViewDimension_2D,
+					.multisampled = false,
+				}
+			}, WGPUBindGroupLayoutEntry{
+				.binding = 1,
+				.visibility = WGPUShaderStage_Fragment,
+				.sampler = {
+					.type = filtering ? WGPUSamplerBindingType_Filtering : WGPUSamplerBindingType_NonFiltering,
+				}
+			}, WGPUBindGroupLayoutEntry{
+				.binding = 2,
+				.visibility = WGPUShaderStage_Vertex,
+				.buffer = {
+					.type = WGPUBufferBindingType_Uniform,
+					.minBindingSize = sizeof(float) * 4,
+				}
+			}
+		};
+
+		WGPUBindGroupLayoutDescriptor layout {
+			.label = {"NoAPI Blit", WGPU_STRLEN},
+			.entryCount = entries.size(),
+			.entries = entries.data(),
+		};
+		queue->blit_bind_group_layouts[filtering] = wgpuDeviceCreateBindGroupLayout(queue->device, &layout);
+
+		WGPUPipelineLayoutDescriptor pipeline_layout {
+			.label = {"NoAPI Blit", WGPU_STRLEN},
+			.bindGroupLayoutCount = 1,
+			.bindGroupLayouts = &queue->blit_bind_group_layouts[filtering],
+		};
+		queue->blit_pipeline_layouts[filtering] = wgpuDeviceCreatePipelineLayout(queue->device, &pipeline_layout);
+
+		WGPUSamplerDescriptor sampler {
+			.label = {"NoAPI Blit", WGPU_STRLEN},
+			.addressModeU = WGPUAddressMode_ClampToEdge,
+			.addressModeV = WGPUAddressMode_ClampToEdge,
+			.addressModeW = WGPUAddressMode_ClampToEdge,
+			.magFilter = filtering ? WGPUFilterMode_Linear : WGPUFilterMode_Nearest,
+			.minFilter = filtering ? WGPUFilterMode_Linear : WGPUFilterMode_Nearest,
+			.mipmapFilter = WGPUMipmapFilterMode_Nearest,
+			.lodMinClamp = 0,
+			.lodMaxClamp = 1,
+			.maxAnisotropy = 1,
+		};
+		queue->blit_samplers[filtering] = wgpuDeviceCreateSampler(queue->device, &sampler);
+	}
+
+	// The destination format is baked into a WebGPU PSO and the sampler type into its layout, so one
+	// pipeline is kept per (format, filtering) pair for the lifetime of the queue
+	inline WGPURenderPipeline blit_pipeline(GpuQueue* queue, WGPUTextureFormat format, bool filtering) {
+		auto key = static_cast<uint64_t>(format) << 1 | filtering;
+		if(auto found = queue->blit_pipelines.find(key); found != queue->blit_pipelines.end())
+			return found->second;
+
+		ensure_blit_layouts(queue, filtering);
+
+		if(!queue->blit_shader) {
+			WGPUShaderSourceWGSL source {
+				.chain = {.sType = WGPUSType_ShaderSourceWGSL},
+				.code = {BLIT_WGSL_CODE.data(), BLIT_WGSL_CODE.size()}
+			};
+			WGPUShaderModuleDescriptor module {
+				.nextInChain = &source.chain,
+				.label = {"NoAPI Blit", WGPU_STRLEN},
+			};
+			queue->blit_shader = wgpuDeviceCreateShaderModule(queue->device, &module);
+		}
+
+		WGPUColorTargetState target {
+			.format = format,
+			.writeMask = WGPUColorWriteMask_All,
+		};
+		WGPUFragmentState fragment {
+			.module = queue->blit_shader,
+			.entryPoint = {"fragment", WGPU_STRLEN},
+			.targetCount = 1,
+			.targets = &target,
+		};
+		WGPURenderPipelineDescriptor d {
+			.label = {"NoAPI Blit", WGPU_STRLEN},
+			.layout = queue->blit_pipeline_layouts[filtering],
+			.vertex = {
+				.module = queue->blit_shader,
+				.entryPoint = {"vertex", WGPU_STRLEN},
+			},
+			.primitive = {
+				.topology = WGPUPrimitiveTopology_TriangleList,
+				.stripIndexFormat = WGPUIndexFormat_Undefined,
+				.frontFace = WGPUFrontFace_CCW,
+				.cullMode = WGPUCullMode_None,
+			},
+			.multisample = {
+				.count = 1,
+				.mask = 0xFFFFFFFF,
+			},
+			.fragment = &fragment,
+		};
+
+		auto pipeline = wgpuDeviceCreateRenderPipeline(queue->device, &d);
+		queue->blit_pipelines[key] = pipeline;
+		return pipeline;
+	}
+
+}
+
+void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const GpuTexture* source,
+		bool linear_filter /* = true */,
+		uint32_t destination_mip /* = 0 */, uint32_t destination_slice /* = 0 */,
+		uint32_t source_mip /* = 0 */, uint32_t source_slice /* = 0 */) {
+	assert(!cmd->render_pass && "A blit opens a render pass of its own, so it can't be recorded inside another one");
+	assert((source->descriptor.usage & USAGE_SAMPLED) && "The blit source must have been created with USAGE_SAMPLED");
+	assert((destination->descriptor.usage & USAGE_COLOR_ATTACHMENT) && "The blit destination must have been created with USAGE_COLOR_ATTACHMENT");
+	assert(!gpuFormatIsDepth(source->descriptor.format) && !gpuFormatIsDepth(destination->descriptor.format) && "Depth/stencil textures can't be blitted");
+	assert(source->descriptor.type != TEXTURE_3D && "A slice of a 3D texture can't be bound on its own, blit out of a 2D array instead");
+	assert(source_mip < source->descriptor.mipCount && destination_mip < destination->descriptor.mipCount);
+
+	endComputePass(cmd);
+
+	// The source is only ever read through a single mip of a single layer, which is what lets the
+	// shader stay a plain texture_2d no matter what the texture it came from actually is
+	WGPUTextureViewDescriptor view {
+		.label = {"NoAPI Blit Source", WGPU_STRLEN},
+		.format = GPU::format2wgpu(source->descriptor.format),
+		.dimension = WGPUTextureViewDimension_2D,
+		.baseMipLevel = source_mip,
+		.mipLevelCount = 1,
+		// Textures backed by a monotexture live at an offset into its array layers
+		.baseArrayLayer = (source->range ? source->range->start : 0) + source_slice,
+		.arrayLayerCount = 1,
+		.aspect = WGPUTextureAspect_All,
+		.usage = WGPUTextureUsage_TextureBinding,
+	};
+	auto source_view = wgpuTextureCreateView(source->texture, &view);
+	cmd->queue->code_pending_submission_finished.emplace_back([source_view] {
+		wgpuTextureViewRelease(source_view);
+	}, cmd->queue->next_submission_index);
+
+	// Building the pipeline is what brings the matching layout and sampler into existence
+	bool filtering = linear_filter && GPU::detail::format_is_filterable(source->descriptor.format);
+	auto pipeline = GPU::detail::blit_pipeline(cmd->queue, GPU::format2wgpu(destination->descriptor.format), filtering);
+
+	// The viewport is opened up to the whole monotexture slot so that fragments exist past the
+	// destination image, and the uv scale keeps uv = 1 sitting exactly on the image's edge. Those
+	// outer fragments therefore sample above 1, where the blit sampler's clamped addressing
+	// replicates the edge texels into the gap, covering it in the same draw.
+	auto extent = GPU::detail::attachment_extent(destination, destination_mip);
+	auto slot = GPU::detail::monotexture_slot_extent(destination, destination_mip);
+
+	float uv_scale[4] = {
+		static_cast<float>(slot.x) / extent.x,
+		static_cast<float>(slot.y) / extent.y,
+		0, 0,
+	};
+	WGPUBufferDescriptor scale_desc {
+		.label = {"NoAPI Blit UV Scale", WGPU_STRLEN},
+		.usage = WGPUBufferUsage_Uniform,
+		.size = sizeof(uv_scale),
+		.mappedAtCreation = true,
+	};
+	auto scale_buffer = wgpuDeviceCreateBuffer(cmd->queue->device, &scale_desc);
+	memcpy(wgpuBufferGetMappedRange(scale_buffer, 0, scale_desc.size), uv_scale, sizeof(uv_scale));
+	wgpuBufferUnmap(scale_buffer);
+	cmd->queue->code_pending_submission_finished.emplace_back([scale_buffer] {
+		wgpuBufferRelease(scale_buffer);
+	}, cmd->queue->next_submission_index);
+
+	std::array<WGPUBindGroupEntry, 3> entries = {
+		WGPUBindGroupEntry{
+			.binding = 0,
+			.textureView = source_view,
+		}, WGPUBindGroupEntry{
+			.binding = 1,
+			.sampler = cmd->queue->blit_samplers[filtering],
+		}, WGPUBindGroupEntry{
+			.binding = 2,
+			.buffer = scale_buffer,
+			.offset = 0,
+			.size = sizeof(uv_scale),
+		}
+	};
+	WGPUBindGroupDescriptor group_desc {
+		.label = {"NoAPI Blit", WGPU_STRLEN},
+		.layout = cmd->queue->blit_bind_group_layouts[filtering],
+		.entryCount = entries.size(),
+		.entries = entries.data(),
+	};
+	auto group = wgpuDeviceCreateBindGroup(cmd->queue->device, &group_desc);
+	cmd->queue->code_pending_submission_finished.emplace_back([group] {
+		wgpuBindGroupRelease(group);
+	}, cmd->queue->next_submission_index);
+
+	WGPURenderPassColorAttachment attachment {
+		.view = GPU::detail::attachment_view(cmd, destination, destination_mip, destination_slice),
+		// Only a view into a 3D texture picks the written slice here, everything else selected it as an array layer
+		.depthSlice = destination->descriptor.type == TEXTURE_3D ? destination_slice : WGPU_DEPTH_SLICE_UNDEFINED,
+		// The draw covers the whole mip, so there is never anything worth loading back in first
+		.loadOp = WGPULoadOp_Clear,
+		.storeOp = WGPUStoreOp_Store,
+		.clearValue = {0, 0, 0, 0},
+	};
+	WGPURenderPassDescriptor pass_desc {
+		.label = {"NoAPI Blit", WGPU_STRLEN},
+		.colorAttachmentCount = 1,
+		.colorAttachments = &attachment,
+	};
+
+	// A pass of its own rather than cmd->render_pass, so nothing the command buffer had bound for
+	// the user's rendering is disturbed (a WebGPU pass owns every piece of state set on it)
+	auto pass = wgpuCommandEncoderBeginRenderPass(cmd->encoder, &pass_desc);
+	wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+	wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr);
+	wgpuRenderPassEncoderSetViewport(pass, 0, 0, slot.x, slot.y, 0, 1);
+	wgpuRenderPassEncoderSetScissorRect(pass, 0, 0, slot.x, slot.y);
+	wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+	wgpuRenderPassEncoderEnd(pass);
+	wgpuRenderPassEncoderRelease(pass);
 }
 
 

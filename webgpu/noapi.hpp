@@ -176,6 +176,17 @@ struct GpuQueue {
 
 	WGPUBindGroupLayout current_graphics_bind_group_layout0 = nullptr; // 0 == buffers
 	WGPUPipelineLayout current_graphics_pipeline_layout = nullptr;
+
+	// gpuBlitTextureEXT's internal pipeline. It binds nothing the rest of the API knows about
+	// (just the source texture, a sampler, and the sampled rectangle), so it gets its own layouts
+	// and is built lazily the first time a blit is recorded. Everything indexed by "filtering"
+	// exists in a filtering and a non-filtering flavor, since WebGPU refuses to let a filtering
+	// sampler touch a texture whose format it can't interpolate.
+	WGPUShaderModule blit_shader = nullptr;
+	std::array<WGPUBindGroupLayout, 2> blit_bind_group_layouts = {};
+	std::array<WGPUPipelineLayout, 2> blit_pipeline_layouts = {};
+	std::array<WGPUSampler, 2> blit_samplers = {};
+	std::unordered_map<uint64_t, WGPURenderPipeline> blit_pipelines; // keyed by destination format and filtering
 };
 
 GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limits, CpuAllocatorFunc allocator = default_::cpu_allocator);

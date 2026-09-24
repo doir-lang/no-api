@@ -10,6 +10,11 @@
 #include <VkBootstrap.h>
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added
 
+// gpuBlitTextureEXT compiles its (tiny, fixed) GLSL at runtime rather than shipping a SPIR-V blob
+#include <glslang/Public/ShaderLang.h>
+#include <glslang/Public/ResourceLimits.h>
+#include <glslang/SPIRV/GlslangToSpv.h>
+
 #include <cassert>
 #include <cerrno>
 #include <cstdint>
@@ -284,6 +289,21 @@ void gpuFreeQueue(GpuQueue* queue) {
 
 	for(auto [_, buffer]: queue->sampler_cache)
 		gpuFree(queue, (gpu*)buffer);
+
+	for(auto [_view, _submit]: queue->blit_views_in_flight)
+		vkDestroyImageView(queue->device, _view, queue->callbacks);
+	for(auto [_key, pipeline]: queue->blit_pipelines)
+		vkDestroyPipeline(queue->device, pipeline, queue->callbacks);
+	for(auto pool: queue->blit_descriptor_pools)
+		vkDestroyDescriptorPool(queue->device, pool, queue->callbacks);
+	for(auto sampler: queue->blit_samplers)
+		if(sampler) vkDestroySampler(queue->device, sampler, queue->callbacks);
+	for(auto module: queue->blit_shader_modules)
+		if(module) vkDestroyShaderModule(queue->device, module, queue->callbacks);
+	if(queue->blit_pipeline_layout)
+		vkDestroyPipelineLayout(queue->device, queue->blit_pipeline_layout, queue->callbacks);
+	if(queue->blit_descriptor_set_layout)
+		vkDestroyDescriptorSetLayout(queue->device, queue->blit_descriptor_set_layout, queue->callbacks);
 
 	if(queue->gpu_allocator)
 		vmaDestroyAllocator(queue->gpu_allocator);
@@ -1702,6 +1722,426 @@ void gpuEndRenderPass(GpuCommandBuffer* cmd, std::optional<const GpuRenderPassDe
 	cmd->state = GpuCommandBuffer::Recording;
 }
 
+
+
+
+namespace GPU::detail {
+
+	constexpr static std::string_view BLIT_VERTEX_SHADER = R"(
+#version 460
+
+layout(location = 0) out vec2 out_uv;
+
+void main() {
+	// An oversized triangle covering the whole viewport, its uvs run 0..1 across the covered area
+	vec2 uv = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
+	// Vulkan's clip space puts -Y at the top of the viewport, which is also where v = 0 sits
+	gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+	out_uv = uv;
+}
+)";
+
+	constexpr static std::string_view BLIT_FRAGMENT_SHADER = R"(
+#version 460
+
+layout(set = 0, binding = 0) uniform sampler2D blit_source;
+
+layout(location = 0) in vec2 in_uv;
+layout(location = 0) out vec4 out_color;
+
+void main() {
+	// The view covers a single mip, so there is never another level to pick between
+	out_color = textureLod(blit_source, in_uv, 0.0);
+}
+)";
+
+	inline std::vector<uint32_t> compile_glsl(EShLanguage stage, std::string_view source) {
+		static const bool initialized = []{ glslang::InitializeProcess(); return true; }();
+		(void)initialized;
+
+		auto data = source.data();
+		int length = source.size();
+
+		glslang::TShader shader(stage);
+		shader.setStringsWithLengths(&data, &length, 1);
+		shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 460);
+		shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_3);
+		shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_6);
+
+		if(!shader.parse(GetDefaultResources(), 460, false, EShMsgDefault)) {
+			assert(false && "The internal blit shader failed to compile");
+			return {};
+		}
+
+		glslang::TProgram program;
+		program.addShader(&shader);
+		if(!program.link(EShMsgDefault)) {
+			assert(false && "The internal blit shader failed to link");
+			return {};
+		}
+
+		std::vector<uint32_t> spirv;
+		glslang::GlslangToSpv(*program.getIntermediate(stage), spirv);
+		return spirv;
+	}
+
+	// The descriptor set layout, the pipeline layout, the shader modules, and the two samplers are
+	// all format independent, so they are built once and then shared by every blit on this queue
+	inline bool ensure_blit_layout(GpuQueue* queue) {
+		if(queue->blit_pipeline_layout) return true;
+
+		constexpr static std::array stages = {
+			std::pair{EShLangVertex, BLIT_VERTEX_SHADER},
+			std::pair{EShLangFragment, BLIT_FRAGMENT_SHADER}
+		};
+		for(size_t i = 0; i < stages.size(); ++i) {
+			auto spirv = compile_glsl(stages[i].first, stages[i].second);
+			if(spirv.empty()) return false;
+
+			VkShaderModuleCreateInfo info {
+				.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+				.codeSize = spirv.size() * sizeof(uint32_t),
+				.pCode = spirv.data(),
+			};
+			VK_CHECK(vkCreateShaderModule(queue->device, &info, queue->callbacks, &queue->blit_shader_modules[i]), false);
+		}
+
+		for(size_t linear = 0; linear < queue->blit_samplers.size(); ++linear) {
+			auto filter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+			VkSamplerCreateInfo info {
+				.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+				.magFilter = filter,
+				.minFilter = filter,
+				.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+				.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+				.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+				.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+				.maxLod = VK_LOD_CLAMP_NONE,
+			};
+			VK_CHECK(vkCreateSampler(queue->device, &info, queue->callbacks, &queue->blit_samplers[linear]), false);
+		}
+
+		VkDescriptorSetLayoutBinding binding {
+			.binding = 0,
+			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		};
+		VkDescriptorSetLayoutCreateInfo set_layout {
+			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+			.bindingCount = 1,
+			.pBindings = &binding,
+		};
+		VK_CHECK(vkCreateDescriptorSetLayout(queue->device, &set_layout, queue->callbacks, &queue->blit_descriptor_set_layout), false);
+
+		VkPipelineLayoutCreateInfo layout {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+			.setLayoutCount = 1,
+			.pSetLayouts = &queue->blit_descriptor_set_layout,
+		};
+		VK_CHECK(vkCreatePipelineLayout(queue->device, &layout, queue->callbacks, &queue->blit_pipeline_layout), false);
+
+		return true;
+	}
+
+	// Dynamic rendering bakes the destination's format into the pipeline, so one is kept per format
+	inline VkPipeline blit_pipeline(GpuQueue* queue, VkFormat format) {
+		auto key = static_cast<uint64_t>(format);
+		if(auto found = queue->blit_pipelines.find(key); found != queue->blit_pipelines.end())
+			return found->second;
+
+		if(!ensure_blit_layout(queue)) return VK_NULL_HANDLE;
+
+		std::array<VkPipelineShaderStageCreateInfo, 2> shader_stages {
+			VkPipelineShaderStageCreateInfo{
+				.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+				.stage = VK_SHADER_STAGE_VERTEX_BIT,
+				.module = queue->blit_shader_modules[0],
+				.pName = "main",
+			}, VkPipelineShaderStageCreateInfo{
+				.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+				.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+				.module = queue->blit_shader_modules[1],
+				.pName = "main",
+			}
+		};
+
+		// The triangle is generated from gl_VertexIndex, so nothing is fetched and nothing is indexed
+		VkPipelineVertexInputStateCreateInfo vertex_input_state {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+		VkPipelineInputAssemblyStateCreateInfo assembly_state {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+			.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+		};
+		VkPipelineViewportStateCreateInfo viewport_state {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+			.viewportCount = 1,
+			.scissorCount = 1,
+		};
+		VkPipelineRasterizationStateCreateInfo rasterization_state {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+			.polygonMode = VK_POLYGON_MODE_FILL,
+			.cullMode = VK_CULL_MODE_NONE,
+			.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+			.lineWidth = 1.0f,
+		};
+		VkPipelineMultisampleStateCreateInfo multisample_state {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+			.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+		};
+		VkPipelineDepthStencilStateCreateInfo depth_stencil_state {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+
+		VkPipelineColorBlendAttachmentState attachment {
+			.blendEnable = VK_FALSE,
+			.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+		};
+		VkPipelineColorBlendStateCreateInfo color_blend_state {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+			.attachmentCount = 1,
+			.pAttachments = &attachment,
+		};
+
+		std::array<VkDynamicState, 2> dynamic = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+		VkPipelineDynamicStateCreateInfo dynamic_state {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+			.dynamicStateCount = dynamic.size(),
+			.pDynamicStates = dynamic.data(),
+		};
+
+		VkPipelineRenderingCreateInfo dynamic_rendering_info {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+			.colorAttachmentCount = 1,
+			.pColorAttachmentFormats = &format,
+		};
+		// Deliberately no VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT: the blit binds its source
+		// the classic way rather than through whatever heap the user happens to have active
+		VkGraphicsPipelineCreateInfo info {
+			.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+			.pNext = &dynamic_rendering_info,
+			.stageCount = shader_stages.size(),
+			.pStages = shader_stages.data(),
+			.pVertexInputState = &vertex_input_state,
+			.pInputAssemblyState = &assembly_state,
+			.pViewportState = &viewport_state,
+			.pRasterizationState = &rasterization_state,
+			.pMultisampleState = &multisample_state,
+			.pDepthStencilState = &depth_stencil_state,
+			.pColorBlendState = &color_blend_state,
+			.pDynamicState = &dynamic_state,
+			.layout = queue->blit_pipeline_layout,
+			.renderPass = VK_NULL_HANDLE,
+			.basePipelineIndex = -1,
+		};
+
+		VkPipeline pipeline = VK_NULL_HANDLE;
+		VK_CHECK(vkCreateGraphicsPipelines(queue->device, VK_NULL_HANDLE, 1, &info, queue->callbacks, &pipeline), VK_NULL_HANDLE);
+
+		queue->blit_pipelines[key] = pipeline;
+		return pipeline;
+	}
+
+	// Hands back everything whose submission has finished: sets go on the free list to be handed
+	// straight back out, views are gone for good since each one names its own subresource
+	inline void reclaim_blit_transients(GpuQueue* queue) {
+		if(queue->blit_descriptor_sets_in_flight.empty() && queue->blit_views_in_flight.empty()) return;
+
+		uint64_t current_finished_submission;
+		vkGetSemaphoreCounterValue(queue->device, queue->command_submission_timeline_semaphore, &current_finished_submission);
+
+		for(size_t i = queue->blit_descriptor_sets_in_flight.size(); i--; ) {
+			auto [set, submit] = queue->blit_descriptor_sets_in_flight[i];
+			if(submit > current_finished_submission) continue;
+
+			queue->blit_descriptor_sets_free.push_back(set);
+			queue->blit_descriptor_sets_in_flight.erase(queue->blit_descriptor_sets_in_flight.begin() + i);
+		}
+
+		for(size_t i = queue->blit_views_in_flight.size(); i--; ) {
+			auto [view, submit] = queue->blit_views_in_flight[i];
+			if(submit > current_finished_submission) continue;
+
+			vkDestroyImageView(queue->device, view, queue->callbacks);
+			queue->blit_views_in_flight.erase(queue->blit_views_in_flight.begin() + i);
+		}
+	}
+
+	constexpr static uint32_t BLIT_DESCRIPTORS_PER_POOL = 32;
+
+	inline VkDescriptorSet blit_descriptor_set(GpuQueue* queue) {
+		if(!queue->blit_descriptor_sets_free.empty()) {
+			auto set = queue->blit_descriptor_sets_free.back();
+			queue->blit_descriptor_sets_free.pop_back();
+			return set;
+		}
+
+		VkDescriptorSetAllocateInfo info {
+			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+			.descriptorSetCount = 1,
+			.pSetLayouts = &queue->blit_descriptor_set_layout,
+		};
+
+		// Sets are never freed individually (they are recycled instead), so a pool is only ever
+		// grown by adding another one next to it when the newest has been drained
+		if(!queue->blit_descriptor_pools.empty()) {
+			info.descriptorPool = queue->blit_descriptor_pools.back();
+
+			VkDescriptorSet set = VK_NULL_HANDLE;
+			if(vkAllocateDescriptorSets(queue->device, &info, &set) == VK_SUCCESS)
+				return set;
+		}
+
+		VkDescriptorPoolSize size {
+			.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.descriptorCount = BLIT_DESCRIPTORS_PER_POOL,
+		};
+		VkDescriptorPoolCreateInfo pool {
+			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+			.maxSets = BLIT_DESCRIPTORS_PER_POOL,
+			.poolSizeCount = 1,
+			.pPoolSizes = &size,
+		};
+		VkDescriptorPool created = VK_NULL_HANDLE;
+		VK_CHECK(vkCreateDescriptorPool(queue->device, &pool, queue->callbacks, &created), VK_NULL_HANDLE);
+		queue->blit_descriptor_pools.push_back(created);
+
+		info.descriptorPool = created;
+		VkDescriptorSet set = VK_NULL_HANDLE;
+		VK_CHECK(vkAllocateDescriptorSets(queue->device, &info, &set), VK_NULL_HANDLE);
+		return set;
+	}
+
+	// Linear filtering of a 32 bit float image is optional on Vulkan and needs a device feature on
+	// WebGPU, so both backends agree to never ask for it rather than differing by implementation
+	inline bool format_is_filterable(FORMAT format) {
+		return !(format == FORMAT_R32_FLOAT || format == FORMAT_RGBA32_FLOAT);
+	}
+
+	inline uvec2 mip_extent(const GpuTexture* texture, uint32_t mip) {
+		return {
+			std::max(texture->descriptor.dimensions.x >> mip, 1u),
+			std::max(texture->descriptor.dimensions.y >> mip, 1u)
+		};
+	}
+}
+
+void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const GpuTexture* source,
+		bool linear_filter /* = true */,
+		uint32_t destination_mip /* = 0 */, uint32_t destination_slice /* = 0 */,
+		uint32_t source_mip /* = 0 */, uint32_t source_slice /* = 0 */) {
+	assert(cmd->state == GpuCommandBuffer::Recording && "A blit opens a render pass of its own, so it can't be recorded inside another one");
+	assert((source->descriptor.usage & USAGE_SAMPLED) && "The blit source must have been created with USAGE_SAMPLED");
+	assert((destination->descriptor.usage & USAGE_COLOR_ATTACHMENT) && "The blit destination must have been created with USAGE_COLOR_ATTACHMENT");
+	assert(!gpuFormatIsDepth(source->descriptor.format) && !gpuFormatIsDepth(destination->descriptor.format) && "Depth/stencil textures can't be blitted");
+	assert(source->descriptor.type != TEXTURE_3D && "A slice of a 3D texture can't be sampled on its own, blit out of a 2D array instead");
+	assert(source_mip < source->descriptor.mipCount && destination_mip < destination->descriptor.mipCount);
+
+	auto queue = cmd->queue;
+	auto pipeline = GPU::detail::blit_pipeline(queue, GPU::detail::format2vulkan(destination->descriptor.format));
+	if(pipeline == VK_NULL_HANDLE) return;
+
+	GPU::detail::reclaim_blit_transients(queue);
+	auto retire_after = queue->command_submission_timeline_semaphore_next_value;
+
+	// Both sides are addressed as a single mip of a single layer, which is what lets the shader stay
+	// a plain sampler2D no matter what the textures it was handed actually are
+	constexpr static auto subresource_view = [](GpuQueue* queue, const GpuTexture* texture, uint32_t mip, uint32_t slice) {
+		VkImageViewCreateInfo info {
+			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+			.image = texture->image,
+			.viewType = VK_IMAGE_VIEW_TYPE_2D,
+			.format = GPU::detail::format2vulkan(texture->descriptor.format),
+			.subresourceRange = {
+				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.baseMipLevel = mip,
+				.levelCount = 1,
+				.baseArrayLayer = slice,
+				.layerCount = 1,
+			}
+		};
+		VkImageView view = VK_NULL_HANDLE;
+		vkCreateImageView(queue->device, &info, queue->callbacks, &view);
+		return view;
+	};
+
+	auto source_view = subresource_view(queue, source, source_mip, source_slice);
+	auto destination_view = subresource_view(queue, destination, destination_mip, destination_slice);
+	if(source_view == VK_NULL_HANDLE || destination_view == VK_NULL_HANDLE) return;
+	queue->blit_views_in_flight.emplace_back(source_view, retire_after);
+	queue->blit_views_in_flight.emplace_back(destination_view, retire_after);
+
+	auto set = GPU::detail::blit_descriptor_set(queue);
+	if(set == VK_NULL_HANDLE) return;
+	queue->blit_descriptor_sets_in_flight.emplace_back(set, retire_after);
+	{
+		// Textures in this backend live in VK_IMAGE_LAYOUT_GENERAL, the same layout their heap
+		// descriptors are written against
+		bool filtering = linear_filter && GPU::detail::format_is_filterable(source->descriptor.format);
+		VkDescriptorImageInfo image {
+			.sampler = queue->blit_samplers[filtering],
+			.imageView = source_view,
+			.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+		};
+		VkWriteDescriptorSet write {
+			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			.dstSet = set,
+			.dstBinding = 0,
+			.descriptorCount = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.pImageInfo = &image,
+		};
+		vkUpdateDescriptorSets(queue->device, 1, &write, 0, nullptr);
+	}
+
+	// The draw covers the whole mip, so the old contents are never worth reading back in
+	transition_image_layout(cmd->command_buffer, destination->image,
+		VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		destination_mip, destination->descriptor.mipCount, destination_slice, destination->descriptor.layerCount
+	);
+
+	auto extent = GPU::detail::mip_extent(destination, destination_mip);
+	VkRenderingAttachmentInfo attachment {
+		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+		.imageView = destination_view,
+		.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		.resolveMode = VK_RESOLVE_MODE_NONE,
+		.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+		.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+	};
+	VkRenderingInfo rendering {
+		.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+		.renderArea = {
+			.offset = {0, 0},
+			.extent = {extent.x, extent.y},
+		},
+		.layerCount = 1,
+		.colorAttachmentCount = 1,
+		.pColorAttachments = &attachment,
+	};
+	vkCmdBeginRendering(cmd->command_buffer, &rendering);
+
+	vkCmdBindPipeline(cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+	vkCmdBindDescriptorSets(cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, queue->blit_pipeline_layout, 0, 1, &set, 0, nullptr);
+	gpuSetViewportEXT(cmd, extent);
+	gpuSetScissorRectEXT(cmd, extent);
+	vkCmdDraw(cmd->command_buffer, 3, 1, 0, 0);
+
+	vkCmdEndRendering(cmd->command_buffer);
+
+	// Hand the destination back in the layout the rest of the backend expects to find it in
+	transition_image_layout(cmd->command_buffer, destination->image,
+		VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+		VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+		destination_mip, destination->descriptor.mipCount, destination_slice, destination->descriptor.layerCount
+	);
+
+	// The blit bound a pipeline of its own, so put back whatever the user had set before it
+	if(cmd->bound_pipeline)
+		vkCmdBindPipeline(cmd->command_buffer,
+			cmd->bound_pipeline->color_target_count.has_value() ? VK_PIPELINE_BIND_POINT_GRAPHICS : VK_PIPELINE_BIND_POINT_COMPUTE,
+			cmd->bound_pipeline->pipeline);
+}
 
 
 
