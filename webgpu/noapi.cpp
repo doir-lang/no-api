@@ -127,17 +127,54 @@ std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::funct
 	return out;
 }
 
-void update_pipeline_layouts(GpuQueue* queue, bool compute) {
+// Group 0 describes the monobuffers, the active texture heap, and the shader data uniform.
+// Its layout never changes, but compute and graphics need separate ones since WebGPU forbids
+// writable storage buffers in the vertex stage (so graphics binds the monobuffers read only).
+WGPUBindGroupLayout create_buffer_bind_group_layout(GpuQueue* queue, bool compute) {
 	auto visibility = compute ? WGPUShaderStage_Compute : WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
 
-	auto create_layout = [&](std::vector<WGPUBindGroupLayoutEntry>& entries) {
-		WGPUBindGroupLayoutDescriptor d{
-			.entryCount = static_cast<uint32_t>(entries.size()),
-			.entries = entries.data(),
-		};
+	uint32_t binding = 0;
+	std::vector<WGPUBindGroupLayoutEntry> group0;
 
-		return wgpuDeviceCreateBindGroupLayout(queue->device, &d);
+	for(uint32_t i = 0; i < queue->monobuffers.size(); ++i)
+		group0.push_back({
+			.binding = binding++,
+			.visibility = visibility,
+			.buffer = {
+				.type = compute ? WGPUBufferBindingType_Storage : WGPUBufferBindingType_ReadOnlyStorage,
+				.hasDynamicOffset = false,
+				.minBindingSize = 0,
+			}
+		});
+
+	group0.push_back({
+		.binding = binding++,
+		.visibility = visibility,
+		.buffer = {
+			.type = WGPUBufferBindingType_ReadOnlyStorage,
+			.hasDynamicOffset = false,
+			.minBindingSize = 0,
+		}
+	});
+
+	group0.push_back({
+		.binding = binding++,
+		.visibility = visibility,
+		.buffer = {
+			.type = WGPUBufferBindingType_Uniform,
+			.hasDynamicOffset = false,
+			.minBindingSize = 0,
+		}
+	});
+
+	WGPUBindGroupLayoutDescriptor d{
+		.entryCount = static_cast<uint32_t>(group0.size()),
+		.entries = group0.data(),
 	};
+	return wgpuDeviceCreateBindGroupLayout(queue->device, &d);
+}
+
+void update_pipeline_layouts(GpuQueue* queue) {
 	auto create_layout_and_group = [&](std::vector<WGPUBindGroupLayoutEntry>& layoutEntries, std::vector<WGPUBindGroupEntry>& entries) -> std::pair<WGPUBindGroupLayout, WGPUBindGroup> {
 		WGPUBindGroupLayoutDescriptor layout{
 			.entryCount = static_cast<uint32_t>(layoutEntries.size()),
@@ -152,63 +189,30 @@ void update_pipeline_layouts(GpuQueue* queue, bool compute) {
 		return {d.layout, wgpuDeviceCreateBindGroup(queue->device, &d)};
 	};
 
-	auto& bgl0 = compute ? queue->current_compute_bind_group_layout0 : queue->current_graphics_bind_group_layout0;
-
 	//
-	// Group 0: buffers
+	// Group 0: buffers (one flavor per pipeline type, neither of which is dynamic)
 	//
-	uint32_t binding = 0;
-
-	if(!bgl0) { // The layout of buffers isn't dynamic so if it already exists we don't need to generate it again!
-		std::vector<WGPUBindGroupLayoutEntry> group0;
-
-		for(uint32_t i = 0; i < queue->monobuffers.size(); ++i)
-			group0.push_back({
-				.binding = binding++,
-				.visibility = visibility,
-				.buffer = {
-					.type = compute ? WGPUBufferBindingType_Storage : WGPUBufferBindingType_ReadOnlyStorage,
-					.hasDynamicOffset = false,
-					.minBindingSize = 0,
-				}
-			});
-
-		group0.push_back({
-			.binding = binding++,
-			.visibility = visibility,
-			.buffer = {
-				.type = WGPUBufferBindingType_ReadOnlyStorage,
-				.hasDynamicOffset = false,
-				.minBindingSize = 0,
-			}
-		});
-
-		group0.push_back({
-			.binding = binding++,
-			.visibility = visibility,
-			.buffer = {
-				.type = WGPUBufferBindingType_Uniform,
-				.hasDynamicOffset = false,
-				.minBindingSize = 0,
-			}
-		});
-
-		bgl0 = create_layout(group0);
-
-	}
+	if(!queue->current_compute_bind_group_layout0)
+		queue->current_compute_bind_group_layout0 = create_buffer_bind_group_layout(queue, true);
+	if(!queue->current_graphics_bind_group_layout0)
+		queue->current_graphics_bind_group_layout0 = create_buffer_bind_group_layout(queue, false);
 
 	//
 	// Group 1: storage textures
 	//
+	// Groups 1 and 2 are shared between the compute and graphics pipeline layouts (the bind groups
+	// built from them get bound to both), so their visibility has to name every stage allowed to
+	// touch them. Writable storage textures are illegal in the vertex stage, hence the asymmetry.
+	//
 	std::vector<WGPUBindGroupLayoutEntry> group1;
 	std::vector<WGPUBindGroupEntry> group1entries;
 
-	binding = 0;
+	uint32_t binding = 0;
 
 	for(auto const& [_cap, texture, view, desc] : queue->storage_monotextures) {
 		group1.push_back({
 			.binding = binding,
-			.visibility = visibility,
+			.visibility = WGPUShaderStage_Compute | WGPUShaderStage_Fragment,
 			.storageTexture = {
 				.access = WGPUStorageTextureAccess_ReadWrite,
 				.format = GPU::format2wgpu(desc.format),
@@ -231,8 +235,8 @@ void update_pipeline_layouts(GpuQueue* queue, bool compute) {
 
 	for(auto const& [_cap, texture, view, desc] : queue->sampled_monotextures) {
 		group2.push_back({
-			.binding = binding++,
-			.visibility = visibility,
+			.binding = binding,
+			.visibility = WGPUShaderStage_Compute | WGPUShaderStage_Vertex | WGPUShaderStage_Fragment,
 			.texture = {
 				.sampleType = WGPUTextureSampleType_Float,
 				.viewDimension = GPU::texture_view2wgpu(desc.type),
@@ -257,23 +261,25 @@ void update_pipeline_layouts(GpuQueue* queue, bool compute) {
 	}, queue->next_submission_index);
 	std::tie(queue->current_bind_group_layout2, queue->current_bind_group2) = create_layout_and_group(group2, group2entries);
 
-	WGPUBindGroupLayout layouts[] = {
-		bgl0,
-		queue->current_bind_group_layout1,
-		queue->current_bind_group_layout2
-	};
-	auto& pipeline_layout = compute ? queue->current_compute_pipeline_layout : queue->current_graphics_pipeline_layout;
-	if(pipeline_layout) wgpuPipelineLayoutRelease(pipeline_layout);
+	auto create_pipeline_layout = [&](WGPUBindGroupLayout bgl0) {
+		WGPUBindGroupLayout layouts[] = {
+			bgl0,
+			queue->current_bind_group_layout1,
+			queue->current_bind_group_layout2
+		};
 
-	WGPUPipelineLayoutDescriptor pd{
-		.bindGroupLayoutCount = 3,
-		.bindGroupLayouts = layouts,
+		WGPUPipelineLayoutDescriptor pd{
+			.bindGroupLayoutCount = 3,
+			.bindGroupLayouts = layouts,
+		};
+		return wgpuDeviceCreatePipelineLayout(queue->device, &pd);
 	};
-	pipeline_layout = wgpuDeviceCreatePipelineLayout(queue->device, &pd);
-}
-void update_pipeline_layouts(GpuQueue* queue) {
-	update_pipeline_layouts(queue, true);
-	update_pipeline_layouts(queue, false);
+
+	if(queue->current_compute_pipeline_layout) wgpuPipelineLayoutRelease(queue->current_compute_pipeline_layout);
+	queue->current_compute_pipeline_layout = create_pipeline_layout(queue->current_compute_bind_group_layout0);
+
+	if(queue->current_graphics_pipeline_layout) wgpuPipelineLayoutRelease(queue->current_graphics_pipeline_layout);
+	queue->current_graphics_pipeline_layout = create_pipeline_layout(queue->current_graphics_bind_group_layout0);
 }
 
 
@@ -315,13 +321,13 @@ std::string generate_binding_prologue(GpuQueue* queue, bool compute) {
 		}
 	};
 
-	std::string out = "@group(0) @binding(0) var<storage, read_write> mono0 : array<u32>;\n"
-	"@group(0) @binding(1) var<storage, read_write> mono1 : array<u32>;\n"
-	"@group(0) @binding(2) var<storage, read_write> mono2 : array<u32>;\n"
-	"@group(0) @binding(3) var<storage, read_write> mono3 : array<u32>;\n"
-	"@group(0) @binding(4) var<storage, read_write> mono4 : array<u32>;\n"
-	"@group(0) @binding(5) var<storage, read_write> mono5 : array<u32>;\n"
-	"\n"
+	// WebGPU forbids writable storage buffers in the vertex stage, so the rasterizer only ever gets
+	// read only access to the monobuffers (matching what create_buffer_bind_group_layout declares)
+	std::string out;
+	for(uint32_t i = 0; i < queue->monobuffers.size(); ++i)
+		out += std::format("@group(0) @binding({}) var<storage, {}> mono{} : array<u32>;\n", i, compute ? "read_write" : "read", i);
+
+	out += "\n"
 	"@group(0) @binding(6) var<storage> texture_heap : array<u32>;\n"
 	"\n"
 	+ std::string(compute ? 
@@ -366,7 +372,7 @@ GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limi
 
 	WGPUBufferDescriptor d {
 		.label = {"NoAPI Empty Monobuffer", WGPU_STRLEN},
-		.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
+		.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc | WGPUBufferUsage_Index | WGPUBufferUsage_Indirect,
 		.size = 4
 	};
 	out->empty_buffer = wgpuDeviceCreateBuffer(out->device, &d);
@@ -471,7 +477,7 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 
 		WGPUBufferDescriptor d {
 			.label = {"NoAPI Monobuffer", WGPU_STRLEN},
-			.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
+			.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc | WGPUBufferUsage_Index | WGPUBufferUsage_Indirect,
 			.size = queue->active_monobuffer_capacity
 		};
 		auto old_monobuffer = queue->monobuffers[queue->active_monobuffer];
@@ -498,7 +504,7 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 
 			WGPUBufferDescriptor d {
 				.label = {"NoAPI Monobuffer", WGPU_STRLEN},
-				.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
+				.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc | WGPUBufferUsage_Index | WGPUBufferUsage_Indirect,
 				.size = bytes
 			};
 			queue->monobuffers[queue->active_monobuffer] = wgpuDeviceCreateBuffer(queue->device, &d);
@@ -762,14 +768,12 @@ GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue* queue, const GpuTextur
 	return gpuTextureViewDescriptor(queue, texture, desc);
 }
 
-void update_compute_pipeline(GpuQueue* queue, const GpuPipeline* pipeline) {
-	auto& cache = std::get<GpuPipeline::ComputeCache>(pipeline->cache);
-	// if(cache.module) wgpuShaderModuleRelease(cache.module);
-	if(cache.pipeline) wgpuComputePipelineRelease(cache.pipeline);
-
+// Splices the bindings generated for the queue's current monobuffer/monotexture set into the
+// provided IR (replacing every @generated_noapi_bindings marker) and compiles the result
+WGPUShaderModule create_shader_module(GpuQueue* queue, std::string_view IR, bool compute) {
 	constexpr std::string_view marker = "@generated_noapi_bindings";
-	std::string wgsl_source = cache.IR;
-	auto generated_bindings = generate_binding_prologue(queue, true);
+	std::string wgsl_source = {IR.begin(), IR.end()};
+	auto generated_bindings = generate_binding_prologue(queue, compute);
 	std::size_t pos = 0;
 	while ((pos = wgsl_source.find(marker, pos)) != std::string::npos) {
 		wgsl_source.replace(pos, marker.size(), generated_bindings);
@@ -783,10 +787,17 @@ void update_compute_pipeline(GpuQueue* queue, const GpuPipeline* pipeline) {
 	WGPUShaderModuleDescriptor module {
 		.nextInChain = &source.chain
 	};
+	return wgpuDeviceCreateShaderModule(queue->device, &module);
+}
+
+void update_compute_pipeline(GpuQueue* queue, const GpuPipeline* pipeline) {
+	auto& cache = std::get<GpuPipeline::ComputeCache>(pipeline->cache);
+	if(cache.pipeline) wgpuComputePipelineRelease(cache.pipeline);
+
 	WGPUComputePipelineDescriptor d {
-		.layout = pipeline->reference_layout = queue->current_compute_pipeline_layout,
+		.layout = queue->current_compute_pipeline_layout,
 		.compute = {
-			.module = wgpuDeviceCreateShaderModule(queue->device, &module),
+			.module = create_shader_module(queue, cache.IR, true),
 			.entryPoint = {"main", WGPU_STRLEN},
 		}
 	};
@@ -794,6 +805,117 @@ void update_compute_pipeline(GpuQueue* queue, const GpuPipeline* pipeline) {
 	pipeline->reference_layout = queue->current_compute_pipeline_layout;
 
 	wgpuShaderModuleRelease(d.compute.module);
+}
+
+// Rebuilds the cached variant of a graphics pipeline against the queue's current pipeline layout
+// and the depth/stencil, blend, and index state that is about to be drawn with. WebGPU bakes all
+// of them into the PSO, so every one of them is recorded alongside the pipeline for comparison.
+void update_render_pipeline(GpuQueue* queue, const GpuPipeline* pipeline, const std::optional<GpuDepthStencilDesc>& depth_stencil, const std::optional<GpuBlendDesc>& blend, INDEX_TYPE_EXT index_type) {
+	auto& cache = std::get<GpuPipeline::RenderCache>(pipeline->cache);
+	if(cache.pipeline) wgpuRenderPipelineRelease(cache.pipeline);
+
+	auto& desc = cache.descriptor;
+
+	// A dynamically applied blend state takes precedence over one baked into the rasterizer description
+	auto effective_blend = blend ? blend : desc.blendstate;
+	WGPUBlendState blend_state {
+		.color = {
+			.operation = GPU::blend2wgpu(effective_blend.value_or(GpuBlendDesc{}).colorOp),
+			.srcFactor = GPU::factor2wgpu(effective_blend.value_or(GpuBlendDesc{}).srcColorFactor),
+			.dstFactor = GPU::factor2wgpu(effective_blend.value_or(GpuBlendDesc{}).dstColorFactor),
+		},
+		.alpha = {
+			.operation = GPU::blend2wgpu(effective_blend.value_or(GpuBlendDesc{}).alphaOp),
+			.srcFactor = GPU::factor2wgpu(effective_blend.value_or(GpuBlendDesc{}).srcAlphaFactor),
+			.dstFactor = GPU::factor2wgpu(effective_blend.value_or(GpuBlendDesc{}).dstAlphaFactor),
+		},
+	};
+
+	std::vector<WGPUColorTargetState> targets; targets.reserve(desc.colorTargets.size());
+	for(auto& target: desc.colorTargets) {
+		// The target's baked write mask and the blend state's write mask both have to be satisfied
+		uint8_t mask = effective_blend ? (target.writeMask & effective_blend->colorWriteMask) : target.writeMask;
+		targets.push_back({
+			.format = GPU::format2wgpu(target.format),
+			.blend = effective_blend ? &blend_state : nullptr,
+			.writeMask = GPU::mask2wgpu(mask),
+		});
+	}
+
+	auto depth_stencil_format = desc.depthFormat != FORMAT_NONE ? desc.depthFormat : desc.stencilFormat;
+	auto state = depth_stencil.value_or(GpuDepthStencilDesc{});
+	auto has_depth = gpuFormatIsDepth(depth_stencil_format);
+	auto has_stencil = GPU::format_has_stencil(depth_stencil_format);
+
+	auto stencil2wgpu = [](const GpuStencil& stencil) {
+		return WGPUStencilFaceState {
+			.compare = GPU::op2wgpu(stencil.test),
+			.failOp = GPU::stencil2wgpu(stencil.failOp),
+			.depthFailOp = GPU::stencil2wgpu(stencil.depthFailOp),
+			.passOp = GPU::stencil2wgpu(stencil.passOp),
+		};
+	};
+	// WebGPU rejects any non default state for an aspect the attachment format doesn't have
+	constexpr static WGPUStencilFaceState stencil_disabled {
+		.compare = WGPUCompareFunction_Always,
+		.failOp = WGPUStencilOperation_Keep,
+		.depthFailOp = WGPUStencilOperation_Keep,
+		.passOp = WGPUStencilOperation_Keep,
+	};
+	WGPUDepthStencilState depth_stencil_state {
+		.format = GPU::format2wgpu(depth_stencil_format),
+		.depthWriteEnabled = (has_depth && (state.depthMode & DEPTH_WRITE)) ? WGPUOptionalBool_True : WGPUOptionalBool_False,
+		.depthCompare = (has_depth && (state.depthMode & DEPTH_READ)) ? GPU::op2wgpu(state.depthTest) : WGPUCompareFunction_Always,
+		.stencilFront = has_stencil ? stencil2wgpu(state.stencilFront) : stencil_disabled,
+		.stencilBack = has_stencil ? stencil2wgpu(state.stencilBack) : stencil_disabled,
+		.stencilReadMask = has_stencil ? static_cast<uint32_t>(state.stencilReadMask) : 0xFFFFFFFFu,
+		.stencilWriteMask = has_stencil ? static_cast<uint32_t>(state.stencilWriteMask) : 0xFFFFFFFFu,
+		// WebGPU counts the constant bias in units of the smallest representable depth value
+		.depthBias = static_cast<int32_t>(state.depthBias),
+		.depthBiasSlopeScale = state.depthBiasSlopeFactor,
+		.depthBiasClamp = state.depthBiasClamp,
+	};
+
+	auto vertex_module = create_shader_module(queue, cache.vertexIR, false);
+	auto fragment_module = cache.fragmentIR.empty() ? nullptr : create_shader_module(queue, cache.fragmentIR, false);
+
+	WGPUFragmentState fragment {
+		.module = fragment_module,
+		.targetCount = targets.size(),
+		.targets = targets.data(),
+	};
+	WGPURenderPipelineDescriptor d {
+		.layout = queue->current_graphics_pipeline_layout,
+		.vertex = {
+			.module = vertex_module,
+			// Leaving the entry point undefined picks the module's only entry point for the stage,
+			// which lets a single blob holding both shaders be handed to us for both stages
+			.entryPoint = WGPU_STRING_VIEW_INIT,
+		},
+		.primitive = {
+			.topology = GPU::topology2wgpu(desc.topology),
+			// Strips need to know how the index buffer restarts primitives, lists must not name a format
+			.stripIndexFormat = desc.topology == TOPOLOGY_TRIANGLE_STRIP ? GPU::index2wgpu(index_type) : WGPUIndexFormat_Undefined,
+			.frontFace = WGPUFrontFace_CCW,
+			.cullMode = GPU::cull2wgpu(desc.cull),
+		},
+		.depthStencil = depth_stencil_format == FORMAT_NONE ? nullptr : &depth_stencil_state,
+		.multisample = {
+			.count = desc.sampleCount,
+			.mask = 0xFFFFFFFF,
+			.alphaToCoverageEnabled = desc.alphaToCoverage,
+		},
+		.fragment = fragment_module ? &fragment : nullptr,
+	};
+	cache.pipeline = wgpuDeviceCreateRenderPipeline(queue->device, &d);
+
+	pipeline->reference_layout = queue->current_graphics_pipeline_layout;
+	cache.depth_stencil = depth_stencil;
+	cache.blend = blend;
+	cache.index_type = index_type;
+
+	wgpuShaderModuleRelease(vertex_module);
+	if(fragment_module) wgpuShaderModuleRelease(fragment_module);
 }
 
 GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, std::span<const std::byte> computeIR) {
@@ -809,17 +931,61 @@ GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, std::span<const std::byte
 	return out;
 }
 
+GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, std::span<const std::byte> vertexIR, std::span<const std::byte> fragmentIR, const GpuRasterDesc& desc) {
+	auto out = (GpuPipeline*)queue->cpu_allocator(nullptr, sizeof(GpuPipeline));
+	new(out) GpuPipeline{
+		.reference_layout = nullptr,
+		.cache = GpuPipeline::RenderCache {
+			.vertexIR = {(char*)vertexIR.data(), (char*)(vertexIR.data() + vertexIR.size())},
+			.fragmentIR = {(char*)fragmentIR.data(), (char*)(fragmentIR.data() + fragmentIR.size())},
+			.color_targets = {desc.colorTargets.begin(), desc.colorTargets.end()},
+			.descriptor = desc,
+		}
+	};
+
+	// The descriptor only borrows its color targets, so point it at our copy of them
+	auto& cache = std::get<GpuPipeline::RenderCache>(out->cache);
+	cache.descriptor.colorTargets = cache.color_targets;
+
+	// Unlike a compute pipeline we can't build anything yet: the depth/stencil state, the blend
+	// state, and the index format are all baked into a WebGPU PSO but none of them are bound until
+	// a draw is recorded. The first draw builds the initial variant.
+	return out;
+}
+
 void gpuFreePipeline(GpuQueue* queue, GpuPipeline* pipeline) {
 	if(std::holds_alternative<GpuPipeline::ComputeCache>(pipeline->cache)) {
 		auto& cache = std::get<GpuPipeline::ComputeCache>(pipeline->cache);
-		// wgpuShaderModuleRelease(cache.module);
-		wgpuComputePipelineRelease(cache.pipeline);
+		if(cache.pipeline) wgpuComputePipelineRelease(cache.pipeline);
 	} else {
-		// TODO: implement graphics side
+		auto& cache = std::get<GpuPipeline::RenderCache>(pipeline->cache);
+		if(cache.pipeline) wgpuRenderPipelineRelease(cache.pipeline);
 	}
 
 	pipeline->~GpuPipeline();
 	queue->cpu_allocator(pipeline, 0);
+}
+
+GpuDepthStencilState* gpuCreateDepthStencilState(GpuQueue* queue, const GpuDepthStencilDesc& desc) {
+	auto out = (GpuDepthStencilState*)queue->cpu_allocator(nullptr, sizeof(GpuDepthStencilState));
+	new(out) GpuDepthStencilState{.descriptor = desc};
+	return out;
+}
+
+GpuBlendState* gpuCreateBlendState(GpuQueue* queue, const GpuBlendDesc& desc) {
+	auto out = (GpuBlendState*)queue->cpu_allocator(nullptr, sizeof(GpuBlendState));
+	new(out) GpuBlendState{.descriptor = desc};
+	return out;
+}
+
+void gpuFreeDepthStencilState(GpuQueue* queue, GpuDepthStencilState* state) {
+	state->~GpuDepthStencilState();
+	queue->cpu_allocator(state, 0);
+}
+
+void gpuFreeBlendState(GpuQueue* queue, GpuBlendState* state) {
+	state->~GpuBlendState();
+	queue->cpu_allocator(state, 0);
 }
 
 GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
@@ -834,21 +1000,30 @@ GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
 	return out;
 }
 
+void endRenderPass(GpuCommandBuffer* cmd) {
+	if(!cmd->render_pass) return;
+
+	wgpuRenderPassEncoderEnd(cmd->render_pass);
+	cmd->queue->code_pending_submission_finished.emplace_back([pass = cmd->render_pass] {
+		wgpuRenderPassEncoderRelease(pass);
+	}, cmd->queue->next_submission_index);
+	cmd->render_pass = nullptr;
+	cmd->bound_render_pipeline = nullptr; // Nothing set on a pass outlives it
+}
+
+void endComputePass(GpuCommandBuffer* cmd) {
+	if(!cmd->compute_pass) return;
+
+	wgpuComputePassEncoderEnd(cmd->compute_pass);
+	cmd->queue->code_pending_submission_finished.emplace_back([pass = cmd->compute_pass] {
+		wgpuComputePassEncoderRelease(pass);
+	}, cmd->queue->next_submission_index);
+	cmd->compute_pass = nullptr;
+}
+
 void endCurrentPass(GpuCommandBuffer* cmd) {
-	if(cmd->render_pass) {
-		wgpuRenderPassEncoderEnd(cmd->render_pass);
-		cmd->queue->code_pending_submission_finished.emplace_back([pass = cmd->render_pass] {
-			wgpuRenderPassEncoderRelease(pass);
-		}, cmd->queue->next_submission_index);
-		cmd->render_pass = nullptr;
-	}
-	if(cmd->compute_pass) {
-		wgpuComputePassEncoderEnd(cmd->compute_pass);
-		cmd->queue->code_pending_submission_finished.emplace_back([pass = cmd->compute_pass] {
-			wgpuComputePassEncoderRelease(pass);
-		}, cmd->queue->next_submission_index);
-		cmd->compute_pass = nullptr;
-	}
+	endRenderPass(cmd);
+	endComputePass(cmd);
 }
 
 void gpuFreeCommandBuffer(GpuCommandBuffer* cmd) {
@@ -1111,40 +1286,65 @@ void gpuWaitBefore(GpuCommandBuffer* cmd, STAGE after, gpu* ptr, uint64_t value,
 
 
 void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline) {
+	cmd->bound_pipeline = pipeline;
+
 	if(std::holds_alternative<GpuPipeline::ComputeCache>(pipeline->cache)) {
 		if(pipeline->reference_layout != cmd->queue->current_compute_pipeline_layout)
 			update_compute_pipeline(cmd->queue, pipeline);
 
-		if(cmd->render_pass) {
-			wgpuRenderPassEncoderEnd(cmd->render_pass);
-			cmd->queue->code_pending_submission_finished.emplace_back([pass = cmd->render_pass] {
-				wgpuRenderPassEncoderRelease(pass);
-			}, cmd->queue->next_submission_index);
-			cmd->render_pass = nullptr;
-		}
-
+		endRenderPass(cmd);
 		if(!cmd->compute_pass) cmd->compute_pass = wgpuCommandEncoderBeginComputePass(cmd->encoder, nullptr);
 
 		wgpuComputePassEncoderSetPipeline(cmd->compute_pass, std::get<GpuPipeline::ComputeCache>(pipeline->cache).pipeline);
 	} else {
-		if(cmd->compute_pass) {
-			wgpuComputePassEncoderEnd(cmd->compute_pass);
-			cmd->queue->code_pending_submission_finished.emplace_back([pass = cmd->compute_pass] {
-				wgpuComputePassEncoderRelease(pass);
-			}, cmd->queue->next_submission_index);
-			cmd->compute_pass = nullptr;
-		}
+		endComputePass(cmd);
 
-		// TODO: Graphics is not implemented yet
-		throw std::runtime_error("Graphics is not implemented yet!");
+		// A render pipeline can't be built (let alone set) until we know what is being drawn with it,
+		// so the variant matching the bound state is compiled and set by the draw commands instead.
 	}
+}
+
+// Makes sure the cached variant of the bound graphics pipeline matches the state it is about to be
+// drawn with, rebuilding it when the bound elements or the pipeline layout have moved on, and then
+// sets it on the render pass
+void bindRenderPipeline(GpuCommandBuffer* cmd) {
+	assert(cmd->render_pass && "A render pass must be started before drawing");
+	assert(cmd->bound_pipeline && "A graphics pipeline must be set before drawing");
+	assert(std::holds_alternative<GpuPipeline::RenderCache>(cmd->bound_pipeline->cache) && "A compute pipeline can't be drawn with");
+
+	auto pipeline = cmd->bound_pipeline;
+	auto& cache = std::get<GpuPipeline::RenderCache>(pipeline->cache);
+
+	if(!cache.pipeline
+	|| pipeline->reference_layout != cmd->queue->current_graphics_pipeline_layout
+	|| !GPU::same(cache.depth_stencil, cmd->depth_stencil)
+	|| !GPU::same(cache.blend, cmd->blend)
+	// The index format is only baked into the pipeline when primitives are restarted by the indices
+	|| (cache.descriptor.topology == TOPOLOGY_TRIANGLE_STRIP && cache.index_type != cmd->index_type))
+		update_render_pipeline(cmd->queue, pipeline, cmd->depth_stencil, cmd->blend, cmd->index_type);
+
+	if(cmd->bound_render_pipeline != cache.pipeline) {
+		wgpuRenderPassEncoderSetPipeline(cmd->render_pass, cache.pipeline);
+		cmd->bound_render_pipeline = cache.pipeline;
+	}
+
+	// The stencil reference is the one piece of depth/stencil state WebGPU leaves dynamic
+	if(cmd->depth_stencil)
+		wgpuRenderPassEncoderSetStencilReference(cmd->render_pass, cmd->depth_stencil->stencilFront.reference);
 }
 
 struct ComputeShaderData {
 	gpu* compute;
 };
 
-WGPUBindGroup createBufferBindGroup(GpuCommandBuffer* cmd, gpu* data, bool no_offsets) {
+struct GraphicsShaderData {
+	gpu* vertex;
+	gpu* fragment;
+};
+
+// Builds group 0: every monobuffer, the active texture heap, and a throwaway uniform holding the
+// root data pointer(s) the shaders were invoked with
+WGPUBindGroup createBufferBindGroup(GpuCommandBuffer* cmd, const void* shader_data, size_t shader_data_size, bool compute) {
 	uint32_t binding = 0;
 	std::vector<WGPUBindGroupEntry> group0;
 	for(uint32_t i = 0; i < cmd->queue->monobuffers.size(); ++i)
@@ -1174,13 +1374,12 @@ WGPUBindGroup createBufferBindGroup(GpuCommandBuffer* cmd, gpu* data, bool no_of
 		WGPUBufferDescriptor d {
 			.label = {"NoAPI ShaderData", WGPU_STRLEN},
 			.usage = WGPUBufferUsage_Uniform,
-			.size = sizeof(ComputeShaderData),
+			.size = shader_data_size,
 			.mappedAtCreation = true,
 		};
 		auto tmp = wgpuDeviceCreateBuffer(cmd->queue->device, &d);
 		cmd->queue->code_pending_submission_finished.emplace_back([tmp] { wgpuBufferRelease(tmp); }, cmd->queue->next_submission_index);
-		auto data_ptr = (ComputeShaderData*)wgpuBufferGetMappedRange(tmp, 0, d.size);
-		data_ptr->compute = data;
+		memcpy(wgpuBufferGetMappedRange(tmp, 0, d.size), shader_data, shader_data_size);
 		wgpuBufferUnmap(tmp);
 
 		group0.push_back({
@@ -1192,21 +1391,48 @@ WGPUBindGroup createBufferBindGroup(GpuCommandBuffer* cmd, gpu* data, bool no_of
 	}
 
 	WGPUBindGroupDescriptor d {
-		.layout = cmd->queue->current_compute_bind_group_layout0,
+		.layout = compute ? cmd->queue->current_compute_bind_group_layout0 : cmd->queue->current_graphics_bind_group_layout0,
 		.entryCount = group0.size(),
 		.entries = group0.data()
 	};
 	return wgpuDeviceCreateBindGroup(cmd->queue->device, &d);
 }
 
+WGPUBindGroup createBufferBindGroup(GpuCommandBuffer* cmd, gpu* data, bool no_offsets) {
+	ComputeShaderData shader_data { .compute = data };
+	return createBufferBindGroup(cmd, &shader_data, sizeof(shader_data), true);
+}
+
+// Binds every group needed by a dispatch or a draw (the texture groups are shared between the two)
+void bindGroups(GpuCommandBuffer* cmd, const void* shader_data, size_t shader_data_size, bool compute) {
+	auto group0 = createBufferBindGroup(cmd, shader_data, shader_data_size, compute);
+	cmd->queue->code_pending_submission_finished.emplace_back([group0] { wgpuBindGroupRelease(group0); }, cmd->queue->next_submission_index);
+
+	if(compute) {
+		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 0, group0, 0, nullptr);
+		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 1, cmd->queue->current_bind_group1, 0, nullptr);
+		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 2, cmd->queue->current_bind_group2, 0, nullptr);
+	} else {
+		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 0, group0, 0, nullptr);
+		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 1, cmd->queue->current_bind_group1, 0, nullptr);
+		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 2, cmd->queue->current_bind_group2, 0, nullptr);
+	}
+}
+
+void bindComputeGroups(GpuCommandBuffer* cmd, gpu* data) {
+	ComputeShaderData shader_data { .compute = data };
+	bindGroups(cmd, &shader_data, sizeof(shader_data), true);
+}
+
+void bindGraphicsGroups(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data) {
+	GraphicsShaderData shader_data { .vertex = vertex_data, .fragment = fragment_data };
+	bindGroups(cmd, &shader_data, sizeof(shader_data), false);
+}
+
 void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions, bool no_offsets /* = false */) {
 	assert(cmd->compute_pass);
 
-	auto group0 = createBufferBindGroup(cmd, data, no_offsets);
-	cmd->queue->code_pending_submission_finished.emplace_back([group0] { wgpuBindGroupRelease(group0); }, cmd->queue->next_submission_index);
-	wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 0, group0, 0, nullptr);
-	wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 1, cmd->queue->current_bind_group1, 0, nullptr);
-	wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 2, cmd->queue->current_bind_group2, 0, nullptr);
+	bindComputeGroups(cmd, data);
 
 	wgpuComputePassEncoderDispatchWorkgroups(cmd->compute_pass, grid_dimensions.x, grid_dimensions.y, grid_dimensions.z);
 }
@@ -1216,11 +1442,200 @@ void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* data, gpu* grid_dimensions_
 
 	auto [grid_range, grid_offset, grid_addr] = GPU::detail::closest_buffer(cmd->queue, grid_dimensions_gpu, no_offsets);
 
-	auto group0 = createBufferBindGroup(cmd, data, no_offsets);
-	cmd->queue->code_pending_submission_finished.emplace_back([group0] { wgpuBindGroupRelease(group0); }, cmd->queue->next_submission_index);
-	wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 0, group0, 0, nullptr);
-	wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 1, cmd->queue->current_bind_group1, 0, nullptr);
-	wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 2, cmd->queue->current_bind_group2, 0, nullptr);
+	bindComputeGroups(cmd, data);
 
 	wgpuComputePassEncoderDispatchWorkgroupsIndirect(cmd->compute_pass, cmd->queue->monobuffers[grid_range.buffer], grid_range.start + grid_offset);
+}
+
+
+void gpuSetDepthStencilState(GpuCommandBuffer* cmd, const GpuDepthStencilState* state) {
+	// WebGPU bakes everything except the stencil reference into the pipeline, so all we can do here
+	// is record the state; bindRenderPipeline rebuilds the bound pipeline when it no longer matches
+	cmd->depth_stencil = state ? std::optional{state->descriptor} : std::nullopt;
+
+	if(cmd->render_pass && cmd->depth_stencil)
+		wgpuRenderPassEncoderSetStencilReference(cmd->render_pass, cmd->depth_stencil->stencilFront.reference);
+}
+
+void gpuSetBlendState(GpuCommandBuffer* cmd, const GpuBlendState* state) {
+	// Blending is part of a WebGPU PSO, so this is recorded and applied by the next draw
+	cmd->blend = state ? std::optional{state->descriptor} : std::nullopt;
+}
+
+void gpuSetViewportEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin /* = {0, 0} */, float depth_min /* = 0 */, float depth_max /* = 1 */) {
+	assert(cmd->render_pass && "The viewport can only be set inside a render pass");
+	wgpuRenderPassEncoderSetViewport(cmd->render_pass, origin.x, origin.y, extent.x, extent.y, depth_min, depth_max);
+}
+
+void gpuSetScissorRectEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin /* = {0, 0} */) {
+	assert(cmd->render_pass && "The scissor rectangle can only be set inside a render pass");
+	wgpuRenderPassEncoderSetScissorRect(cmd->render_pass, origin.x, origin.y, extent.x, extent.y);
+}
+
+
+
+namespace GPU::detail {
+	// Creates the single subresource view a texture is attached to a render pass through. The view
+	// lives until the submission referencing it has finished.
+	inline WGPUTextureView attachment_view(GpuCommandBuffer* cmd, const GpuTexture* texture, uint32_t mipLevel, uint32_t slice) {
+		bool volume = texture->descriptor.type == TEXTURE_3D;
+
+		WGPUTextureViewDescriptor d {
+			.label = {"NoAPI Attachment", WGPU_STRLEN},
+			.format = GPU::format2wgpu(texture->descriptor.format),
+			.dimension = volume ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2D,
+			.baseMipLevel = mipLevel,
+			.mipLevelCount = 1,
+			// Textures backed by a monotexture live at an offset into its array layers
+			.baseArrayLayer = volume ? 0 : (texture->range ? texture->range->start : 0) + slice,
+			.arrayLayerCount = 1,
+			.aspect = WGPUTextureAspect_All,
+			.usage = WGPUTextureUsage_RenderAttachment,
+		};
+		auto view = wgpuTextureCreateView(texture->texture, &d);
+
+		cmd->queue->code_pending_submission_finished.emplace_back([view] {
+			wgpuTextureViewRelease(view);
+		}, cmd->queue->next_submission_index);
+		return view;
+	}
+
+	inline uvec2 attachment_extent(const GpuTexture* texture, uint32_t mipLevel) {
+		return {
+			std::max(texture->descriptor.dimensions.x >> mipLevel, 1u),
+			std::max(texture->descriptor.dimensions.y >> mipLevel, 1u)
+		};
+	}
+}
+
+void gpuBeginRenderPass(GpuCommandBuffer* cmd, const GpuRenderPassDesc& desc) {
+	endCurrentPass(cmd);
+
+	uvec2 extent = {0, 0};
+
+	std::vector<WGPURenderPassColorAttachment> colors; colors.reserve(desc.colorAttachments.size());
+	for(auto& color: desc.colorAttachments) {
+		bool volume = color.texture->descriptor.type == TEXTURE_3D;
+		colors.push_back({
+			.view = GPU::detail::attachment_view(cmd, color.texture, color.mipLevel, color.slice),
+			// Only a view into a 3D texture picks the rendered slice here, everything else selects it as an array layer
+			.depthSlice = volume ? color.slice : WGPU_DEPTH_SLICE_UNDEFINED,
+			.resolveTarget = color.resolveTexture ? GPU::detail::attachment_view(cmd, color.resolveTexture, color.mipLevel, color.slice) : nullptr,
+			.loadOp = GPU::load2wgpu(color.loadOp),
+			.storeOp = GPU::store2wgpu(color.storeOp),
+			.clearValue = {color.clearValue.r, color.clearValue.g, color.clearValue.b, color.clearValue.a},
+		});
+
+		if(extent.x == 0) extent = GPU::detail::attachment_extent(color.texture, color.mipLevel);
+	}
+
+	// Depth and stencil are separate attachments in our API but WebGPU merges them into one, so when
+	// both are provided they have to name the same subresource
+	auto& merged = desc.depthAttachment ? desc.depthAttachment : desc.stencilAttachment;
+	assert((!(desc.depthAttachment && desc.stencilAttachment)
+		|| (desc.depthAttachment->texture == desc.stencilAttachment->texture
+			&& desc.depthAttachment->mipLevel == desc.stencilAttachment->mipLevel
+			&& desc.depthAttachment->slice == desc.stencilAttachment->slice))
+		&& "WebGPU requires the depth and stencil attachments to be the same subresource");
+
+	WGPURenderPassDepthStencilAttachment depth_stencil {};
+	if(merged) {
+		auto format = merged->texture->descriptor.format;
+		depth_stencil.view = GPU::detail::attachment_view(cmd, merged->texture, merged->mipLevel, merged->slice);
+
+		// Both aspects of the format need ops, whether or not the user described that aspect
+		if(gpuFormatIsDepth(format)) {
+			auto& attachment = desc.depthAttachment ? *desc.depthAttachment : *merged;
+			depth_stencil.depthLoadOp = desc.depthAttachment ? GPU::load2wgpu(attachment.loadOp) : WGPULoadOp_Load;
+			depth_stencil.depthStoreOp = desc.depthAttachment ? GPU::store2wgpu(attachment.storeOp) : WGPUStoreOp_Store;
+			depth_stencil.depthClearValue = static_cast<float>(attachment.clearValue);
+		}
+		if(GPU::format_has_stencil(format)) {
+			auto& attachment = desc.stencilAttachment ? *desc.stencilAttachment : *merged;
+			depth_stencil.stencilLoadOp = desc.stencilAttachment ? GPU::load2wgpu(attachment.loadOp) : WGPULoadOp_Load;
+			depth_stencil.stencilStoreOp = desc.stencilAttachment ? GPU::store2wgpu(attachment.storeOp) : WGPUStoreOp_Store;
+			depth_stencil.stencilClearValue = static_cast<uint32_t>(attachment.clearValue);
+		}
+
+		if(extent.x == 0) extent = GPU::detail::attachment_extent(merged->texture, merged->mipLevel);
+	}
+
+	WGPURenderPassDescriptor d {
+		.label = {"NoAPI Render Pass", WGPU_STRLEN},
+		.colorAttachmentCount = colors.size(),
+		.colorAttachments = colors.data(),
+		.depthStencilAttachment = merged ? &depth_stencil : nullptr,
+	};
+	cmd->render_pass = wgpuCommandEncoderBeginRenderPass(cmd->encoder, &d);
+
+	gpuSetViewportEXT(cmd, extent);
+	gpuSetScissorRectEXT(cmd, extent);
+}
+
+void gpuEndRenderPass(GpuCommandBuffer* cmd, std::optional<const GpuRenderPassDesc> desc /* = {} */) {
+	// The descriptor is only needed by backends that transition images by hand, WebGPU tracks that itself
+	endRenderPass(cmd);
+}
+
+
+
+// Matches both VkDrawIndexedIndirectCommand and WebGPU's indexed indirect argument layout
+struct GpuDrawIndexedIndirectCommand {
+	uint32_t indexCount;
+	uint32_t instanceCount;
+	uint32_t firstIndex;
+	int32_t baseVertex;
+	uint32_t firstInstance;
+};
+
+namespace GPU::detail {
+	// The monobuffers are created with Index usage, so the indices are drawn straight out of the one
+	// they were allocated in; no shadow copy (and thus nothing for no_index_buffer_changes to skip)
+	inline void bind_index_buffer(GpuCommandBuffer* cmd, gpu* indices, INDEX_TYPE_EXT index_type, bool no_offsets) {
+		auto [range, offset, address] = GPU::detail::closest_buffer(cmd->queue, indices, no_offsets);
+		assert(range.start + offset < range.end && "The indices point past the end of their allocation");
+
+		wgpuRenderPassEncoderSetIndexBuffer(cmd->render_pass, cmd->queue->monobuffers[range.buffer],
+			GPU::index2wgpu(index_type), range.start + offset, range.end - (range.start + offset));
+	}
+}
+
+void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data, gpu* indices, uint32_t index_count, uint32_t instance_count, INDEX_TYPE_EXT index_type /* = INDEX_TYPE_UINT32 */, bool no_offsets /* = false */, bool no_index_buffer_changes /* = false */) {
+	assert(cmd->render_pass);
+	assert(indices);
+
+	cmd->index_type = index_type;
+	bindRenderPipeline(cmd);
+	bindGraphicsGroups(cmd, vertex_data, fragment_data);
+	GPU::detail::bind_index_buffer(cmd, indices, index_type, no_offsets);
+
+	wgpuRenderPassEncoderDrawIndexed(cmd->render_pass, index_count, instance_count, 0, 0, 0);
+}
+
+void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data, gpu* indices, gpu* args, INDEX_TYPE_EXT index_type /* = INDEX_TYPE_UINT32 */, bool no_offsets /* = false */, bool no_index_buffer_changes /* = false */) {
+	assert(cmd->render_pass);
+	assert(indices);
+	assert(args);
+
+	cmd->index_type = index_type;
+	bindRenderPipeline(cmd);
+	bindGraphicsGroups(cmd, vertex_data, fragment_data);
+	GPU::detail::bind_index_buffer(cmd, indices, index_type, no_offsets);
+
+	auto [range, offset, address] = GPU::detail::closest_buffer(cmd->queue, args, no_offsets);
+	auto start = range.start + offset;
+	auto count = (range.end - start) / sizeof(GpuDrawIndexedIndirectCommand);
+
+	// WebGPU has no multi draw indirect (outside of an extension), so every argument struct between
+	// the provided pointer and the end of its allocation becomes its own indirect draw
+	for(size_t i = 0; i < count; ++i)
+		wgpuRenderPassEncoderDrawIndexedIndirect(cmd->render_pass, cmd->queue->monobuffers[range.buffer], start + i * sizeof(GpuDrawIndexedIndirectCommand));
+}
+
+void gpuDrawMeshlets(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, uvec3 dim) {
+	throw std::runtime_error("WebGPU doesn't support mesh shaders!");
+}
+
+void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, gpu* dim, bool no_offsets /* = false */) {
+	throw std::runtime_error("WebGPU doesn't support mesh shaders!");
 }

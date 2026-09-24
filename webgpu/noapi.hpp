@@ -190,7 +190,24 @@ struct GpuCommandBuffer {
 	WGPUComputePassEncoder compute_pass = nullptr;
 	WGPURenderPassEncoder render_pass = nullptr;
 
+	// WebGPU bakes the depth/stencil state, the blend state, and (for strip topologies) the index
+	// format into the pipeline, so all of them are tracked here and compared against what the bound
+	// pipeline's cached variant was built with. Whenever they disagree the pipeline gets rebuilt.
+	const GpuPipeline* bound_pipeline = nullptr;
+	WGPURenderPipeline bound_render_pipeline = nullptr; // Whatever is currently set on render_pass
+	std::optional<GpuDepthStencilDesc> depth_stencil = {};
+	std::optional<GpuBlendDesc> blend = {};
+	INDEX_TYPE_EXT index_type = INDEX_TYPE_UINT32;
+
 	std::vector<std::function<void()>> code_pending_submission_finished;
+};
+
+struct GpuDepthStencilState {
+	GpuDepthStencilDesc descriptor;
+};
+
+struct GpuBlendState {
+	GpuBlendDesc descriptor;
 };
 
 struct GpuTexture {
@@ -215,7 +232,15 @@ struct GpuPipeline {
 	};
 
 	struct RenderCache {
-		mutable WGPURenderPipeline pipeline;
+		std::string vertexIR, fragmentIR;
+		std::vector<GpuColorTarget> color_targets; // Backing storage for descriptor.colorTargets
+		GpuRasterDesc descriptor;
+
+		// The dynamic state the currently cached variant was built against (nothing is cached until pipeline is set)
+		mutable std::optional<GpuDepthStencilDesc> depth_stencil = {};
+		mutable std::optional<GpuBlendDesc> blend = {};
+		mutable INDEX_TYPE_EXT index_type = INDEX_TYPE_UINT32; // Only relevant for strip topologies
+		mutable WGPURenderPipeline pipeline = nullptr;
 	};
 
 	mutable WGPUPipelineLayout reference_layout; // The layout that the currently cached variant of this pipeline is built against

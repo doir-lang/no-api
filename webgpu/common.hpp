@@ -2,6 +2,7 @@
 
 #include "webgpu/noapi.hpp"
 
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <thread>
@@ -468,6 +469,153 @@ fn cs_set_max() {
 			usage |= WGPUTextureUsage_RenderAttachment;
 
 		return usage;
+	}
+
+	inline WGPUCompareFunction op2wgpu(OP op) {
+		switch (op) {
+		case OP_NEVER: return WGPUCompareFunction_Never;
+		case OP_LESS: return WGPUCompareFunction_Less;
+		case OP_EQUAL: return WGPUCompareFunction_Equal;
+		case OP_LESS_EQUAL: return WGPUCompareFunction_LessEqual;
+		case OP_GREATER: return WGPUCompareFunction_Greater;
+		case OP_NOT_EQUAL: return WGPUCompareFunction_NotEqual;
+		case OP_GREATER_EQUAL: return WGPUCompareFunction_GreaterEqual;
+		case OP_ALWAYS: return WGPUCompareFunction_Always;
+		}
+		return WGPUCompareFunction_Always;
+	}
+
+	inline WGPUStencilOperation stencil2wgpu(STENCIL_OP op) {
+		switch (op) {
+		case STENCIL_OP_KEEP: return WGPUStencilOperation_Keep;
+		case STENCIL_OP_ZERO: return WGPUStencilOperation_Zero;
+		case STENCIL_OP_REPLACE: return WGPUStencilOperation_Replace;
+		case STENCIL_OP_INCR_SAT: return WGPUStencilOperation_IncrementClamp;
+		case STENCIL_OP_DECR_SAT: return WGPUStencilOperation_DecrementClamp;
+		case STENCIL_OP_INVERT: return WGPUStencilOperation_Invert;
+		case STENCIL_OP_INCR_WRAP: return WGPUStencilOperation_IncrementWrap;
+		case STENCIL_OP_DECR_WRAP: return WGPUStencilOperation_DecrementWrap;
+		}
+		return WGPUStencilOperation_Keep;
+	}
+
+	inline WGPUBlendOperation blend2wgpu(BLEND op) {
+		switch (op) {
+		case BLEND_ADD: return WGPUBlendOperation_Add;
+		case BLEND_SUBTRACT: return WGPUBlendOperation_Subtract;
+		case BLEND_REV_SUBTRACT: return WGPUBlendOperation_ReverseSubtract;
+		case BLEND_MIN: return WGPUBlendOperation_Min;
+		case BLEND_MAX: return WGPUBlendOperation_Max;
+		}
+		return WGPUBlendOperation_Add;
+	}
+
+	inline WGPUBlendFactor factor2wgpu(FACTOR factor) {
+		switch (factor) {
+		case FACTOR_ZERO: return WGPUBlendFactor_Zero;
+		case FACTOR_ONE: return WGPUBlendFactor_One;
+		case FACTOR_SRC_COLOR: return WGPUBlendFactor_Src;
+		case FACTOR_ONE_MINUS_SRC_COLOR: return WGPUBlendFactor_OneMinusSrc;
+		case FACTOR_DST_COLOR: return WGPUBlendFactor_Dst;
+		case FACTOR_ONE_MINUS_DST_COLOR: return WGPUBlendFactor_OneMinusDst;
+		case FACTOR_SRC_ALPHA: return WGPUBlendFactor_SrcAlpha;
+		case FACTOR_ONE_MINUS_SRC_ALPHA: return WGPUBlendFactor_OneMinusSrcAlpha;
+		case FACTOR_DST_ALPHA: return WGPUBlendFactor_DstAlpha;
+		case FACTOR_ONE_MINUS_DST_ALPHA: return WGPUBlendFactor_OneMinusDstAlpha;
+		case FACTOR_SRC1_COLOR: return WGPUBlendFactor_Src1;
+		case FACTOR_ONE_MINUS_SRC1_COLOR: return WGPUBlendFactor_OneMinusSrc1;
+		case FACTOR_SRC1_ALPHA: return WGPUBlendFactor_Src1Alpha;
+		case FACTOR_ONE_MINUS_SRC1_ALPHA: return WGPUBlendFactor_OneMinusSrc1Alpha;
+		}
+		return WGPUBlendFactor_One;
+	}
+
+	inline WGPUColorWriteMask mask2wgpu(uint8_t mask) {
+		WGPUColorWriteMask out = WGPUColorWriteMask_None;
+		if (mask & 0x1) out |= WGPUColorWriteMask_Red;
+		if (mask & 0x2) out |= WGPUColorWriteMask_Green;
+		if (mask & 0x4) out |= WGPUColorWriteMask_Blue;
+		if (mask & 0x8) out |= WGPUColorWriteMask_Alpha;
+		return out;
+	}
+
+	inline WGPUPrimitiveTopology topology2wgpu(TOPOLOGY topology) {
+		switch (topology) {
+		case TOPOLOGY_TRIANGLE_LIST: return WGPUPrimitiveTopology_TriangleList;
+		case TOPOLOGY_TRIANGLE_STRIP: return WGPUPrimitiveTopology_TriangleStrip;
+		}
+		return WGPUPrimitiveTopology_TriangleList;
+	}
+
+	// We define counter clockwise triangles as front facing (matching the Vulkan backend)
+	inline WGPUCullMode cull2wgpu(CULL cull) {
+		switch (cull) {
+		case CULL_NONE: return WGPUCullMode_None;
+		case CULL_CCW: return WGPUCullMode_Front;
+		case CULL_CW: return WGPUCullMode_Back;
+		case CULL_ALL:
+			assert(false && "WebGPU can't cull both faces at once, use an empty color target list instead");
+			return WGPUCullMode_Back;
+		}
+		return WGPUCullMode_None;
+	}
+
+	inline WGPUIndexFormat index2wgpu(INDEX_TYPE_EXT type) {
+		switch (type) {
+		case INDEX_TYPE_UINT16: return WGPUIndexFormat_Uint16;
+		case INDEX_TYPE_UINT32: return WGPUIndexFormat_Uint32;
+		case INDEX_TYPE_UINT8:
+			assert(false && "8 bit indices aren't supported by WebGPU");
+			return WGPUIndexFormat_Uint16;
+		}
+		return WGPUIndexFormat_Uint32;
+	}
+
+	// WebGPU has no "don't care", but discarding/clearing expresses the same intent to a tiler
+	inline WGPULoadOp load2wgpu(LOAD_OP op) {
+		switch (op) {
+		case LOAD_OP_LOAD: return WGPULoadOp_Load;
+		case LOAD_OP_CLEAR:
+		case LOAD_OP_DONT_CARE: return WGPULoadOp_Clear;
+		}
+		return WGPULoadOp_Load;
+	}
+
+	inline WGPUStoreOp store2wgpu(STORE_OP op) {
+		switch (op) {
+		case STORE_OP_STORE: return WGPUStoreOp_Store;
+		case STORE_OP_DONT_CARE: return WGPUStoreOp_Discard;
+		}
+		return WGPUStoreOp_Store;
+	}
+
+	// Every depth/stencil format we expose that carries a stencil aspect also carries a depth one
+	inline bool format_has_stencil(FORMAT format) {
+		return format == FORMAT_D24_UNORM_S8_UINT || format == FORMAT_D32_FLOAT_S8_UINT;
+	}
+
+	inline bool operator==(const GpuStencil& a, const GpuStencil& b) {
+		return a.test == b.test && a.failOp == b.failOp && a.passOp == b.passOp
+			&& a.depthFailOp == b.depthFailOp && a.reference == b.reference;
+	}
+
+	inline bool operator==(const GpuDepthStencilDesc& a, const GpuDepthStencilDesc& b) {
+		return a.depthMode == b.depthMode && a.depthTest == b.depthTest && a.depthBias == b.depthBias
+			&& a.depthBiasSlopeFactor == b.depthBiasSlopeFactor && a.depthBiasClamp == b.depthBiasClamp
+			&& a.stencilReadMask == b.stencilReadMask && a.stencilWriteMask == b.stencilWriteMask
+			&& a.stencilFront == b.stencilFront && a.stencilBack == b.stencilBack;
+	}
+
+	inline bool operator==(const GpuBlendDesc& a, const GpuBlendDesc& b) {
+		return a.colorOp == b.colorOp && a.srcColorFactor == b.srcColorFactor && a.dstColorFactor == b.dstColorFactor
+			&& a.alphaOp == b.alphaOp && a.srcAlphaFactor == b.srcAlphaFactor && a.dstAlphaFactor == b.dstAlphaFactor
+			&& a.colorWriteMask == b.colorWriteMask;
+	}
+
+	template<typename T>
+	inline bool same(const std::optional<T>& a, const std::optional<T>& b) {
+		if(a.has_value() != b.has_value()) return false;
+		return !a.has_value() || *a == *b;
 	}
 
 	inline WGPUTextureDescriptor texture2wgpu(const GpuTextureDesc& src, std::string_view label = "") {
