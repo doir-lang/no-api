@@ -249,7 +249,7 @@ struct GpuRasterDesc {
 	FORMAT depthFormat = FORMAT_NONE;
 
 	///< Stencil attachment format, or FORMAT_NONE. On most hardware the depth
-	///< and stencil share the same memory allocation (e.g. FORMAT_D24_UNORM_S8_UINT).
+	///< and stencil share the same memory allocation (e.g. FORMAT_D24_PLUS_S8_UINT).
 	FORMAT stencilFormat = FORMAT_NONE;
 
 	///< List of color render target formats and write masks. Maximum is

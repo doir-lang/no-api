@@ -1,20 +1,760 @@
 #include "noapi.hpp"
-#include "common.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <thread>
+#include <unordered_map>
 #include <variant>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
 #endif
+
+namespace GPU {
+
+	static const char* semaphore_wgsl_code = R"WGSL(
+struct SemaphoreData {
+	lo: atomic<u32>,
+	hi: atomic<u32>,
+}
+
+struct SetValue {
+	lo: u32,
+	hi: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> semaphore_buf: SemaphoreData;
+@group(0) @binding(1) var<uniform> set_value: SetValue;
+
+@compute @workgroup_size(1)
+fn cs_increment() {
+	loop {
+		let old_lo = atomicLoad(&semaphore_buf.lo);
+		let new_lo = old_lo + 1u; // wraps 0xFFFFFFFF -> 0 on overflow
+		let r = atomicCompareExchangeWeak(&semaphore_buf.lo, old_lo, new_lo);
+		if (r.exchanged) {
+			if (new_lo == 0u) {
+				atomicAdd(&semaphore_buf.hi, 1u);
+			}
+			break;
+		}
+		// else: another invocation raced us on `lo`, retry.
+	}
+}
+
+@compute @workgroup_size(1)
+fn cs_set() {
+	atomicStore(&semaphore_buf.lo, set_value.lo);
+	atomicStore(&semaphore_buf.hi, set_value.hi);
+}
+
+@compute @workgroup_size(1)
+fn cs_set_max() {
+	let cur_lo = atomicLoad(&semaphore_buf.lo);
+	let cur_hi = atomicLoad(&semaphore_buf.hi);
+	let new_lo = set_value.lo;
+	let new_hi = set_value.hi;
+
+	let is_greater = (new_hi > cur_hi) || (new_hi == cur_hi && new_lo > cur_lo);
+	if (is_greater) {
+		atomicStore(&semaphore_buf.lo, new_lo);
+		atomicStore(&semaphore_buf.hi, new_hi);
+	}
+})WGSL";
+
+	inline void ensure_semaphore_pipelines(GpuQueue* queue) {
+		if(queue->semaphore_bind_group_layout) return;
+
+		std::array<WGPUBindGroupLayoutEntry, 2> entries = {
+			WGPUBindGroupLayoutEntry{
+				.binding = 0,
+				.visibility = WGPUShaderStage_Compute,
+				.buffer = {
+					.type = WGPUBufferBindingType_Storage,
+					.minBindingSize = sizeof(uint64_t),
+				}
+			}, WGPUBindGroupLayoutEntry{
+				.binding = 1,
+				.visibility = WGPUShaderStage_Compute,
+				.buffer = {
+					.type = WGPUBufferBindingType_Uniform,
+					.minBindingSize = sizeof(uint64_t),
+				}
+			}
+		};
+
+		WGPUBindGroupLayoutDescriptor bind_group{
+			.entryCount = entries.size(),
+			.entries = entries.data(),
+		};
+		queue->semaphore_bind_group_layout = wgpuDeviceCreateBindGroupLayout(queue->device, &bind_group);
+
+		WGPUPipelineLayoutDescriptor pipeline_layout_desc{
+			.bindGroupLayoutCount = 1,
+			.bindGroupLayouts = &queue->semaphore_bind_group_layout,
+		};
+		WGPUPipelineLayout pipeline_layout = wgpuDeviceCreatePipelineLayout(queue->device, &pipeline_layout_desc);
+
+		WGPUShaderSourceWGSL wgsl{
+			.chain = {.sType = WGPUSType_ShaderSourceWGSL},
+			.code = {semaphore_wgsl_code, WGPU_STRLEN}
+		};
+		WGPUShaderModuleDescriptor shader_module_desc{
+			.nextInChain = &wgsl.chain
+		};
+		WGPUShaderModule shader_module = wgpuDeviceCreateShaderModule(queue->device, &shader_module_desc);
+
+		WGPUComputePipelineDescriptor increment{
+			.layout = pipeline_layout,
+			.compute = {
+				.module = shader_module,
+				.entryPoint = {"cs_increment", WGPU_STRLEN},
+			},
+		};
+		queue->semaphore_increment_pipeline = wgpuDeviceCreateComputePipeline(queue->device, &increment);
+
+		WGPUComputePipelineDescriptor set{
+			.layout = pipeline_layout,
+			.compute = {
+				.module = shader_module,
+				.entryPoint = {"cs_set", WGPU_STRLEN},
+			},
+		};
+		queue->semaphore_set_pipeline = wgpuDeviceCreateComputePipeline(queue->device, &set);
+
+		WGPUComputePipelineDescriptor set_max{
+			.layout = pipeline_layout,
+			.compute = {
+				.module = shader_module,
+				.entryPoint = {"cs_set_max", WGPU_STRLEN},
+			},
+		};
+		queue->semaphore_set_max_pipeline = wgpuDeviceCreateComputePipeline(queue->device, &set_max);
+
+		wgpuShaderModuleRelease(shader_module);
+		wgpuPipelineLayoutRelease(pipeline_layout);
+	}
+
+	inline void wait_for_buffer_map(GpuQueue* queue, WGPUBuffer buffer, WGPUMapMode mode, uint64_t offset, uint64_t size) {
+		struct Wait { volatile bool done = false; };
+		Wait wait;
+
+		WGPUBufferMapCallbackInfo callback{
+			.mode = WGPUCallbackMode_AllowSpontaneous,
+			.callback = [](WGPUMapAsyncStatus _status, WGPUStringView _message, void* userdata1, void* _userdata2) {
+				static_cast<Wait*>(userdata1)->done = true;
+			},
+			.userdata1 = &wait,
+		};
+		wgpuBufferMapAsync(buffer, mode, offset, size, callback);
+
+		while (!wait.done) {
+		#ifdef __EMSCRIPTEN__
+			emscripten_sleep(1); // yields back to the browser event loop
+		#else
+			wgpuDeviceTick(queue->device);
+		#endif
+		}
+	}
+
+	inline uint64_t semaphore_cpu_set(GpuQueue* queue, GpuSemaphore sema, uint64_t value = 1) {
+		wgpuQueueWriteBuffer(queue->queue, sema.buffer, 0, &value, sizeof(value));
+		return value;
+	}
+
+	inline GpuSemaphore semaphore_initialize(GpuQueue* queue, uint64_t initial_value) {
+		GpuSemaphore out{};
+
+		WGPUBufferDescriptor buffer{
+			.label = {"NoAPI Semaphore Storage Buffer", WGPU_STRLEN},
+			.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst,
+			.size = sizeof(uint64_t),
+		};
+		out.buffer = wgpuDeviceCreateBuffer(queue->device, &buffer);
+
+		WGPUBufferDescriptor readback{
+			.label = {"NoAPI Semaphore Value Readback Buffer", WGPU_STRLEN},
+			.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst,
+			.size = sizeof(uint64_t),
+		};
+		out.readback_buffer = wgpuDeviceCreateBuffer(queue->device, &readback);
+
+		WGPUBufferDescriptor upload{
+			.label = {"NoAPI Semaphore Value Upload Buffer", WGPU_STRLEN},
+			.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst,
+			.size = sizeof(uint64_t),
+		};
+		out.upload_buffer = wgpuDeviceCreateBuffer(queue->device, &upload);
+
+		ensure_semaphore_pipelines(queue);
+
+		std::array<WGPUBindGroupEntry, 2> entries = {
+			WGPUBindGroupEntry{
+				.binding = 0,
+				.buffer = out.buffer,
+				.size = sizeof(uint64_t),
+			}, WGPUBindGroupEntry{
+				.binding = 1,
+				.buffer = out.upload_buffer,
+				.size = sizeof(uint64_t),
+			}
+		};
+		WGPUBindGroupDescriptor bind_group{
+			.layout = queue->semaphore_bind_group_layout,
+			.entryCount = entries.size(),
+			.entries = entries.data(),
+		};
+		out.bind_group = wgpuDeviceCreateBindGroup(queue->device, &bind_group);
+
+		semaphore_cpu_set(queue, out, initial_value);
+		return out;
+	}
+
+	inline uint64_t semaphore_value(GpuQueue* queue, GpuSemaphore sema) {
+		WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(queue->device, nullptr);
+		wgpuCommandEncoderCopyBufferToBuffer(encoder, sema.buffer, 0, sema.readback_buffer, 0, sizeof(uint64_t));
+
+		WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, nullptr);
+		wgpuCommandEncoderRelease(encoder);
+
+		wgpuQueueSubmit(queue->queue, 1, &cmd);
+		wgpuCommandBufferRelease(cmd);
+
+		wait_for_buffer_map(queue, sema.readback_buffer, WGPUMapMode_Read, 0, sizeof(uint64_t));
+
+		const void* mapped = wgpuBufferGetConstMappedRange(sema.readback_buffer, 0, sizeof(uint64_t));
+		uint64_t result = 0;
+		std::memcpy(&result, mapped, sizeof(uint64_t));
+		wgpuBufferUnmap(sema.readback_buffer);
+
+		return result;
+	}
+
+	inline bool semaphore_wait(GpuQueue* queue, GpuSemaphore sema, uint64_t target_value, std::chrono::nanoseconds timeout = std::chrono::nanoseconds::max(), std::chrono::nanoseconds poll_interval = std::chrono::milliseconds(1)) {
+		const bool infinite = (timeout == std::chrono::nanoseconds::max());
+		const auto deadline = infinite ? std::chrono::steady_clock::time_point::max() : std::chrono::steady_clock::now() + timeout;
+
+		while (true) {
+			if (semaphore_value(queue, sema) >= target_value)
+				return true;
+			if (!infinite && std::chrono::steady_clock::now() >= deadline)
+				return false;
+#ifdef __EMSCRIPTEN__
+			emscripten_sleep(std::chrono::duration_cast<std::chrono::milliseconds>(poll_interval).count());
+#else
+			std::this_thread::sleep_for(poll_interval);
+#endif
+		}
+	}
+
+	inline void semaphore_gpu_increment(GpuCommandBuffer* cmd, GpuSemaphore sema) {
+		ensure_semaphore_pipelines(cmd->queue);
+
+		WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(cmd->encoder, nullptr);
+		wgpuComputePassEncoderSetPipeline(pass, cmd->queue->semaphore_increment_pipeline);
+		wgpuComputePassEncoderSetBindGroup(pass, 0, sema.bind_group, 0, nullptr);
+		wgpuComputePassEncoderDispatchWorkgroups(pass, 1, 1, 1);
+		wgpuComputePassEncoderEnd(pass);
+		wgpuComputePassEncoderRelease(pass);
+	}
+
+	inline void semaphore_gpu_set(GpuCommandBuffer* cmd, GpuSemaphore sema, uint64_t value = 1) {
+		wgpuQueueWriteBuffer(cmd->queue->queue, sema.upload_buffer, 0, &value, sizeof(value));
+
+		ensure_semaphore_pipelines(cmd->queue);
+
+		WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(cmd->encoder, nullptr);
+		wgpuComputePassEncoderSetPipeline(pass, cmd->queue->semaphore_set_pipeline);
+		wgpuComputePassEncoderSetBindGroup(pass, 0, sema.bind_group, 0, nullptr);
+		wgpuComputePassEncoderDispatchWorkgroups(pass, 1, 1, 1);
+		wgpuComputePassEncoderEnd(pass);
+		wgpuComputePassEncoderRelease(pass);
+	}
+
+	inline void semaphore_gpu_set_max(GpuCommandBuffer* cmd, GpuSemaphore sema, uint64_t value = 1) {
+		wgpuQueueWriteBuffer(cmd->queue->queue, sema.upload_buffer, 0, &value, sizeof(value));
+
+		ensure_semaphore_pipelines(cmd->queue);
+
+		WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(cmd->encoder, nullptr);
+		wgpuComputePassEncoderSetPipeline(pass, cmd->queue->semaphore_set_max_pipeline);
+		wgpuComputePassEncoderSetBindGroup(pass, 0, sema.bind_group, 0, nullptr);
+		wgpuComputePassEncoderDispatchWorkgroups(pass, 1, 1, 1);
+		wgpuComputePassEncoderEnd(pass);
+		wgpuComputePassEncoderRelease(pass);
+	}
+
+	inline void semaphore_cpu_set_max(GpuQueue* queue, GpuSemaphore sema, uint64_t value = 1) {
+		GpuCommandBuffer cmd {
+			.queue = queue,
+			.encoder = wgpuDeviceCreateCommandEncoder(queue->device, nullptr)
+		};
+		semaphore_gpu_set_max(&cmd, sema, value);
+
+		WGPUCommandBuffer cb = wgpuCommandEncoderFinish(cmd.encoder, nullptr);
+		wgpuCommandEncoderRelease(cmd.encoder);
+
+		wgpuQueueSubmit(queue->queue, 1, &cb);
+		wgpuCommandBufferRelease(cb);
+	}
+
+	inline void semaphore_destroy(GpuSemaphore sema) {
+		wgpuBindGroupRelease(sema.bind_group);
+		wgpuBufferRelease(sema.upload_buffer);
+		wgpuBufferRelease(sema.readback_buffer);
+		wgpuBufferRelease(sema.buffer);
+	}
+
+
+
+	// Processess all of the pending code snippets associated with already finished submissions
+	inline void process_pending_code(GpuQueue* queue) {
+		auto current_finished_submission = GPU::semaphore_value(queue, queue->current_submission_timeline_semaphore);
+		if(queue->code_pending_submission_finished.size())
+			for(size_t i = queue->code_pending_submission_finished.size(); i--; ) {
+				auto& [code, submit] = queue->code_pending_submission_finished[i];
+				if(submit <= current_finished_submission) {
+					code();
+					queue->code_pending_submission_finished.erase(queue->code_pending_submission_finished.begin() + i);
+				}
+			}
+	}
+
+	inline void push_to_monobuffer(GpuCommandBuffer* cmd, GpuQueue::MonobufferRange range, void* cpu) {
+		auto size = range.size();
+		WGPUBufferDescriptor d{
+			.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_MapWrite,
+			.size = size,
+			.mappedAtCreation = true,
+		};
+		auto tmp = wgpuDeviceCreateBuffer(cmd->queue->device, &d);
+		auto tmp_cpu = wgpuBufferGetMappedRange(tmp, 0, size);
+		memcpy(tmp_cpu, cpu, size);
+		wgpuBufferUnmap(tmp);
+
+		wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, tmp, 0, cmd->queue->monobuffers[range.buffer], range.start, size);
+		cmd->code_pending_submission_finished.emplace_back([tmp]() {
+			wgpuBufferRelease(tmp);
+		});
+	}
+
+	inline size_t push_to_monobuffer(GpuQueue* queue, GpuQueue::MonobufferRange range, void* cpu) {
+		auto cmd = gpuStartCommandRecording(queue);
+		push_to_monobuffer(cmd, range, cpu);
+		return gpuSubmit(queue, {&cmd, 1});
+
+		// If we are just pushing to the buffer I don't think we always care about making sure the process is 100% finished.
+		// So returning the submission index which we can wait on if we do care seems fine...
+		// GPU::semaphore_wait(queue, queue->current_submission_timeline_semaphore, submit_index);
+		// GPU::process_pending_code(queue);
+	}
+
+	inline void pull_from_monobuffer(GpuCommandBuffer* cmd, GpuQueue::MonobufferRange range, void* cpu) {
+		auto size = range.size();
+
+		WGPUBufferDescriptor d{
+			.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead,
+			.size = size,
+		};
+		auto tmp = wgpuDeviceCreateBuffer(cmd->queue->device, &d);
+
+		wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, cmd->queue->monobuffers[range.buffer], range.start, tmp, 0, size);
+		cmd->code_pending_submission_finished.emplace_back([queue = cmd->queue, tmp, cpu, size]() {
+			GPU::wait_for_buffer_map(queue, tmp, WGPUMapMode_Read, 0, size);
+
+			auto tmp_cpu = wgpuBufferGetConstMappedRange(tmp, 0, size);
+			memcpy(cpu, tmp_cpu, size);
+
+			wgpuBufferRelease(tmp);
+		});
+	}
+
+	inline void pull_from_monobuffer(GpuQueue* queue, GpuQueue::MonobufferRange range, void* cpu) {
+		auto cmd = gpuStartCommandRecording(queue);
+		pull_from_monobuffer(cmd, range, cpu);
+		auto submit_index = gpuSubmit(queue, {&cmd, 1});
+
+		// When we pull it seems much more likely that we want the cpu memory updated before considering our work "done"
+		GPU::semaphore_wait(queue, queue->current_submission_timeline_semaphore, submit_index);
+		GPU::process_pending_code(queue);
+	}
+
+
+
+	inline WGPUTextureDimension texture2wgpu(TEXTURE type){
+		switch (type){
+		case TEXTURE_1D:
+			return WGPUTextureDimension_1D;
+
+		case TEXTURE_2D:
+		case TEXTURE_2D_ARRAY:
+		case TEXTURE_CUBE:
+		case TEXTURE_CUBE_ARRAY:
+			return WGPUTextureDimension_2D;
+
+		case TEXTURE_3D:
+			return WGPUTextureDimension_3D;
+
+		default:
+			return WGPUTextureDimension_2D;
+		}
+	}
+
+	inline WGPUTextureViewDimension texture_view2wgpu(TEXTURE type){
+		switch (type){
+		case TEXTURE_2D:
+		case TEXTURE_2D_ARRAY:
+			return WGPUTextureViewDimension_2DArray;
+		case TEXTURE_CUBE_ARRAY:
+			return WGPUTextureViewDimension_CubeArray;
+		case TEXTURE_3D:
+			return WGPUTextureViewDimension_3D;
+		default:
+			return WGPUTextureViewDimension_2D;
+		}
+	}
+
+	inline WGPUTextureFormat format2wgpu(FORMAT format){
+		switch (format) {
+		case FORMAT_R8_UNORM: return WGPUTextureFormat_R8Unorm;
+		case FORMAT_R8_SNORM: return WGPUTextureFormat_R8Snorm;
+		case FORMAT_R8_UINT: return WGPUTextureFormat_R8Uint;
+		case FORMAT_R8_SINT: return WGPUTextureFormat_R8Sint;
+
+		case FORMAT_R16_UNORM: return WGPUTextureFormat_R16Unorm;
+		case FORMAT_R16_SNORM: return WGPUTextureFormat_R16Snorm;
+		case FORMAT_R16_UINT: return WGPUTextureFormat_R16Uint;
+		case FORMAT_R16_SINT: return WGPUTextureFormat_R16Sint;
+		case FORMAT_R16_FLOAT: return WGPUTextureFormat_R16Float;
+		case FORMAT_RG8_UNORM: return WGPUTextureFormat_RG8Unorm;
+		case FORMAT_RG8_SNORM: return WGPUTextureFormat_RG8Snorm;
+		case FORMAT_RG8_UINT: return WGPUTextureFormat_RG8Uint;
+		case FORMAT_RG8_SINT: return WGPUTextureFormat_RG8Sint;
+
+		case FORMAT_R32_UINT: return WGPUTextureFormat_R32Uint;
+		case FORMAT_R32_SINT: return WGPUTextureFormat_R32Sint;
+		case FORMAT_R32_FLOAT: return WGPUTextureFormat_R32Float;
+		case FORMAT_RG16_UNORM: return WGPUTextureFormat_RG16Unorm;
+		case FORMAT_RG16_SNORM: return WGPUTextureFormat_RG16Snorm;
+		case FORMAT_RG16_UINT: return WGPUTextureFormat_RG16Uint;
+		case FORMAT_RG16_SINT: return WGPUTextureFormat_RG16Sint;
+		case FORMAT_RG16_FLOAT: return WGPUTextureFormat_RG16Float;
+		case FORMAT_RGBA8_UNORM: return WGPUTextureFormat_RGBA8Unorm;
+		case FORMAT_RGBA8_SRGB: return WGPUTextureFormat_RGBA8UnormSrgb;
+		case FORMAT_RGBA8_SNORM: return WGPUTextureFormat_RGBA8Snorm;
+		case FORMAT_RGBA8_UINT: return WGPUTextureFormat_RGBA8Uint;
+		case FORMAT_RGBA8_SINT: return WGPUTextureFormat_RGBA8Sint;
+		case FORMAT_BGRA8_UNORM: return WGPUTextureFormat_BGRA8Unorm;
+		case FORMAT_BGRA8_SRGB: return WGPUTextureFormat_BGRA8UnormSrgb;
+
+		case FORMAT_RGB10_A2_UINT: return WGPUTextureFormat_RGB10A2Uint;
+		case FORMAT_RGB10_A2_UNORM: return WGPUTextureFormat_RGB10A2Unorm;
+		case FORMAT_RG11B10_UFLOAT: return WGPUTextureFormat_RG11B10Ufloat;
+		case FORMAT_RGB9E5_UFLOAT: return WGPUTextureFormat_RGB9E5Ufloat;
+
+		case FORMAT_RG32_UINT: return WGPUTextureFormat_RG32Uint;
+		case FORMAT_RG32_SINT: return WGPUTextureFormat_RG32Sint;
+		case FORMAT_RG32_FLOAT: return WGPUTextureFormat_RG32Float;
+		case FORMAT_RGBA16_UNORM: return WGPUTextureFormat_RGBA16Unorm;
+		case FORMAT_RGBA16_SNORM: return WGPUTextureFormat_RGBA16Snorm;
+		case FORMAT_RGBA16_UINT: return WGPUTextureFormat_RGBA16Uint;
+		case FORMAT_RGBA16_SINT: return WGPUTextureFormat_RGBA16Sint;
+		case FORMAT_RGBA16_FLOAT: return WGPUTextureFormat_RGBA16Float;
+
+		case FORMAT_RGBA32_UINT: return WGPUTextureFormat_RGBA32Uint;
+		case FORMAT_RGBA32_SINT: return WGPUTextureFormat_RGBA32Sint;
+		case FORMAT_RGBA32_FLOAT: return WGPUTextureFormat_RGBA32Float;
+
+		case FORMAT_S8_UINT: return WGPUTextureFormat_Stencil8;
+		case FORMAT_D16_UNORM: return WGPUTextureFormat_Depth16Unorm;
+		case FORMAT_D24_PLUS: return WGPUTextureFormat_Depth24Plus;
+		case FORMAT_D24_PLUS_S8_UINT: return WGPUTextureFormat_Depth24PlusStencil8;
+		case FORMAT_D32_FLOAT: return WGPUTextureFormat_Depth32Float;
+		case FORMAT_D32_FLOAT_S8_UINT: return WGPUTextureFormat_Depth32FloatStencil8;
+
+		default:
+			return WGPUTextureFormat_Undefined;
+		}
+	}
+
+	inline WGPUTextureUsage usage2wgpu(TEXTURE_USAGE_FLAGS flags) {
+		WGPUTextureUsage usage = WGPUTextureUsage_None;
+
+		if (flags & USAGE_TRANSFER_SRC)
+			usage |= WGPUTextureUsage_CopySrc;
+
+		if (flags & USAGE_TRANSFER_DST)
+			usage |= WGPUTextureUsage_CopyDst;
+
+		if (flags & USAGE_SAMPLED)
+			usage |= WGPUTextureUsage_TextureBinding;
+
+		if (flags & USAGE_STORAGE)
+			usage |= WGPUTextureUsage_StorageBinding;
+
+		if (flags & USAGE_COLOR_ATTACHMENT || flags & USAGE_DEPTH_STENCIL_ATTACHMENT)
+			usage |= WGPUTextureUsage_RenderAttachment;
+
+		return usage;
+	}
+
+	// Names a WebGPU format the API can talk about again, or FORMAT_NONE for one it can't. Only
+	// needed where WebGPU picks the format rather than us — which today means a surface reporting
+	// the formats it prefers (see gpuSurfaceReconfigureEXT).
+	inline FORMAT wgpu2format(WGPUTextureFormat format) {
+		switch (format) {
+		case WGPUTextureFormat_R8Unorm: return FORMAT_R8_UNORM;
+		case WGPUTextureFormat_R8Snorm: return FORMAT_R8_SNORM;
+		case WGPUTextureFormat_R8Uint: return FORMAT_R8_UINT;
+		case WGPUTextureFormat_R8Sint: return FORMAT_R8_SINT;
+
+		case WGPUTextureFormat_R16Unorm: return FORMAT_R16_UNORM;
+		case WGPUTextureFormat_R16Snorm: return FORMAT_R16_SNORM;
+		case WGPUTextureFormat_R16Uint: return FORMAT_R16_UINT;
+		case WGPUTextureFormat_R16Sint: return FORMAT_R16_SINT;
+		case WGPUTextureFormat_R16Float: return FORMAT_R16_FLOAT;
+		case WGPUTextureFormat_RG8Unorm: return FORMAT_RG8_UNORM;
+		case WGPUTextureFormat_RG8Snorm: return FORMAT_RG8_SNORM;
+		case WGPUTextureFormat_RG8Uint: return FORMAT_RG8_UINT;
+		case WGPUTextureFormat_RG8Sint: return FORMAT_RG8_SINT;
+
+		case WGPUTextureFormat_R32Uint: return FORMAT_R32_UINT;
+		case WGPUTextureFormat_R32Sint: return FORMAT_R32_SINT;
+		case WGPUTextureFormat_R32Float: return FORMAT_R32_FLOAT;
+		case WGPUTextureFormat_RG16Unorm: return FORMAT_RG16_UNORM;
+		case WGPUTextureFormat_RG16Snorm: return FORMAT_RG16_SNORM;
+		case WGPUTextureFormat_RG16Uint: return FORMAT_RG16_UINT;
+		case WGPUTextureFormat_RG16Sint: return FORMAT_RG16_SINT;
+		case WGPUTextureFormat_RG16Float: return FORMAT_RG16_FLOAT;
+		case WGPUTextureFormat_RGBA8Unorm: return FORMAT_RGBA8_UNORM;
+		case WGPUTextureFormat_RGBA8UnormSrgb: return FORMAT_RGBA8_SRGB;
+		case WGPUTextureFormat_RGBA8Snorm: return FORMAT_RGBA8_SNORM;
+		case WGPUTextureFormat_RGBA8Uint: return FORMAT_RGBA8_UINT;
+		case WGPUTextureFormat_RGBA8Sint: return FORMAT_RGBA8_SINT;
+		case WGPUTextureFormat_BGRA8Unorm: return FORMAT_BGRA8_UNORM;
+		case WGPUTextureFormat_BGRA8UnormSrgb: return FORMAT_BGRA8_SRGB;
+
+		case WGPUTextureFormat_RGB10A2Uint: return FORMAT_RGB10_A2_UINT;
+		case WGPUTextureFormat_RGB10A2Unorm: return FORMAT_RGB10_A2_UNORM;
+		case WGPUTextureFormat_RG11B10Ufloat: return FORMAT_RG11B10_UFLOAT;
+		case WGPUTextureFormat_RGB9E5Ufloat: return FORMAT_RGB9E5_UFLOAT;
+
+		case WGPUTextureFormat_RG32Uint: return FORMAT_RG32_UINT;
+		case WGPUTextureFormat_RG32Sint: return FORMAT_RG32_SINT;
+		case WGPUTextureFormat_RG32Float: return FORMAT_RG32_FLOAT;
+		case WGPUTextureFormat_RGBA16Unorm: return FORMAT_RGBA16_UNORM;
+		case WGPUTextureFormat_RGBA16Snorm: return FORMAT_RGBA16_SNORM;
+		case WGPUTextureFormat_RGBA16Uint: return FORMAT_RGBA16_UINT;
+		case WGPUTextureFormat_RGBA16Sint: return FORMAT_RGBA16_SINT;
+		case WGPUTextureFormat_RGBA16Float: return FORMAT_RGBA16_FLOAT;
+
+		case WGPUTextureFormat_RGBA32Uint: return FORMAT_RGBA32_UINT;
+		case WGPUTextureFormat_RGBA32Sint: return FORMAT_RGBA32_SINT;
+		case WGPUTextureFormat_RGBA32Float: return FORMAT_RGBA32_FLOAT;
+
+		case WGPUTextureFormat_Stencil8: return FORMAT_S8_UINT;
+		case WGPUTextureFormat_Depth16Unorm: return FORMAT_D16_UNORM;
+		case WGPUTextureFormat_Depth24Plus: return FORMAT_D24_PLUS;
+		case WGPUTextureFormat_Depth24PlusStencil8: return FORMAT_D24_PLUS_S8_UINT;
+		case WGPUTextureFormat_Depth32Float: return FORMAT_D32_FLOAT;
+		case WGPUTextureFormat_Depth32FloatStencil8: return FORMAT_D32_FLOAT_S8_UINT;
+
+		default: return FORMAT_NONE;
+		}
+	}
+
+	// PRESENT_MODE_BEST_AVAILABLE has no WebGPU spelling, so it is resolved against what the surface
+	// supports before this is reached (see GPU::detail::pick_present_mode)
+	inline WGPUPresentMode present2wgpu(PRESENT_MODE mode) {
+		switch (mode) {
+		case PRESENT_MODE_IMMEDIATE: return WGPUPresentMode_Immediate;
+		case PRESENT_MODE_FIFO_RELAXED: return WGPUPresentMode_FifoRelaxed;
+		case PRESENT_MODE_MAILBOX: return WGPUPresentMode_Mailbox;
+		default: return WGPUPresentMode_Fifo;
+		}
+	}
+
+	inline PRESENT_MODE wgpu2present(WGPUPresentMode mode) {
+		switch (mode) {
+		case WGPUPresentMode_Immediate: return PRESENT_MODE_IMMEDIATE;
+		case WGPUPresentMode_FifoRelaxed: return PRESENT_MODE_FIFO_RELAXED;
+		case WGPUPresentMode_Mailbox: return PRESENT_MODE_MAILBOX;
+		default: return PRESENT_MODE_FIFO;
+		}
+	}
+
+	inline WGPUCompareFunction op2wgpu(OP op) {
+		switch (op) {
+		case OP_NEVER: return WGPUCompareFunction_Never;
+		case OP_LESS: return WGPUCompareFunction_Less;
+		case OP_EQUAL: return WGPUCompareFunction_Equal;
+		case OP_LESS_EQUAL: return WGPUCompareFunction_LessEqual;
+		case OP_GREATER: return WGPUCompareFunction_Greater;
+		case OP_NOT_EQUAL: return WGPUCompareFunction_NotEqual;
+		case OP_GREATER_EQUAL: return WGPUCompareFunction_GreaterEqual;
+		case OP_ALWAYS: return WGPUCompareFunction_Always;
+		}
+		return WGPUCompareFunction_Always;
+	}
+
+	inline WGPUStencilOperation stencil2wgpu(STENCIL_OP op) {
+		switch (op) {
+		case STENCIL_OP_KEEP: return WGPUStencilOperation_Keep;
+		case STENCIL_OP_ZERO: return WGPUStencilOperation_Zero;
+		case STENCIL_OP_REPLACE: return WGPUStencilOperation_Replace;
+		case STENCIL_OP_INCR_SAT: return WGPUStencilOperation_IncrementClamp;
+		case STENCIL_OP_DECR_SAT: return WGPUStencilOperation_DecrementClamp;
+		case STENCIL_OP_INVERT: return WGPUStencilOperation_Invert;
+		case STENCIL_OP_INCR_WRAP: return WGPUStencilOperation_IncrementWrap;
+		case STENCIL_OP_DECR_WRAP: return WGPUStencilOperation_DecrementWrap;
+		}
+		return WGPUStencilOperation_Keep;
+	}
+
+	inline WGPUBlendOperation blend2wgpu(BLEND op) {
+		switch (op) {
+		case BLEND_ADD: return WGPUBlendOperation_Add;
+		case BLEND_SUBTRACT: return WGPUBlendOperation_Subtract;
+		case BLEND_REV_SUBTRACT: return WGPUBlendOperation_ReverseSubtract;
+		case BLEND_MIN: return WGPUBlendOperation_Min;
+		case BLEND_MAX: return WGPUBlendOperation_Max;
+		}
+		return WGPUBlendOperation_Add;
+	}
+
+	inline WGPUBlendFactor factor2wgpu(FACTOR factor) {
+		switch (factor) {
+		case FACTOR_ZERO: return WGPUBlendFactor_Zero;
+		case FACTOR_ONE: return WGPUBlendFactor_One;
+		case FACTOR_SRC_COLOR: return WGPUBlendFactor_Src;
+		case FACTOR_ONE_MINUS_SRC_COLOR: return WGPUBlendFactor_OneMinusSrc;
+		case FACTOR_DST_COLOR: return WGPUBlendFactor_Dst;
+		case FACTOR_ONE_MINUS_DST_COLOR: return WGPUBlendFactor_OneMinusDst;
+		case FACTOR_SRC_ALPHA: return WGPUBlendFactor_SrcAlpha;
+		case FACTOR_ONE_MINUS_SRC_ALPHA: return WGPUBlendFactor_OneMinusSrcAlpha;
+		case FACTOR_DST_ALPHA: return WGPUBlendFactor_DstAlpha;
+		case FACTOR_ONE_MINUS_DST_ALPHA: return WGPUBlendFactor_OneMinusDstAlpha;
+		case FACTOR_SRC1_COLOR: return WGPUBlendFactor_Src1;
+		case FACTOR_ONE_MINUS_SRC1_COLOR: return WGPUBlendFactor_OneMinusSrc1;
+		case FACTOR_SRC1_ALPHA: return WGPUBlendFactor_Src1Alpha;
+		case FACTOR_ONE_MINUS_SRC1_ALPHA: return WGPUBlendFactor_OneMinusSrc1Alpha;
+		}
+		return WGPUBlendFactor_One;
+	}
+
+	inline WGPUColorWriteMask mask2wgpu(uint8_t mask) {
+		WGPUColorWriteMask out = WGPUColorWriteMask_None;
+		if (mask & 0x1) out |= WGPUColorWriteMask_Red;
+		if (mask & 0x2) out |= WGPUColorWriteMask_Green;
+		if (mask & 0x4) out |= WGPUColorWriteMask_Blue;
+		if (mask & 0x8) out |= WGPUColorWriteMask_Alpha;
+		return out;
+	}
+
+	inline WGPUPrimitiveTopology topology2wgpu(TOPOLOGY topology) {
+		switch (topology) {
+		case TOPOLOGY_TRIANGLE_LIST: return WGPUPrimitiveTopology_TriangleList;
+		case TOPOLOGY_TRIANGLE_STRIP: return WGPUPrimitiveTopology_TriangleStrip;
+		}
+		return WGPUPrimitiveTopology_TriangleList;
+	}
+
+	// We define counter clockwise triangles as front facing (matching the Vulkan backend)
+	inline WGPUCullMode cull2wgpu(CULL cull) {
+		switch (cull) {
+		case CULL_NONE: return WGPUCullMode_None;
+		case CULL_CCW: return WGPUCullMode_Front;
+		case CULL_CW: return WGPUCullMode_Back;
+		case CULL_ALL:
+			assert(false && "WebGPU can't cull both faces at once, use an empty color target list instead");
+			return WGPUCullMode_Back;
+		}
+		return WGPUCullMode_None;
+	}
+
+	inline WGPUIndexFormat index2wgpu(INDEX_TYPE_EXT type) {
+		switch (type) {
+		case INDEX_TYPE_UINT16: return WGPUIndexFormat_Uint16;
+		case INDEX_TYPE_UINT32: return WGPUIndexFormat_Uint32;
+		case INDEX_TYPE_UINT8:
+			assert(false && "8 bit indices aren't supported by WebGPU");
+			return WGPUIndexFormat_Uint16;
+		}
+		return WGPUIndexFormat_Uint32;
+	}
+
+	// WebGPU has no "don't care", but discarding/clearing expresses the same intent to a tiler
+	inline WGPULoadOp load2wgpu(LOAD_OP op) {
+		switch (op) {
+		case LOAD_OP_LOAD: return WGPULoadOp_Load;
+		case LOAD_OP_CLEAR:
+		case LOAD_OP_DONT_CARE: return WGPULoadOp_Clear;
+		}
+		return WGPULoadOp_Load;
+	}
+
+	inline WGPUStoreOp store2wgpu(STORE_OP op) {
+		switch (op) {
+		case STORE_OP_STORE: return WGPUStoreOp_Store;
+		case STORE_OP_DONT_CARE: return WGPUStoreOp_Discard;
+		}
+		return WGPUStoreOp_Store;
+	}
+
+	inline bool operator==(const GpuStencil& a, const GpuStencil& b) {
+		return a.test == b.test && a.failOp == b.failOp && a.passOp == b.passOp
+			&& a.depthFailOp == b.depthFailOp && a.reference == b.reference;
+	}
+
+	inline bool operator==(const GpuDepthStencilDesc& a, const GpuDepthStencilDesc& b) {
+		return a.depthMode == b.depthMode && a.depthTest == b.depthTest && a.depthBias == b.depthBias
+			&& a.depthBiasSlopeFactor == b.depthBiasSlopeFactor && a.depthBiasClamp == b.depthBiasClamp
+			&& a.stencilReadMask == b.stencilReadMask && a.stencilWriteMask == b.stencilWriteMask
+			&& a.stencilFront == b.stencilFront && a.stencilBack == b.stencilBack;
+	}
+
+	inline bool operator==(const GpuBlendDesc& a, const GpuBlendDesc& b) {
+		return a.colorOp == b.colorOp && a.srcColorFactor == b.srcColorFactor && a.dstColorFactor == b.dstColorFactor
+			&& a.alphaOp == b.alphaOp && a.srcAlphaFactor == b.srcAlphaFactor && a.dstAlphaFactor == b.dstAlphaFactor
+			&& a.colorWriteMask == b.colorWriteMask;
+	}
+
+	template<typename T>
+	inline bool same(const std::optional<T>& a, const std::optional<T>& b) {
+		if(a.has_value() != b.has_value()) return false;
+		return !a.has_value() || *a == *b;
+	}
+
+	inline WGPUTextureDescriptor texture2wgpu(const GpuTextureDesc& src, std::string_view label = "") {
+		return WGPUTextureDescriptor{
+			.label = { .data = label.data(), .length = label.size() },
+			.usage = usage2wgpu(src.usage),
+			.dimension = texture2wgpu(src.type),
+			.size = {
+				.width  = src.dimensions.x,
+				.height = src.dimensions.y,
+				.depthOrArrayLayers = (src.type == TEXTURE_2D_ARRAY || src.type == TEXTURE_CUBE_ARRAY) ? src.layerCount : src.dimensions.z,
+			},
+			.format = format2wgpu(src.format),
+			.mipLevelCount = src.mipCount,
+			.sampleCount   = src.sampleCount,
+			.viewFormatCount = 0,
+			.viewFormats     = nullptr,
+		};
+	}
+}
+
+
+
 
 const GpuQueue::MonotextureRange GpuQueue::MonotextureRange::INVALID = {static_cast<uint32_t>(-1), static_cast<uint32_t>(-1), static_cast<uint32_t>(-1)};
 
@@ -436,31 +1176,39 @@ std::string generate_binding_prologue(GpuQueue* queue, bool compute) {
 	};
 	constexpr static auto wgsl_format = [](FORMAT f) {
 		switch (f) {
-		case FORMAT_RGBA8_UNORM:
-			return "rgba8unorm";
-		case FORMAT_RGBA16_FLOAT:
-			return "rgba16float";
-		case FORMAT_RGBA32_FLOAT:
-			return "rgba32float";
-		case FORMAT_R32_FLOAT:
-			return "r32float";
-		// WGSL has no sRGB storage format at all, and bgra8unorm needs the bgra8unorm-storage feature:
+		case FORMAT_R32_UINT: return "r32uint";
+		case FORMAT_R32_SINT: return "r32sint";
+		case FORMAT_R32_FLOAT: return "r32float";
+		case FORMAT_RGBA8_UNORM: return "rgba8unorm";
+		case FORMAT_RGBA8_SNORM: return "rgba8snorm";
+		case FORMAT_RGBA8_UINT: return "rgba8uint";
+		case FORMAT_RGBA8_SINT: return "rgba8sint";
+		case FORMAT_RG32_UINT: return "rg32uint";
+		case FORMAT_RG32_SINT: return "rg32sint";
+		case FORMAT_RG32_FLOAT: return "rg32float";
+		case FORMAT_RGBA16_UINT: return "rgba16uint";
+		case FORMAT_RGBA16_SINT: return "rgba16sint";
+		case FORMAT_RGBA16_FLOAT: return "rgba16float";
+		case FORMAT_RGBA32_UINT: return "rgba32uint";
+		case FORMAT_RGBA32_SINT: return "rgba32sint";
+		case FORMAT_RGBA32_FLOAT: return "rgba32float";
+		// Everything below is a format WGSL can't name as a storage texture, whatever the device
+		// supports. WGSL has no sRGB storage format at all, and bgra8unorm needs bgra8unorm-storage:
 		// case FORMAT_RGBA8_SRGB:
 		// case FORMAT_BGRA8_UNORM:
 		// case FORMAT_BGRA8_SRGB:
-		// These are only spellable with the texture-formats-tier1 feature, which we never ask for:
-		// case FORMAT_RG11B10_FLOAT:
-		// case FORMAT_RGB10_A2_UNORM:
-		// case FORMAT_R8_UNORM:
-		// case FORMAT_R16_FLOAT:
-		// A depth format can never be a storage texture:
-		// case FORMAT_D16_UNORM:
-		// case FORMAT_D24_UNORM_S8_UINT:
-		// case FORMAT_D32_FLOAT:
-		// case FORMAT_D32_FLOAT_S8_UINT:
+		// The one and two component narrow formats, plus the packed ones, are only spellable with
+		// the texture-formats-tier1 feature, which we never ask for:
+		// case FORMAT_R8_*: case FORMAT_RG8_*: case FORMAT_R16_*: case FORMAT_RG16_*:
+		// case FORMAT_RGBA16_UNORM: case FORMAT_RGBA16_SNORM:
+		// case FORMAT_RG11B10_UFLOAT: case FORMAT_RGB10_A2_UINT: case FORMAT_RGB10_A2_UNORM:
+		// rgb9e5ufloat is read only even under tier2, and a depth/stencil format is never storage:
+		// case FORMAT_RGB9E5_UFLOAT:
+		// case FORMAT_S8_UINT: case FORMAT_D16_UNORM: case FORMAT_D24_PLUS:
+		// case FORMAT_D24_PLUS_S8_UINT: case FORMAT_D32_FLOAT: case FORMAT_D32_FLOAT_S8_UINT:
 		default:
-			// The fallback shares a texel size with the 8 bit formats that land here, so a release
-			// build writes the right number of bytes even though it skips the sRGB conversion
+			// The fallback is only reached by a texture the validation layer would reject anyway;
+			// naming the most common storage format keeps the generated WGSL parseable
 			assert(false && "Unsupported storage texture format");
 			return "rgba8unorm";
 		}
@@ -1211,7 +1959,7 @@ void update_render_pipeline(GpuQueue* queue, const GpuPipeline* pipeline, const 
 	auto depth_stencil_format = desc.depthFormat != FORMAT_NONE ? desc.depthFormat : desc.stencilFormat;
 	auto state = depth_stencil.value_or(GpuDepthStencilDesc{});
 	auto has_depth = gpuFormatIsDepth(depth_stencil_format);
-	auto has_stencil = GPU::format_has_stencil(depth_stencil_format);
+	auto has_stencil = gpuFormatIsStencil(depth_stencil_format);
 
 	auto stencil2wgpu = [](const GpuStencil& stencil) {
 		return WGPUStencilFaceState {
@@ -1555,21 +2303,61 @@ namespace GPU::detail {
 	// Bytes per texel for the uncompressed, single plane formats the API exposes
 	inline uint32_t format_bytes(FORMAT format) {
 		switch (format) {
-		case FORMAT_R8_UNORM: return 1;
+		case FORMAT_R8_UNORM:
+		case FORMAT_R8_SNORM:
+		case FORMAT_R8_UINT:
+		case FORMAT_R8_SINT:
+		case FORMAT_S8_UINT: return 1;
+
+		case FORMAT_R16_UNORM:
+		case FORMAT_R16_SNORM:
+		case FORMAT_R16_UINT:
+		case FORMAT_R16_SINT:
 		case FORMAT_R16_FLOAT:
+		case FORMAT_RG8_UNORM:
+		case FORMAT_RG8_SNORM:
+		case FORMAT_RG8_UINT:
+		case FORMAT_RG8_SINT:
 		case FORMAT_D16_UNORM: return 2;
+
+		case FORMAT_R32_UINT:
+		case FORMAT_R32_SINT:
+		case FORMAT_R32_FLOAT:
+		case FORMAT_RG16_UNORM:
+		case FORMAT_RG16_SNORM:
+		case FORMAT_RG16_UINT:
+		case FORMAT_RG16_SINT:
+		case FORMAT_RG16_FLOAT:
 		case FORMAT_RGBA8_UNORM:
 		case FORMAT_RGBA8_SRGB:
+		case FORMAT_RGBA8_SNORM:
+		case FORMAT_RGBA8_UINT:
+		case FORMAT_RGBA8_SINT:
 		case FORMAT_BGRA8_UNORM:
 		case FORMAT_BGRA8_SRGB:
-		case FORMAT_RG11B10_FLOAT:
+		case FORMAT_RGB10_A2_UINT:
 		case FORMAT_RGB10_A2_UNORM:
-		case FORMAT_R32_FLOAT:
-		case FORMAT_D24_UNORM_S8_UINT:
+		case FORMAT_RG11B10_UFLOAT:
+		case FORMAT_RGB9E5_UFLOAT:
+		case FORMAT_D24_PLUS_S8_UINT:
 		case FORMAT_D32_FLOAT: return 4;
+
+		case FORMAT_RG32_UINT:
+		case FORMAT_RG32_SINT:
+		case FORMAT_RG32_FLOAT:
+		case FORMAT_RGBA16_UNORM:
+		case FORMAT_RGBA16_SNORM:
+		case FORMAT_RGBA16_UINT:
+		case FORMAT_RGBA16_SINT:
 		case FORMAT_RGBA16_FLOAT:
 		case FORMAT_D32_FLOAT_S8_UINT: return 8;
+
+		case FORMAT_RGBA32_UINT:
+		case FORMAT_RGBA32_SINT:
 		case FORMAT_RGBA32_FLOAT: return 16;
+
+		// FORMAT_D24_PLUS lands here with FORMAT_NONE: its texels have no size anyone can name,
+		// which is also why WebGPU refuses to copy it
 		default: return 0;
 		}
 	}
@@ -2127,7 +2915,7 @@ void gpuBeginRenderPass(GpuCommandBuffer* cmd, const GpuRenderPassDesc& desc) {
 			depth_stencil.depthStoreOp = desc.depthAttachment ? GPU::store2wgpu(attachment.storeOp) : WGPUStoreOp_Store;
 			depth_stencil.depthClearValue = static_cast<float>(attachment.clearValue);
 		}
-		if(GPU::format_has_stencil(format)) {
+		if(gpuFormatIsStencil(format)) {
 			auto& attachment = desc.stencilAttachment ? *desc.stencilAttachment : *merged;
 			depth_stencil.stencilLoadOp = desc.stencilAttachment ? GPU::load2wgpu(attachment.loadOp) : WGPULoadOp_Load;
 			depth_stencil.stencilStoreOp = desc.stencilAttachment ? GPU::store2wgpu(attachment.storeOp) : WGPUStoreOp_Store;
@@ -2188,12 +2976,6 @@ fn fragment(varyings : Varyings) -> @location(0) vec4<f32> {
 	return textureSampleLevel(blit_source, blit_sampler, varyings.uv, 0.0);
 }
 )WGSL";
-
-	// A WebGPU sampler can only interpolate between texels of a filterable format, and the 32 bit
-	// float ones only become filterable with an optional feature we never ask the device for
-	inline bool format_is_filterable(FORMAT format) {
-		return !(format == FORMAT_R32_FLOAT || format == FORMAT_RGBA32_FLOAT);
-	}
 
 	inline void ensure_blit_layouts(GpuQueue* queue, bool filtering) {
 		if(queue->blit_bind_group_layouts[filtering]) return;
@@ -2317,7 +3099,7 @@ void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const Gpu
 	assert(!cmd->render_pass && "A blit opens a render pass of its own, so it can't be recorded inside another one");
 	assert((source->descriptor.usage & USAGE_SAMPLED) && "The blit source must have been created with USAGE_SAMPLED");
 	assert((destination->descriptor.usage & USAGE_COLOR_ATTACHMENT) && "The blit destination must have been created with USAGE_COLOR_ATTACHMENT");
-	assert(!gpuFormatIsDepth(source->descriptor.format) && !gpuFormatIsDepth(destination->descriptor.format) && "Depth/stencil textures can't be blitted");
+	assert(!gpuFormatIsDepthStencil(source->descriptor.format) && !gpuFormatIsDepthStencil(destination->descriptor.format) && "Depth/stencil textures can't be blitted");
 	assert(source->descriptor.type != TEXTURE_3D && "A slice of a 3D texture can't be bound on its own, blit out of a 2D array instead");
 	assert(source_mip < source->descriptor.mipCount && destination_mip < destination->descriptor.mipCount);
 
@@ -2343,7 +3125,7 @@ void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const Gpu
 	}, cmd->queue->next_submission_index);
 
 	// Building the pipeline is what brings the matching layout and sampler into existence
-	bool filtering = linear_filter && GPU::detail::format_is_filterable(source->descriptor.format);
+	bool filtering = linear_filter && gpuFormatIsFilterable(source->descriptor.format);
 	auto pipeline = GPU::detail::blit_pipeline(cmd->queue, GPU::format2wgpu(destination->descriptor.format), filtering);
 
 	// The viewport is opened up to the whole monotexture slot so that fragments exist past the
@@ -2619,6 +3401,50 @@ void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSur
 	surface->descriptor.presentMode = GPU::wgpu2present(present_mode);
 	surface->descriptor.opaque = alpha_mode == WGPUCompositeAlphaMode_Opaque
 		|| (alpha_mode == WGPUCompositeAlphaMode_Auto && surface->descriptor.opaque);
+}
+
+GpuSurfaceCapabilities gpuGetSurfaceCapabilities(GpuQueue* queue, GpuSurface* surface) {
+	GpuSurfaceCapabilities out;
+
+	WGPUSurfaceCapabilities caps = {};
+	if(wgpuSurfaceGetCapabilities(surface->surface, queue->adapter, &caps) != WGPUStatus_Success) {
+		errno = WGPUErrorType_Unknown;
+		return out;
+	}
+
+	// WebGPU already reports the formats in the order it prefers them, which is the order
+	// GPU::detail::pick_surface_format walks, so keeping it makes formats[0] the FORMAT_NONE pick.
+	// The same format can be listed more than once (once per configuration the surface would
+	// accept it in), so the first sighting is the one that counts.
+	out.formats.reserve(caps.formatCount);
+	for(size_t i = 0; i < caps.formatCount; ++i) {
+		auto format = GPU::wgpu2format(caps.formats[i]);
+		// A format the rest of the API can't name is one it could never be configured with either
+		if(format == FORMAT_NONE) continue;
+		if(std::ranges::find(out.formats, format) == out.formats.end())
+			out.formats.push_back(format);
+	}
+
+	// GPU::detail::pick_present_mode's preference, so presentModes[0] is what
+	// PRESENT_MODE_BEST_AVAILABLE resolves to. Immediate trails the tear free modes rather than
+	// leading on its latency, matching the mode that picker never reaches for on its own.
+	for(auto mode: {PRESENT_MODE_MAILBOX, PRESENT_MODE_FIFO_RELAXED, PRESENT_MODE_FIFO, PRESENT_MODE_IMMEDIATE}) {
+		auto wanted = GPU::present2wgpu(mode);
+		for(size_t i = 0; i < caps.presentModeCount; ++i)
+			if(caps.presentModes[i] == wanted) {
+				out.presentModes.push_back(mode);
+				break;
+			}
+	}
+
+	// Auto is whatever the surface does by default, which is not a promise that it blends
+	for(size_t i = 0; i < caps.alphaModeCount; ++i)
+		if(caps.alphaModes[i] == WGPUCompositeAlphaMode_Premultiplied
+			|| caps.alphaModes[i] == WGPUCompositeAlphaMode_Unpremultiplied)
+			out.supportsTransparency = true;
+
+	wgpuSurfaceCapabilitiesFreeMembers(caps);
+	return out;
 }
 
 GpuSurfaceDescriptor gpuSurfaceGetConfigurationEXT(const GpuSurface* surface) {

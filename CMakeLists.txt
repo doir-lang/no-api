@@ -1,10 +1,21 @@
 cmake_minimum_required(VERSION 3.21)
 project(NoAPI CXX C)
 
-option(NOAPI_ENABLE_VULKAN "Enable the Vulkan backend" $<NOT:$<BOOL:${EMSCRIPTEN}>>)
+# A generator expression is no use here: option() wants a plain constant
+if(EMSCRIPTEN)
+	option(NOAPI_ENABLE_VULKAN "Enable the Vulkan backend" OFF)
+else()
+	option(NOAPI_ENABLE_VULKAN "Enable the Vulkan backend" ON)
+endif()
 option(NOAPI_ENABLE_WEBGPU "Enable the WebGPU backend" ON)
 
-set(NOAPI_DEFAULT_BACKEND "webgpu" CACHE STRING "Backend exposed as the noapi::noapi alias")
+# Whichever backend is available unless asked otherwise, so that disabling one is enough
+if(NOAPI_ENABLE_WEBGPU)
+	set(NOAPI_DEFAULT_BACKEND_INIT "webgpu")
+else()
+	set(NOAPI_DEFAULT_BACKEND_INIT "vulkan")
+endif()
+set(NOAPI_DEFAULT_BACKEND "${NOAPI_DEFAULT_BACKEND_INIT}" CACHE STRING "Backend exposed as the noapi::noapi alias")
 set_property(CACHE NOAPI_DEFAULT_BACKEND PROPERTY STRINGS "vulkan" "webgpu")
 
 if(NOT NOAPI_ENABLE_VULKAN AND NOT NOAPI_ENABLE_WEBGPU)

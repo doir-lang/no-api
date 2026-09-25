@@ -1,6 +1,7 @@
 .cache
 .zed
 .vs
+.vscode
 build*
 
 logos*

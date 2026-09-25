@@ -15,6 +15,7 @@
 #include <glslang/Public/ResourceLimits.h>
 #include <glslang/SPIRV/GlslangToSpv.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <cstdint>
@@ -28,38 +29,165 @@
 
 
 namespace GPU::detail {
+	// The Vulkan packed formats read their components from the high bits down, so a WebGPU style
+	// name maps onto the reversed Vulkan one (rgb10a2unorm is A2B10G10R10, rg11b10ufloat is B10G11R11).
 	inline VkFormat format2vulkan(FORMAT format) {
 		switch(format) {
-		case FORMAT_NONE:
-			return VK_FORMAT_UNDEFINED;
-		case FORMAT_RGBA8_UNORM:
-			return VK_FORMAT_R8G8B8A8_UNORM;
-		case FORMAT_RGBA8_SRGB:
-			return VK_FORMAT_R8G8B8A8_SRGB;
-		case FORMAT_RGBA16_FLOAT:
-			return VK_FORMAT_R16G16B16A16_SFLOAT;
-		case FORMAT_RGBA32_FLOAT:
-			return VK_FORMAT_R32G32B32A32_SFLOAT;
-		case FORMAT_RG11B10_FLOAT:
-			return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-		case FORMAT_RGB10_A2_UNORM:
-			return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
-		case FORMAT_R8_UNORM:
-			return VK_FORMAT_R8_UNORM;
-		case FORMAT_R16_FLOAT:
-			return VK_FORMAT_R16_SFLOAT;
-		case FORMAT_R32_FLOAT:
-			return VK_FORMAT_R32_SFLOAT;
-		case FORMAT_D16_UNORM:
-			return VK_FORMAT_D16_UNORM;
-		case FORMAT_D24_UNORM_S8_UINT:
-			return VK_FORMAT_D24_UNORM_S8_UINT;
-		case FORMAT_D32_FLOAT:
-			return VK_FORMAT_D32_SFLOAT;
-		case FORMAT_D32_FLOAT_S8_UINT:
-			return VK_FORMAT_D32_SFLOAT_S8_UINT;
+		case FORMAT_NONE: return VK_FORMAT_UNDEFINED;
+
+		case FORMAT_R8_UNORM: return VK_FORMAT_R8_UNORM;
+		case FORMAT_R8_SNORM: return VK_FORMAT_R8_SNORM;
+		case FORMAT_R8_UINT: return VK_FORMAT_R8_UINT;
+		case FORMAT_R8_SINT: return VK_FORMAT_R8_SINT;
+
+		case FORMAT_R16_UNORM: return VK_FORMAT_R16_UNORM;
+		case FORMAT_R16_SNORM: return VK_FORMAT_R16_SNORM;
+		case FORMAT_R16_UINT: return VK_FORMAT_R16_UINT;
+		case FORMAT_R16_SINT: return VK_FORMAT_R16_SINT;
+		case FORMAT_R16_FLOAT: return VK_FORMAT_R16_SFLOAT;
+		case FORMAT_RG8_UNORM: return VK_FORMAT_R8G8_UNORM;
+		case FORMAT_RG8_SNORM: return VK_FORMAT_R8G8_SNORM;
+		case FORMAT_RG8_UINT: return VK_FORMAT_R8G8_UINT;
+		case FORMAT_RG8_SINT: return VK_FORMAT_R8G8_SINT;
+
+		case FORMAT_R32_UINT: return VK_FORMAT_R32_UINT;
+		case FORMAT_R32_SINT: return VK_FORMAT_R32_SINT;
+		case FORMAT_R32_FLOAT: return VK_FORMAT_R32_SFLOAT;
+		case FORMAT_RG16_UNORM: return VK_FORMAT_R16G16_UNORM;
+		case FORMAT_RG16_SNORM: return VK_FORMAT_R16G16_SNORM;
+		case FORMAT_RG16_UINT: return VK_FORMAT_R16G16_UINT;
+		case FORMAT_RG16_SINT: return VK_FORMAT_R16G16_SINT;
+		case FORMAT_RG16_FLOAT: return VK_FORMAT_R16G16_SFLOAT;
+		case FORMAT_RGBA8_UNORM: return VK_FORMAT_R8G8B8A8_UNORM;
+		case FORMAT_RGBA8_SRGB: return VK_FORMAT_R8G8B8A8_SRGB;
+		case FORMAT_RGBA8_SNORM: return VK_FORMAT_R8G8B8A8_SNORM;
+		case FORMAT_RGBA8_UINT: return VK_FORMAT_R8G8B8A8_UINT;
+		case FORMAT_RGBA8_SINT: return VK_FORMAT_R8G8B8A8_SINT;
+		case FORMAT_BGRA8_UNORM: return VK_FORMAT_B8G8R8A8_UNORM;
+		case FORMAT_BGRA8_SRGB: return VK_FORMAT_B8G8R8A8_SRGB;
+
+		case FORMAT_RGB10_A2_UINT: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
+		case FORMAT_RGB10_A2_UNORM: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+		case FORMAT_RG11B10_UFLOAT: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+		case FORMAT_RGB9E5_UFLOAT: return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+
+		case FORMAT_RG32_UINT: return VK_FORMAT_R32G32_UINT;
+		case FORMAT_RG32_SINT: return VK_FORMAT_R32G32_SINT;
+		case FORMAT_RG32_FLOAT: return VK_FORMAT_R32G32_SFLOAT;
+		case FORMAT_RGBA16_UNORM: return VK_FORMAT_R16G16B16A16_UNORM;
+		case FORMAT_RGBA16_SNORM: return VK_FORMAT_R16G16B16A16_SNORM;
+		case FORMAT_RGBA16_UINT: return VK_FORMAT_R16G16B16A16_UINT;
+		case FORMAT_RGBA16_SINT: return VK_FORMAT_R16G16B16A16_SINT;
+		case FORMAT_RGBA16_FLOAT: return VK_FORMAT_R16G16B16A16_SFLOAT;
+
+		case FORMAT_RGBA32_UINT: return VK_FORMAT_R32G32B32A32_UINT;
+		case FORMAT_RGBA32_SINT: return VK_FORMAT_R32G32B32A32_SINT;
+		case FORMAT_RGBA32_FLOAT: return VK_FORMAT_R32G32B32A32_SFLOAT;
+
+		case FORMAT_S8_UINT: return VK_FORMAT_S8_UINT;
+		case FORMAT_D16_UNORM: return VK_FORMAT_D16_UNORM;
+		// WebGPU's depth24plus only promises 24 bits of depth; X8_D24 is the Vulkan format that
+		// makes the same promise, and a driver without it reports D32_SFLOAT support instead
+		case FORMAT_D24_PLUS: return VK_FORMAT_X8_D24_UNORM_PACK32;
+		case FORMAT_D24_PLUS_S8_UINT: return VK_FORMAT_D24_UNORM_S8_UINT;
+		case FORMAT_D32_FLOAT: return VK_FORMAT_D32_SFLOAT;
+		case FORMAT_D32_FLOAT_S8_UINT: return VK_FORMAT_D32_SFLOAT_S8_UINT;
 		}
 		std::unreachable();
+	};
+
+	// The inverse of format2vulkan, for reporting back whatever a swapchain settled on when the
+	// request left the choice open. Anything the rest of the API can't name comes back as FORMAT_NONE.
+	inline FORMAT vulkan2format(VkFormat format) {
+		switch(format) {
+		case VK_FORMAT_R8_UNORM: return FORMAT_R8_UNORM;
+		case VK_FORMAT_R8_SNORM: return FORMAT_R8_SNORM;
+		case VK_FORMAT_R8_UINT: return FORMAT_R8_UINT;
+		case VK_FORMAT_R8_SINT: return FORMAT_R8_SINT;
+
+		case VK_FORMAT_R16_UNORM: return FORMAT_R16_UNORM;
+		case VK_FORMAT_R16_SNORM: return FORMAT_R16_SNORM;
+		case VK_FORMAT_R16_UINT: return FORMAT_R16_UINT;
+		case VK_FORMAT_R16_SINT: return FORMAT_R16_SINT;
+		case VK_FORMAT_R16_SFLOAT: return FORMAT_R16_FLOAT;
+		case VK_FORMAT_R8G8_UNORM: return FORMAT_RG8_UNORM;
+		case VK_FORMAT_R8G8_SNORM: return FORMAT_RG8_SNORM;
+		case VK_FORMAT_R8G8_UINT: return FORMAT_RG8_UINT;
+		case VK_FORMAT_R8G8_SINT: return FORMAT_RG8_SINT;
+
+		case VK_FORMAT_R32_UINT: return FORMAT_R32_UINT;
+		case VK_FORMAT_R32_SINT: return FORMAT_R32_SINT;
+		case VK_FORMAT_R32_SFLOAT: return FORMAT_R32_FLOAT;
+		case VK_FORMAT_R16G16_UNORM: return FORMAT_RG16_UNORM;
+		case VK_FORMAT_R16G16_SNORM: return FORMAT_RG16_SNORM;
+		case VK_FORMAT_R16G16_UINT: return FORMAT_RG16_UINT;
+		case VK_FORMAT_R16G16_SINT: return FORMAT_RG16_SINT;
+		case VK_FORMAT_R16G16_SFLOAT: return FORMAT_RG16_FLOAT;
+		case VK_FORMAT_R8G8B8A8_UNORM: return FORMAT_RGBA8_UNORM;
+		case VK_FORMAT_R8G8B8A8_SRGB: return FORMAT_RGBA8_SRGB;
+		case VK_FORMAT_R8G8B8A8_SNORM: return FORMAT_RGBA8_SNORM;
+		case VK_FORMAT_R8G8B8A8_UINT: return FORMAT_RGBA8_UINT;
+		case VK_FORMAT_R8G8B8A8_SINT: return FORMAT_RGBA8_SINT;
+		case VK_FORMAT_B8G8R8A8_UNORM: return FORMAT_BGRA8_UNORM;
+		case VK_FORMAT_B8G8R8A8_SRGB: return FORMAT_BGRA8_SRGB;
+
+		case VK_FORMAT_A2B10G10R10_UINT_PACK32: return FORMAT_RGB10_A2_UINT;
+		case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return FORMAT_RGB10_A2_UNORM;
+		case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return FORMAT_RG11B10_UFLOAT;
+		case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: return FORMAT_RGB9E5_UFLOAT;
+
+		case VK_FORMAT_R32G32_UINT: return FORMAT_RG32_UINT;
+		case VK_FORMAT_R32G32_SINT: return FORMAT_RG32_SINT;
+		case VK_FORMAT_R32G32_SFLOAT: return FORMAT_RG32_FLOAT;
+		case VK_FORMAT_R16G16B16A16_UNORM: return FORMAT_RGBA16_UNORM;
+		case VK_FORMAT_R16G16B16A16_SNORM: return FORMAT_RGBA16_SNORM;
+		case VK_FORMAT_R16G16B16A16_UINT: return FORMAT_RGBA16_UINT;
+		case VK_FORMAT_R16G16B16A16_SINT: return FORMAT_RGBA16_SINT;
+		case VK_FORMAT_R16G16B16A16_SFLOAT: return FORMAT_RGBA16_FLOAT;
+
+		case VK_FORMAT_R32G32B32A32_UINT: return FORMAT_RGBA32_UINT;
+		case VK_FORMAT_R32G32B32A32_SINT: return FORMAT_RGBA32_SINT;
+		case VK_FORMAT_R32G32B32A32_SFLOAT: return FORMAT_RGBA32_FLOAT;
+
+		case VK_FORMAT_S8_UINT: return FORMAT_S8_UINT;
+		case VK_FORMAT_D16_UNORM: return FORMAT_D16_UNORM;
+		case VK_FORMAT_X8_D24_UNORM_PACK32: return FORMAT_D24_PLUS;
+		case VK_FORMAT_D24_UNORM_S8_UINT: return FORMAT_D24_PLUS_S8_UINT;
+		case VK_FORMAT_D32_SFLOAT: return FORMAT_D32_FLOAT;
+		case VK_FORMAT_D32_SFLOAT_S8_UINT: return FORMAT_D32_FLOAT_S8_UINT;
+
+		default:
+			return FORMAT_NONE;
+		}
+	};
+
+	// PRESENT_MODE_BEST_AVAILABLE has no Vulkan spelling, so it is resolved against what the surface
+	// supports before this is reached (see gpuSurfaceReconfigureEXT)
+	inline VkPresentModeKHR present2vulkan(PRESENT_MODE mode) {
+		switch(mode) {
+		case PRESENT_MODE_IMMEDIATE:
+			return VK_PRESENT_MODE_IMMEDIATE_KHR;
+		case PRESENT_MODE_FIFO_RELAXED:
+			return VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+		case PRESENT_MODE_MAILBOX:
+			return VK_PRESENT_MODE_MAILBOX_KHR;
+		default:
+			return VK_PRESENT_MODE_FIFO_KHR;
+		}
+	};
+
+	// Likewise for the presentation mode the swapchain ended up with
+	inline PRESENT_MODE vulkan2presentMode(VkPresentModeKHR mode) {
+		switch(mode) {
+		case VK_PRESENT_MODE_IMMEDIATE_KHR:
+			return PRESENT_MODE_IMMEDIATE;
+		case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
+			return PRESENT_MODE_FIFO_RELAXED;
+		case VK_PRESENT_MODE_MAILBOX_KHR:
+			return PRESENT_MODE_MAILBOX;
+		default:
+			return PRESENT_MODE_FIFO;
+		}
 	};
 
 	inline VkImageUsageFlags usage2vulkan(TEXTURE_USAGE_FLAGS usageFlags) {
@@ -77,6 +205,23 @@ namespace GPU::detail {
 		if (usageFlags & USAGE_TRANSFER_DST)
 			result |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 		return result;
+	};
+
+	inline TEXTURE_USAGE_FLAGS vulkan2usage(VkImageUsageFlags usageFlags) {
+		uint32_t result = 0;
+		if (usageFlags & VK_IMAGE_USAGE_SAMPLED_BIT)
+			result |= USAGE_SAMPLED;
+		if (usageFlags & VK_IMAGE_USAGE_STORAGE_BIT)
+			result |= USAGE_STORAGE;
+		if (usageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+			result |= USAGE_COLOR_ATTACHMENT;
+		if (usageFlags & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+			result |= USAGE_DEPTH_STENCIL_ATTACHMENT;
+		if (usageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+			result |= USAGE_TRANSFER_SRC;
+		if (usageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+			result |= USAGE_TRANSFER_DST;
+		return (TEXTURE_USAGE_FLAGS)result;
 	};
 
 	inline VkSampleCountFlagBits samples2vulkan(size_t samples) {
@@ -2012,12 +2157,6 @@ void main() {
 		return set;
 	}
 
-	// Linear filtering of a 32 bit float image is optional on Vulkan and needs a device feature on
-	// WebGPU, so both backends agree to never ask for it rather than differing by implementation
-	inline bool format_is_filterable(FORMAT format) {
-		return !(format == FORMAT_R32_FLOAT || format == FORMAT_RGBA32_FLOAT);
-	}
-
 	inline uvec2 mip_extent(const GpuTexture* texture, uint32_t mip) {
 		return {
 			std::max(texture->descriptor.dimensions.x >> mip, 1u),
@@ -2033,7 +2172,7 @@ void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const Gpu
 	assert(cmd->state == GpuCommandBuffer::Recording && "A blit opens a render pass of its own, so it can't be recorded inside another one");
 	assert((source->descriptor.usage & USAGE_SAMPLED) && "The blit source must have been created with USAGE_SAMPLED");
 	assert((destination->descriptor.usage & USAGE_COLOR_ATTACHMENT) && "The blit destination must have been created with USAGE_COLOR_ATTACHMENT");
-	assert(!gpuFormatIsDepth(source->descriptor.format) && !gpuFormatIsDepth(destination->descriptor.format) && "Depth/stencil textures can't be blitted");
+	assert(!gpuFormatIsDepthStencil(source->descriptor.format) && !gpuFormatIsDepthStencil(destination->descriptor.format) && "Depth/stencil textures can't be blitted");
 	assert(source->descriptor.type != TEXTURE_3D && "A slice of a 3D texture can't be sampled on its own, blit out of a 2D array instead");
 	assert(source_mip < source->descriptor.mipCount && destination_mip < destination->descriptor.mipCount);
 
@@ -2077,7 +2216,7 @@ void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const Gpu
 	{
 		// Textures in this backend live in VK_IMAGE_LAYOUT_GENERAL, the same layout their heap
 		// descriptors are written against
-		bool filtering = linear_filter && GPU::detail::format_is_filterable(source->descriptor.format);
+		bool filtering = linear_filter && gpuFormatIsFilterable(source->descriptor.format);
 		VkDescriptorImageInfo image {
 			.sampler = queue->blit_samplers[filtering],
 			.imageView = source_view,
@@ -2359,26 +2498,28 @@ void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSur
 	auto builder = vkb::SwapchainBuilder(queue->gpu, queue->device, surface->surface, queue->queue_family);
 	if(surface->swapchain)
 		builder.set_old_swapchain(*surface->swapchain);
-	switch(desc.presentMode){
-	break; case PRESENT_MODE_IMMEDIATE:
-		builder.set_desired_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR);
-	break; case PRESENT_MODE_FIFO:
-		builder.set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR);
-	break; case PRESENT_MODE_FIFO_RELAXED:
-		builder.set_desired_present_mode(VK_PRESENT_MODE_FIFO_RELAXED_KHR);
-	break; case PRESENT_MODE_MAILBOX:
-		builder.set_desired_present_mode(VK_PRESENT_MODE_MAILBOX_KHR);
-	break; case PRESENT_MODE_BEST_AVAILABLE:
-		builder.use_default_present_mode_selection();
-	}
+	// The requested mode first, then the fallbacks a PRESENT_MODE_BEST_AVAILABLE request starts
+	// from: mailbox (tear free at the lowest latency), then relaxed fifo, then the fifo every
+	// surface has. Spelled out rather than left to use_default_present_mode_selection, whose order
+	// skips relaxed fifo, so that both backends resolve BEST_AVAILABLE the same way and
+	// gpuGetSurfaceCapabilities can report one order for it.
+	if(desc.presentMode != PRESENT_MODE_BEST_AVAILABLE)
+		builder.set_desired_present_mode(GPU::detail::present2vulkan(desc.presentMode));
+	builder.add_fallback_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
+		.add_fallback_present_mode(VK_PRESENT_MODE_FIFO_RELAXED_KHR)
+		.add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR);
 	assert(surface->descriptor.texture.dimensions.z == 1);
+	// FORMAT_NONE means "whatever the surface prefers", which is what leaving the desired format
+	// unset asks for. Naming VK_FORMAT_UNDEFINED instead would match nothing and fall back to
+	// whichever format the surface happens to list first.
+	if(surface->descriptor.texture.format != FORMAT_NONE)
+		builder.set_desired_format({
+			GPU::detail::format2vulkan(surface->descriptor.texture.format),
+			VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+		});
 	auto swap = builder.set_desired_extent(surface->descriptor.texture.dimensions.x, surface->descriptor.texture.dimensions.y)
 		.set_allocation_callbacks(queue->callbacks)
 		.set_composite_alpha_flags(surface->descriptor.opaque ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR : VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR)
-		.set_desired_format({
-			GPU::detail::format2vulkan(surface->descriptor.texture.format),
-			VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
-		})
 		.set_image_array_layer_count(surface->descriptor.texture.layerCount)
 		.add_image_usage_flags(GPU::detail::usage2vulkan(surface->descriptor.texture.usage))
 		.build();
@@ -2386,6 +2527,12 @@ void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSur
 
 	gpuFreeSurfaceNoSemaphores(queue, surface);
 	surface->swapchain = std::make_shared<vkb::Swapchain>(std::move(*swap));
+	// What the swapchain settled on, which is not necessarily what was asked for: a FORMAT_NONE
+	// request in particular means "whatever the surface prefers", and the caller still has to be able
+	// to build a pipeline targeting it
+	surface->descriptor.texture.format = GPU::detail::vulkan2format(surface->swapchain->image_format);
+	surface->descriptor.presentMode = GPU::detail::vulkan2presentMode(surface->swapchain->present_mode);
+	surface->descriptor.texture.usage = GPU::detail::vulkan2usage(surface->swapchain->image_usage_flags);
 	std::vector<VkImage> images;
 	std::tie(images, surface->image_views) = surface->swapchain->get_images_and_image_views().value();
 
@@ -2396,6 +2543,59 @@ void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSur
 			surface->image_views[i],
 			surface->descriptor.texture
 		};
+}
+
+GpuSurfaceCapabilities gpuGetSurfaceCapabilities(GpuQueue* queue, GpuSurface* surface) {
+	GpuSurfaceCapabilities out;
+
+	uint32_t count = 0;
+	vkGetPhysicalDeviceSurfaceFormatsKHR(queue->gpu, surface->surface, &count, nullptr);
+	std::vector<VkSurfaceFormatKHR> formats(count);
+	vkGetPhysicalDeviceSurfaceFormatsKHR(queue->gpu, surface->surface, &count, formats.data());
+
+	// The swapchain is only ever built for the nonlinear sRGB color space, so a format offered in
+	// any other one is not a format this surface could actually be configured with
+	auto usable = [](VkSurfaceFormatKHR format) {
+		return format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+			&& GPU::detail::vulkan2format(format.format) != FORMAT_NONE;
+	};
+	auto append = [&out](VkFormat format) {
+		auto named = GPU::detail::vulkan2format(format);
+		if(std::ranges::find(out.formats, named) == out.formats.end())
+			out.formats.push_back(named);
+	};
+
+	// vk-bootstrap asks for these two first whenever the caller names no format of its own, and
+	// falls back to whatever the driver listed first, so walking them in that order makes
+	// formats[0] the format a FORMAT_NONE request resolves to
+	out.formats.reserve(formats.size());
+	for(auto preferred: {VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB})
+		for(auto format: formats)
+			if(format.format == preferred && usable(format))
+				append(format.format);
+	for(auto format: formats)
+		if(usable(format))
+			append(format.format);
+
+	vkGetPhysicalDeviceSurfacePresentModesKHR(queue->gpu, surface->surface, &count, nullptr);
+	std::vector<VkPresentModeKHR> modes(count);
+	vkGetPhysicalDeviceSurfacePresentModesKHR(queue->gpu, surface->surface, &count, modes.data());
+
+	// The fallback order gpuSurfaceReconfigureEXT hands the swapchain builder, so presentModes[0]
+	// is what PRESENT_MODE_BEST_AVAILABLE resolves to. Immediate trails the tear free modes rather
+	// than leading on its latency, matching the mode that fallback list never reaches for.
+	for(auto mode: {PRESENT_MODE_MAILBOX, PRESENT_MODE_FIFO_RELAXED, PRESENT_MODE_FIFO, PRESENT_MODE_IMMEDIATE})
+		if(std::ranges::find(modes, GPU::detail::present2vulkan(mode)) != modes.end())
+			out.presentModes.push_back(mode);
+
+	VkSurfaceCapabilitiesKHR caps {};
+	vkGetPhysicalDeviceSurfaceCapabilitiesKHR(queue->gpu, surface->surface, &caps);
+	// Inherit leaves the blending to whatever the native window was set up for, which is not a
+	// promise the compositor will honor an alpha channel
+	out.supportsTransparency = caps.supportedCompositeAlpha
+		& (VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR | VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR);
+
+	return out;
 }
 
 GpuSurfaceDescriptor gpuSurfaceGetConfigurationEXT(const GpuSurface* surface) {

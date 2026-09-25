@@ -68,26 +68,36 @@ enum PRESENT_MODE {
  *
  * Used to determine which texture formats and presentation modes are supported
  * by the current platform compositor and display backend.
+ *
+ * Both lists are ordered best first, by the same preference the backend applies
+ * when it is left to choose: formats[0] is what a FORMAT_NONE request resolves
+ * to, and presentModes[0] is what PRESENT_MODE_BEST_AVAILABLE resolves to. A
+ * surface that reports neither list as empty can always be configured with any
+ * entry in them.
  */
-// struct GpuSurfaceCapabilities {
-// 	/**
-// 	 * Supported swapchain texture formats.
-// 	 *
-// 	 * Typically includes formats such as FORMAT_RGBA8_UNORM_SRGB,
-// 	 * FORMAT_BGRA8_UNORM_SRGB, and optionally HDR formats.
-// 	 */
-// 	std::vector<FORMAT> formats;
+struct GpuSurfaceCapabilities {
+	/**
+	 * Supported swapchain texture formats, best first.
+	 *
+	 * Typically includes formats such as FORMAT_BGRA8_SRGB, FORMAT_BGRA8_UNORM,
+	 * and optionally HDR formats such as FORMAT_RGB10_A2_UNORM. Formats the rest
+	 * of the API can't name, and formats only offered outside the nonlinear sRGB
+	 * color space the swapchain is built for, are left out.
+	 */
+	std::vector<FORMAT> formats;
 
-// 	/**
-// 	 * Supported presentation scheduling modes.
-// 	 */
-// 	std::vector<PRESENT_MODE> presentModes;
+	/**
+	 * Supported presentation scheduling modes, best first. Never contains
+	 * PRESENT_MODE_BEST_AVAILABLE, which is a request rather than a mode.
+	 */
+	std::vector<PRESENT_MODE> presentModes;
 
-// 	/**
-// 	 * True if the compositor supports transparent or alpha-composited windows.
-// 	 */
-// 	bool supportsTransparency = false;
-// };
+	/**
+	 * True if the compositor supports transparent or alpha-composited windows,
+	 * which is what a surface configured with `opaque = false` asks for.
+	 */
+	bool supportsTransparency = false;
+};
 
 /**
  * GpuSurfaceDescriptor – Presentation surface / swapchain configuration.
@@ -173,10 +183,16 @@ void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSur
  * gpuGetSurfaceCapabilities – Query presentation capabilities for a surface.
  *
  * Used to determine supported formats, present modes, transparency support,
- * and HDR support before configuring the surface.
+ * and HDR support before configuring the surface. The surface has to exist to be
+ * asked, so choosing a format this way means creating the surface (with
+ * FORMAT_NONE, so that the backend's own preference is the fallback) and then
+ * reconfiguring it with the pick.
+ *
+ * @param queue GPU queue/device the surface was created against.
+ * @param surface Surface to query.
+ * @return What the surface supports, each list ordered best first.
  */
-// GpuSurfaceCapabilities gpuGetSurfaceCapabilities(GpuQueue* queue, GpuSurface* surface);
-// TODO: Do we need this API?
+GpuSurfaceCapabilities gpuGetSurfaceCapabilities(GpuQueue* queue, GpuSurface* surface);
 
 /**
  * gpuSurfaceGetConfigurationEXT – Gets the configured properties of the surface.
@@ -200,6 +216,16 @@ GpuSurfaceDescriptor gpuSurfaceGetConfigurationEXT(const GpuSurface* surface);
  * NOTE: Returning references avoids per-frame texture handle churn and maps
  * well to fixed swapchain backbuffers, but requires care around surface
  * lifetime and reconfiguration invalidation.
+ *
+ * A presentable texture is not necessarily a first class texture. Backends that
+ * allocate textures out of their own pools (WebGPU, where the swapchain owns the
+ * image) cannot place it in the texture heap, so it cannot be named by a
+ * GpuTextureDescriptor and cannot be sampled, written as a storage texture, or
+ * used as a copy endpoint. Attaching it to a render pass always works, and
+ * gpuBlitTextureEXT is the supported bridge to and from ordinary textures:
+ * render or dispatch into a texture of your own and blit the result in at the
+ * end of the frame. Only the usages gpuSurfaceGetConfigurationEXT reports back
+ * were actually granted, which may be fewer than were requested.
  *
  * @param queue GPU queue/device the surface was created against.
  * @param surface Surface to acquire the next presentable texture from.

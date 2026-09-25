@@ -56,3 +56,6 @@ target_link_libraries(noapi-vulkan PUBLIC
 )
 set_target_properties(noapi-vulkan PROPERTIES CXX_STANDARD 26)
 target_include_directories(noapi-vulkan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+# Lets anything linking this backend (rather than the other one) pick its shading language and its
+# windowing/instance glue at compile time
+target_compile_definitions(noapi-vulkan PUBLIC NOAPI_BACKEND_VULKAN=1)

@@ -168,37 +168,95 @@ enum TEXTURE {
 };
 
 /**
- * FORMAT – Pixel / texel formats. Expand as needed for your target feature set.
+ * FORMAT – Pixel / texel formats. The set is the one WebGPU names, since that is the
+ * narrowest of the backends; every entry has a Vulkan equivalent.
  * FORMAT_NONE is used to indicate "no attachment" (e.g. no depth buffer).
+ *
+ * The entries marked EXT ride on an optional WebGPU feature, so a device is free to
+ * reject them: the 16 bit unorm/snorm ones need `texture-formats-tier1` and
+ * FORMAT_D32_FLOAT_S8_UINT needs `depth32float-stencil8`.
  */
 enum FORMAT {
 	FORMAT_NONE,
+
+	// 1 byte per texel
+	FORMAT_R8_UNORM,
+	FORMAT_R8_SNORM,
+	FORMAT_R8_UINT,
+	FORMAT_R8_SINT,
+
+	// 2 bytes per texel
+	FORMAT_R16_UNORM, // EXT
+	FORMAT_R16_SNORM, // EXT
+	FORMAT_R16_UINT,
+	FORMAT_R16_SINT,
+	FORMAT_R16_FLOAT,
+	FORMAT_RG8_UNORM,
+	FORMAT_RG8_SNORM,
+	FORMAT_RG8_UINT,
+	FORMAT_RG8_SINT,
+
+	// 4 bytes per texel
+	FORMAT_R32_UINT,
+	FORMAT_R32_SINT,
+	FORMAT_R32_FLOAT,
+	FORMAT_RG16_UNORM, // EXT
+	FORMAT_RG16_SNORM, // EXT
+	FORMAT_RG16_UINT,
+	FORMAT_RG16_SINT,
+	FORMAT_RG16_FLOAT,
 	FORMAT_RGBA8_UNORM,
 	FORMAT_RGBA8_SRGB,
-	FORMAT_RGBA16_FLOAT,
-	FORMAT_RGBA32_FLOAT,
-	FORMAT_RG11B10_FLOAT,
+	FORMAT_RGBA8_SNORM,
+	FORMAT_RGBA8_UINT,
+	FORMAT_RGBA8_SINT,
+	// The layout most presentation surfaces prefer, and on some platforms the only one they offer
+	FORMAT_BGRA8_UNORM,
+	FORMAT_BGRA8_SRGB,
+
+	// 4 bytes per texel, components packed at uneven widths
+	FORMAT_RGB10_A2_UINT,
 	FORMAT_RGB10_A2_UNORM,
-	FORMAT_R8_UNORM,
-	FORMAT_R16_FLOAT,
-	FORMAT_R32_FLOAT,
+	FORMAT_RG11B10_UFLOAT,
+	FORMAT_RGB9E5_UFLOAT,
+
+	// 8 bytes per texel
+	FORMAT_RG32_UINT,
+	FORMAT_RG32_SINT,
+	FORMAT_RG32_FLOAT,
+	FORMAT_RGBA16_UNORM, // EXT
+	FORMAT_RGBA16_SNORM, // EXT
+	FORMAT_RGBA16_UINT,
+	FORMAT_RGBA16_SINT,
+	FORMAT_RGBA16_FLOAT,
+
+	// 16 bytes per texel
+	FORMAT_RGBA32_UINT,
+	FORMAT_RGBA32_SINT,
+	FORMAT_RGBA32_FLOAT,
+
+	// Depth and stencil. FORMAT_D24_PLUS (and its stencil pairing) is "at least 24 bits of
+	// depth", which is all WebGPU promises: the implementation picks the actual layout.
+	FORMAT_S8_UINT,
 	FORMAT_D16_UNORM,
-	FORMAT_D24_UNORM_S8_UINT,
+	FORMAT_D24_PLUS,
+	FORMAT_D24_PLUS_S8_UINT,
 	FORMAT_D32_FLOAT,
-	FORMAT_D32_FLOAT_S8_UINT,
-	// TODO: extend with BC/ETC/ASTC compressed formats
+	FORMAT_D32_FLOAT_S8_UINT, // EXT
+	// TODO: extend with BC/ETC/ASTC compressed formats. 
 };
 
 /**
- * gpuFormatIsDepth – Returns true if `format` is one of the depth (or
- * depth/stencil) FORMAT values.
+ * gpuFormatIsDepth – Returns true if `format` carries a depth aspect. A stencil-only
+ * format (FORMAT_S8_UINT) is not one of these; see gpuFormatIsDepthStencil.
  *
  * @param format Format to test.
  */
 inline bool gpuFormatIsDepth(FORMAT format) {
 	switch (format) {
 	case FORMAT_D16_UNORM:
-	case FORMAT_D24_UNORM_S8_UINT:
+	case FORMAT_D24_PLUS:
+	case FORMAT_D24_PLUS_S8_UINT:
 	case FORMAT_D32_FLOAT:
 	case FORMAT_D32_FLOAT_S8_UINT:
 		return true;
@@ -213,10 +271,68 @@ inline bool gpuFormatIsDepth(FORMAT format) {
  */
 inline bool gpuFormatIsStencil(FORMAT format) {
 	switch (format) {
-	case FORMAT_D24_UNORM_S8_UINT:
+	case FORMAT_S8_UINT:
+	case FORMAT_D24_PLUS_S8_UINT:
 	case FORMAT_D32_FLOAT_S8_UINT:
 		return true;
 	default: return false;
+	}
+}
+
+/**
+ * gpuFormatIsDepthStencil – Returns true if `format` carries either a depth or a stencil
+ * aspect, and so can't be used where a plain color format is expected.
+ *
+ * @param format Format to test.
+ */
+inline bool gpuFormatIsDepthStencil(FORMAT format) {
+	return gpuFormatIsDepth(format) || gpuFormatIsStencil(format);
+}
+
+/**
+ * gpuFormatIsSrgb – Returns true if `format` stores sRGB encoded texels, so that a
+ * sampler decodes to linear on the way in and a render target encodes on the way out.
+ *
+ * @param format Format to test.
+ */
+inline bool gpuFormatIsSrgb(FORMAT format) {
+	return format == FORMAT_RGBA8_SRGB || format == FORMAT_BGRA8_SRGB;
+}
+
+/**
+ * gpuFormatIsFilterable – Returns true if a sampler may interpolate between texels of
+ * `format`. Integer formats are never filterable, a depth/stencil one only reads back
+ * through a comparison sampler, and filtering a 32 bit float image is optional on Vulkan
+ * and an opt-in feature on WebGPU, so both backends agree to never offer it.
+ *
+ * @param format Format to test.
+ */
+inline bool gpuFormatIsFilterable(FORMAT format) {
+	switch (format) {
+	case FORMAT_R8_UINT:
+	case FORMAT_R8_SINT:
+	case FORMAT_R16_UINT:
+	case FORMAT_R16_SINT:
+	case FORMAT_RG8_UINT:
+	case FORMAT_RG8_SINT:
+	case FORMAT_R32_UINT:
+	case FORMAT_R32_SINT:
+	case FORMAT_R32_FLOAT:
+	case FORMAT_RG16_UINT:
+	case FORMAT_RG16_SINT:
+	case FORMAT_RGBA8_UINT:
+	case FORMAT_RGBA8_SINT:
+	case FORMAT_RGB10_A2_UINT:
+	case FORMAT_RG32_UINT:
+	case FORMAT_RG32_SINT:
+	case FORMAT_RG32_FLOAT:
+	case FORMAT_RGBA16_UINT:
+	case FORMAT_RGBA16_SINT:
+	case FORMAT_RGBA32_UINT:
+	case FORMAT_RGBA32_SINT:
+	case FORMAT_RGBA32_FLOAT:
+		return false;
+	default: return !gpuFormatIsDepthStencil(format);
 	}
 }
 

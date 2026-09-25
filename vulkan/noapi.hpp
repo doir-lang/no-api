@@ -212,6 +212,9 @@ struct GpuSurface {
 	uint32_t current_image = uint32_t(-1), semaphore_counter = 0;
 };
 GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, VkSurfaceKHR surface, const GpuSurfaceDescriptor& desc);
+inline GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, const GpuVulkanDefault& vulkan, const GpuSurfaceDescriptor& desc) {
+	return gpuCreateSurfaceEXT(queue, vulkan.surface, desc);
+}
 
 
 
