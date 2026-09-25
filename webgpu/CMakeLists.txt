@@ -19,3 +19,6 @@ add_library(noapi-webgpu noapi.cpp)
 target_link_libraries(noapi-webgpu PUBLIC webgpu)
 set_target_properties(noapi-webgpu PROPERTIES CXX_STANDARD 26)
 target_include_directories(noapi-webgpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+# Lets anything linking this backend (rather than the other one) pick its shading language and its
+# windowing/instance glue at compile time
+target_compile_definitions(noapi-webgpu PUBLIC NOAPI_BACKEND_WEBGPU=1)

@@ -288,6 +288,11 @@ struct GpuTextureDescriptorImpl {
 };
 static_assert(sizeof(GpuTextureDescriptorImpl) == sizeof(GpuTextureDescriptor), "GPU Texture Descriptors of The Wrong Size");
 
+// Statuses gpuSurfaceNextTextureEXT leaves in errno. A suboptimal texture is still perfectly usable
+// (it just no longer matches the window), an out of date one means the configuration has to be redone.
+constexpr static int SURFACE_SUBOPTIMAL = WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal;
+constexpr static int SURFACE_OUT_OF_DATE = WGPUSurfaceGetCurrentTextureStatus_Outdated;
+
 struct GpuPipeline {
 	struct ComputeCache {
 		std::string IR;
@@ -309,3 +314,24 @@ struct GpuPipeline {
 	mutable WGPUPipelineLayout reference_layout; // The layout that the currently cached variant of this pipeline is built against
 	std::variant<ComputeCache, RenderCache> cache;
 };
+
+struct GpuSurface {
+	WGPUSurface surface;
+
+	// What wgpuSurfaceConfigure was actually given, which is not necessarily what the user asked for:
+	// the format, present mode, usage and alpha mode are all narrowed to what the surface supports so
+	// that gpuSurfaceGetConfigurationEXT reports the truth rather than the request.
+	GpuSurfaceDescriptor descriptor;
+
+	// The texture wgpuSurfaceGetCurrentTexture handed back, wrapped for the rest of the API. Its range
+	// stays empty: WebGPU allocates presentable textures itself, so there is no way to place one
+	// inside a monotexture and therefore no way to name it from a GpuTextureDescriptor. It can be
+	// attached to a render pass (or blitted to and from) and nothing else.
+	GpuTexture current = {};
+	bool acquired = false;
+};
+
+GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, WGPUSurface surface, const GpuSurfaceDescriptor& desc);
+inline GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, GpuWebGPUDefault def, const GpuSurfaceDescriptor& desc) {
+	return gpuCreateSurfaceEXT(queue, def.surface, desc);
+}

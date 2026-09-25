@@ -414,6 +414,12 @@ void update_pipeline_layouts(GpuQueue* queue) {
 
 
 
+constexpr static uint64_t gpu_address_max = 0x1FFFFFFFFFFFFFFF; // (2^61 - 1) aka max number storable in 60 bits
+// A gpu pointer reaches WGSL as a vec2<u32>, so the shader works with the halves of those: the bits of
+// the high word that still belong to the address, and how far up that word the monobuffer tag sits.
+constexpr static uint32_t gpu_address_max_hi = static_cast<uint32_t>(gpu_address_max >> 32);
+constexpr static uint32_t gpu_address_tag_shift = std::countr_one(gpu_address_max_hi); // 61 - 32
+
 std::string generate_binding_prologue(GpuQueue* queue, bool compute) {
 	// Has to name the same view dimension GPU::texture_view2wgpu puts in the bind group layouts, or
 	// the declaration won't match the view that gets bound. A plain 2D texture is still an array
@@ -432,22 +438,29 @@ std::string generate_binding_prologue(GpuQueue* queue, bool compute) {
 		switch (f) {
 		case FORMAT_RGBA8_UNORM:
 			return "rgba8unorm";
-		case FORMAT_RGBA8_SRGB:
-			return "rgba8snorm";
 		case FORMAT_RGBA16_FLOAT:
 			return "rgba16float";
 		case FORMAT_RGBA32_FLOAT:
 			return "rgba32float";
+		case FORMAT_R32_FLOAT:
+			return "r32float";
+		// WGSL has no sRGB storage format at all, and bgra8unorm needs the bgra8unorm-storage feature:
+		// case FORMAT_RGBA8_SRGB:
+		// case FORMAT_BGRA8_UNORM:
+		// case FORMAT_BGRA8_SRGB:
+		// These are only spellable with the texture-formats-tier1 feature, which we never ask for:
 		// case FORMAT_RG11B10_FLOAT:
 		// case FORMAT_RGB10_A2_UNORM:
 		// case FORMAT_R8_UNORM:
 		// case FORMAT_R16_FLOAT:
-		// case FORMAT_R32_FLOAT:
+		// A depth format can never be a storage texture:
 		// case FORMAT_D16_UNORM:
 		// case FORMAT_D24_UNORM_S8_UINT:
 		// case FORMAT_D32_FLOAT:
 		// case FORMAT_D32_FLOAT_S8_UINT:
 		default:
+			// The fallback shares a texel size with the 8 bit formats that land here, so a release
+			// build writes the right number of bytes even though it skips the sRGB conversion
 			assert(false && "Unsupported storage texture format");
 			return "rgba8unorm";
 		}
@@ -498,6 +511,80 @@ std::string generate_binding_prologue(GpuQueue* queue, bool compute) {
 		"	fragment: vec2<u32>,\n"
 		"}\n")
 	+ std::format("@group(0) @binding({}) var<uniform> shader_data : GPUShaderData;\n\n", binding++);
+
+	//
+	// Pointers. A gpu pointer arrives as a vec2<u32> holding the 64 bits gpuEncodeWebGPUAddressEXT
+	// produced: an offset into a monobuffer, tagged in the top bits with which monobuffer that is.
+	// WGSL can't index an array of storage buffers, so reaching one means switching over every
+	// monobuffer the queue has, which is why these are generated rather than written by hand.
+	//
+	std::string load_cases, store_cases;
+	for(uint32_t i = 1; i < queue->monobuffers.size(); ++i) {
+		load_cases += std::format("		case {}u: {{ return mono{}[index]; }}\n", i, i);
+		store_cases += std::format("		case {}u: {{ mono{}[index] = value; }}\n", i, i);
+	}
+
+	out += std::format(
+		"const GPU_ADDRESS_MAX_HI : u32 = {:#x}u; // The bits of the high word that are still address\n"
+		"const GPU_ADDRESS_TAG_SHIFT : u32 = {}u; // Where the monobuffer tag starts in that word\n"
+		"\n"
+		"struct GPUAddress {{\n"
+		"	monobuffer : u32,\n"
+		"	address : vec2<u32>,\n"
+		"}}\n"
+		"\n"
+		"// Steps a pointer forward by `offset` bytes. Only the low word moves: no allocation reaches\n"
+		"// far enough into a monobuffer to carry into the high one.\n"
+		"fn gpuPtrOffset(address : vec2<u32>, offset : u32) -> vec2<u32> {{\n"
+		"	return vec2<u32>(address.x + offset, address.y);\n"
+		"}}\n"
+		"\n"
+		"fn gpuEncodeAddress(monobuffer : u32, address : vec2<u32>) -> vec2<u32> {{\n"
+		"	let tag = monobuffer + 1u; // Zero is left meaning \"no pointer\"\n"
+		"	return vec2<u32>(address.x, (address.y & GPU_ADDRESS_MAX_HI) | (tag << GPU_ADDRESS_TAG_SHIFT));\n"
+		"}}\n"
+		"\n"
+		"fn gpuDecodeAddress(encoded : vec2<u32>) -> GPUAddress {{\n"
+		"	let tag = encoded.y >> GPU_ADDRESS_TAG_SHIFT;\n"
+		"	return GPUAddress(tag - 1u, vec2<u32>(encoded.x, encoded.y & GPU_ADDRESS_MAX_HI));\n"
+		"}}\n"
+		"\n"
+		"fn gpuLoadU32(address : vec2<u32>) -> u32 {{\n"
+		"	let at = gpuDecodeAddress(address);\n"
+		"	let index = at.address.x / 4u;\n"
+		"	switch at.monobuffer {{\n"
+		"{}"
+		"		default: {{ return mono0[index]; }}\n"
+		"	}}\n"
+		"}}\n"
+		"\n"
+		"fn gpuLoadF32(address : vec2<u32>) -> f32 {{\n"
+		"	return bitcast<f32>(gpuLoadU32(address));\n"
+		"}}\n"
+		"\n"
+		"// Loads the pointer sitting at `address`, for stepping through a root data struct\n"
+		"fn gpuLoadPtr(address : vec2<u32>) -> vec2<u32> {{\n"
+		"	return vec2<u32>(gpuLoadU32(address), gpuLoadU32(gpuPtrOffset(address, 4u)));\n"
+		"}}\n"
+		"\n", gpu_address_max_hi, gpu_address_tag_shift, load_cases);
+
+	// The rasterizer only gets the monobuffers read only (see create_buffer_bind_group_layout), so a
+	// store is compute only and declaring one in a graphics shader wouldn't even compile
+	if(compute)
+		out += std::format(
+			"fn gpuStoreU32(address : vec2<u32>, value : u32) {{\n"
+			"	let at = gpuDecodeAddress(address);\n"
+			"	let index = at.address.x / 4u;\n"
+			"	switch at.monobuffer {{\n"
+			"{}"
+			"		default: {{ mono0[index] = value; }}\n"
+			"	}}\n"
+			"}}\n"
+			"\n"
+			"fn gpuStoreF32(address : vec2<u32>, value : f32) {{\n"
+			"	gpuStoreU32(address, bitcast<u32>(value));\n"
+			"}}\n"
+			"\n", store_cases);
 
 	binding = 0;
 
@@ -663,8 +750,6 @@ void gpuFreeQueue(GpuQueue* queue) {
 	queue->~GpuQueue();
 	allocator(queue, 0);
 }
-
-constexpr static uint64_t gpu_address_max = 0x1FFFFFFFFFFFFFFF; // (2^61 - 1) aka max number storable in 60 bits
 
 // top 3 bits encode monobuffer, rest encodes address
 gpu* gpuEncodeWebGPUAddressEXT(uint8_t monobuffer, uint64_t address) {
@@ -1020,6 +1105,12 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 }
 
 GpuTextureDescriptor gpuTextureViewDescriptor(GpuQueue* queue, const GpuTexture* texture, const GpuViewDesc& desc) {
+	// A shader reaches a texture by indexing the monotexture holding it, so a texture that never landed
+	// in one can't be described. That is every texture created without USAGE_SAMPLED or USAGE_STORAGE,
+	// and a surface's presentable texture, which WebGPU allocates itself and never lets us place in an
+	// atlas. Blit it into a sampled texture (gpuBlitTextureEXT) and describe that instead.
+	assert(texture->range && "This texture has no monotexture slot, so no descriptor can name it");
+
 	GpuTextureDescriptorImpl out {
 		.type = static_cast<uint8_t>(texture->descriptor.type),
 		.baseMip = desc.baseMip,
@@ -1469,6 +1560,8 @@ namespace GPU::detail {
 		case FORMAT_D16_UNORM: return 2;
 		case FORMAT_RGBA8_UNORM:
 		case FORMAT_RGBA8_SRGB:
+		case FORMAT_BGRA8_UNORM:
+		case FORMAT_BGRA8_SRGB:
 		case FORMAT_RG11B10_FLOAT:
 		case FORMAT_RGB10_A2_UNORM:
 		case FORMAT_R32_FLOAT:
@@ -1685,18 +1778,19 @@ void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuT
 		.aspect = WGPUTextureAspect_All
 	};
 	if(texture->range) source.origin = {0, 0, texture->range->start};
+	// The texture is what is being read here, so the buffer half of the copy is the destination
 	WGPUTexelCopyBufferInfo destination {
 		.layout = {
-			.offset = static_cast<uint64_t>(src_range.start + src_offset),
-			.bytesPerRow = texture->descriptor.dimensions.x * texture->descriptor.format,
+			.offset = static_cast<uint64_t>(dest_range.start + dest_offset),
+			.bytesPerRow = texture->descriptor.dimensions.x * GPU::detail::format_bytes(texture->descriptor.format),
 			.rowsPerImage = texture->descriptor.dimensions.y,
 		},
-		.buffer = cmd->queue->monobuffers[src_range.buffer],
+		.buffer = cmd->queue->monobuffers[dest_range.buffer],
 	};
 	WGPUExtent3D size {
 		.width = texture->descriptor.dimensions.x,
 		.height = texture->descriptor.dimensions.y,
-		.depthOrArrayLayers = texture->range ? texture->range->start - texture->range->end : texture->descriptor.dimensions.z
+		.depthOrArrayLayers = texture->range ? texture->range->end - texture->range->start : texture->descriptor.dimensions.z
 	};
 	wgpuCommandEncoderCopyTextureToBuffer(cmd->encoder, &source, &destination, &size);
 }
@@ -2390,4 +2484,200 @@ void gpuDrawMeshlets(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_dat
 
 void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, gpu* dim, bool no_offsets /* = false */) {
 	throw std::runtime_error("WebGPU doesn't support mesh shaders!");
+}
+
+
+
+namespace GPU::detail {
+	// Hands the presentable texture back to the surface. Any view recorded from it outlives this call:
+	// a WebGPU view keeps its texture alive internally, so the views gpuBeginRenderPass created are
+	// still valid until the submission that used them releases them.
+	inline void release_surface_texture(GpuSurface* surface) {
+		if(!surface->acquired) return;
+
+		wgpuTextureRelease(surface->current.texture);
+		surface->current.texture = nullptr;
+		surface->acquired = false;
+	}
+
+	// The requested present mode when the surface supports it, otherwise the best one it does:
+	// mailbox (tear free at the lowest latency), then relaxed fifo, then the fifo every surface has.
+	inline WGPUPresentMode pick_present_mode(PRESENT_MODE requested, const WGPUSurfaceCapabilities& caps) {
+		auto supported = [&caps](WGPUPresentMode mode) {
+			for(size_t i = 0; i < caps.presentModeCount; ++i)
+				if(caps.presentModes[i] == mode) return true;
+			return false;
+		};
+
+		if(requested != PRESENT_MODE_BEST_AVAILABLE)
+			if(auto wanted = GPU::present2wgpu(requested); supported(wanted))
+				return wanted;
+
+		if(supported(WGPUPresentMode_Mailbox)) return WGPUPresentMode_Mailbox;
+		if(supported(WGPUPresentMode_FifoRelaxed)) return WGPUPresentMode_FifoRelaxed;
+		return WGPUPresentMode_Fifo; // Guaranteed to be supported
+	}
+
+	// The requested format when the surface supports it, otherwise the one it prefers. FORMAT_NONE asks
+	// for the preferred one outright, which is the portable thing to do: it is BGRA8 on most platforms
+	// and the only format offered on some of them.
+	inline WGPUTextureFormat pick_surface_format(FORMAT requested, const WGPUSurfaceCapabilities& caps) {
+		if(requested != FORMAT_NONE) {
+			auto wanted = GPU::format2wgpu(requested);
+			for(size_t i = 0; i < caps.formatCount; ++i)
+				if(caps.formats[i] == wanted) return wanted;
+		}
+
+		return caps.formatCount ? caps.formats[0] : WGPUTextureFormat_BGRA8Unorm;
+	}
+
+	inline WGPUCompositeAlphaMode pick_alpha_mode(bool opaque, const WGPUSurfaceCapabilities& caps) {
+		auto wanted = opaque ? WGPUCompositeAlphaMode_Opaque : WGPUCompositeAlphaMode_Premultiplied;
+		for(size_t i = 0; i < caps.alphaModeCount; ++i)
+			if(caps.alphaModes[i] == wanted) return wanted;
+
+		// Auto aliases the surface's first supported mode and is never listed as one itself
+		return WGPUCompositeAlphaMode_Auto;
+	}
+}
+
+GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, WGPUSurface surface, const GpuSurfaceDescriptor& desc) {
+	auto out = (GpuSurface*)queue->cpu_allocator(nullptr, sizeof(GpuSurface));
+	new(out) GpuSurface {
+		.surface = surface,
+	};
+
+	gpuSurfaceReconfigureEXT(queue, out, desc);
+	return out;
+}
+
+void gpuFreeSurfaceEXT(GpuQueue* queue, GpuSurface* surface) {
+	GPU::detail::release_surface_texture(surface);
+	wgpuSurfaceUnconfigure(surface->surface);
+	// The WGPUSurface itself was handed to us by whoever owns the window, so it is theirs to release
+	// (matching the Vulkan backend, which leaves the VkSurfaceKHR alone too)
+
+	auto allocator = queue->cpu_allocator;
+	surface->~GpuSurface();
+	allocator(surface, 0);
+}
+
+void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSurfaceDescriptor& desc) {
+	// Whatever is still acquired belongs to the configuration being replaced
+	GPU::detail::release_surface_texture(surface);
+
+	WGPUSurfaceCapabilities caps = {};
+	if(wgpuSurfaceGetCapabilities(surface->surface, queue->adapter, &caps) != WGPUStatus_Success) {
+		errno = WGPUErrorType_Unknown;
+		return;
+	}
+
+	surface->descriptor = desc;
+	auto& texture = surface->descriptor.texture;
+
+	// A presentable texture is a single 2D image with no mips and no multisampling, whatever was asked
+	// for. Render into an MSAA texture of your own and resolve (or blit) into this one instead.
+	texture.type = TEXTURE_2D;
+	texture.mipCount = 1;
+	texture.sampleCount = 1;
+	texture.layerCount = 1;
+	texture.dimensions.z = 1;
+	assert(texture.dimensions.x > 0 && texture.dimensions.y > 0 && "A surface can't be configured for a zero sized window");
+
+	auto format = GPU::detail::pick_surface_format(texture.format, caps);
+	auto present_mode = GPU::detail::pick_present_mode(surface->descriptor.presentMode, caps);
+	auto alpha_mode = GPU::detail::pick_alpha_mode(surface->descriptor.opaque, caps);
+
+	// RenderAttachment is the one usage every surface offers, and the only one the rest of the API can
+	// reach: a presentable texture is allocated by WebGPU itself, so it can't be placed inside a
+	// monotexture, and a GpuTextureDescriptor (what a sampled or storage binding goes through) can only
+	// name a texture that lives in one. Asking for USAGE_SAMPLED is still worth it where the surface
+	// supports it, because gpuBlitTextureEXT binds its source view directly rather than through the
+	// heap, which makes a presented frame readable that way.
+	auto usage = (GPU::usage2wgpu(texture.usage) | WGPUTextureUsage_RenderAttachment) & caps.usages;
+
+	WGPUSurfaceConfiguration config {
+		.device = queue->device,
+		.format = format,
+		.usage = usage,
+		.width = texture.dimensions.x,
+		.height = texture.dimensions.y,
+		.alphaMode = alpha_mode,
+		.presentMode = present_mode,
+	};
+	wgpuSurfaceConfigure(surface->surface, &config);
+	wgpuSurfaceCapabilitiesFreeMembers(caps);
+
+	// Report what the surface was actually given rather than what was requested, so that code which
+	// has to match the swapchain (a pipeline's color target format above all) can just ask
+	texture.format = GPU::wgpu2format(format);
+	texture.usage = (TEXTURE_USAGE_FLAGS)(USAGE_COLOR_ATTACHMENT
+		| ((usage & WGPUTextureUsage_TextureBinding) ? USAGE_SAMPLED : 0)
+		| ((usage & WGPUTextureUsage_StorageBinding) ? USAGE_STORAGE : 0)
+		| ((usage & WGPUTextureUsage_CopySrc) ? USAGE_TRANSFER_SRC : 0)
+		| ((usage & WGPUTextureUsage_CopyDst) ? USAGE_TRANSFER_DST : 0));
+	surface->descriptor.presentMode = GPU::wgpu2present(present_mode);
+	surface->descriptor.opaque = alpha_mode == WGPUCompositeAlphaMode_Opaque
+		|| (alpha_mode == WGPUCompositeAlphaMode_Auto && surface->descriptor.opaque);
+}
+
+GpuSurfaceDescriptor gpuSurfaceGetConfigurationEXT(const GpuSurface* surface) {
+	return surface->descriptor;
+}
+
+const GpuTexture* gpuSurfaceNextTextureEXT(GpuQueue* queue, GpuSurface* surface) {
+	// Acquiring twice without presenting in between is a mistake, but it shouldn't leak the texture
+	GPU::detail::release_surface_texture(surface);
+
+	WGPUSurfaceTexture acquired = {};
+	wgpuSurfaceGetCurrentTexture(surface->surface, &acquired);
+
+	switch(acquired.status) {
+	break; case WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal:
+		// Nothing to report
+	break; case WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal:
+		// The texture no longer matches the window but can still be rendered into and presented. The
+		// caller decides whether that is worth a reconfiguration.
+		errno = SURFACE_SUBOPTIMAL;
+	break; default:
+		// Outdated, Lost, Timeout and Error all leave nothing to render into
+		errno = acquired.status;
+		if(acquired.texture) wgpuTextureRelease(acquired.texture);
+		return nullptr;
+	}
+
+	// The texture's own size rather than the configured one: they agree, and taking it from the texture
+	// keeps the descriptor honest if a platform ever rounds the configuration
+	surface->current = GpuTexture {
+		.descriptor = surface->descriptor.texture,
+		// Deliberately no monotexture range. Everything that consumes a texture through the descriptor
+		// heap therefore can't touch this one; gpuBlitTextureEXT is the bridge in both directions.
+		.range = {},
+		.texture = acquired.texture,
+	};
+	surface->current.descriptor.dimensions = {
+		wgpuTextureGetWidth(acquired.texture),
+		wgpuTextureGetHeight(acquired.texture),
+		1
+	};
+	surface->acquired = true;
+	return &surface->current;
+}
+
+void gpuSurfacePresentEXT(GpuQueue* queue, GpuSurface* surface, uint64_t wait_submission_index /* = NO_SUBMISSION_WAIT */) {
+	assert(surface->acquired && "gpuSurfaceNextTextureEXT has to succeed before the frame can be presented");
+
+	// WebGPU has one queue and presents behind everything already submitted to it, so there is nothing
+	// to wait on here: any index the caller can name belongs to a submission that has already been
+	// handed over. All the parameter can do on this backend is get checked.
+	assert((wait_submission_index == NO_SUBMISSION_WAIT || wait_submission_index < queue->next_submission_index)
+		&& "Presenting behind a submission that hasn't happened yet would deadlock on a backend that waits");
+
+	GPU::detail::release_surface_texture(surface);
+#ifndef __EMSCRIPTEN__
+	// In the browser the canvas is presented when control returns to the event loop, and calling this
+	// is an error there
+	if(wgpuSurfacePresent(surface->surface) != WGPUStatus_Success)
+		errno = WGPUErrorType_Unknown;
+#endif
 }

@@ -423,6 +423,10 @@ fn cs_set_max() {
 			return WGPUTextureFormat_RGBA8Unorm;
 		case FORMAT_RGBA8_SRGB:
 			return WGPUTextureFormat_RGBA8UnormSrgb;
+		case FORMAT_BGRA8_UNORM:
+			return WGPUTextureFormat_BGRA8Unorm;
+		case FORMAT_BGRA8_SRGB:
+			return WGPUTextureFormat_BGRA8UnormSrgb;
 		case FORMAT_RGBA16_FLOAT:
 			return WGPUTextureFormat_RGBA16Float;
 		case FORMAT_RGBA32_FLOAT:
@@ -469,6 +473,50 @@ fn cs_set_max() {
 			usage |= WGPUTextureUsage_RenderAttachment;
 
 		return usage;
+	}
+
+	// Names a WebGPU format the API can talk about again, or FORMAT_NONE for one it can't. Only
+	// needed where WebGPU picks the format rather than us — which today means a surface reporting
+	// the formats it prefers (see gpuSurfaceReconfigureEXT).
+	inline FORMAT wgpu2format(WGPUTextureFormat format) {
+		switch (format) {
+		case WGPUTextureFormat_RGBA8Unorm: return FORMAT_RGBA8_UNORM;
+		case WGPUTextureFormat_RGBA8UnormSrgb: return FORMAT_RGBA8_SRGB;
+		case WGPUTextureFormat_BGRA8Unorm: return FORMAT_BGRA8_UNORM;
+		case WGPUTextureFormat_BGRA8UnormSrgb: return FORMAT_BGRA8_SRGB;
+		case WGPUTextureFormat_RGBA16Float: return FORMAT_RGBA16_FLOAT;
+		case WGPUTextureFormat_RGBA32Float: return FORMAT_RGBA32_FLOAT;
+		case WGPUTextureFormat_RG11B10Ufloat: return FORMAT_RG11B10_FLOAT;
+		case WGPUTextureFormat_RGB10A2Unorm: return FORMAT_RGB10_A2_UNORM;
+		case WGPUTextureFormat_R8Unorm: return FORMAT_R8_UNORM;
+		case WGPUTextureFormat_R16Float: return FORMAT_R16_FLOAT;
+		case WGPUTextureFormat_R32Float: return FORMAT_R32_FLOAT;
+		case WGPUTextureFormat_Depth16Unorm: return FORMAT_D16_UNORM;
+		case WGPUTextureFormat_Depth24PlusStencil8: return FORMAT_D24_UNORM_S8_UINT;
+		case WGPUTextureFormat_Depth32Float: return FORMAT_D32_FLOAT;
+		case WGPUTextureFormat_Depth32FloatStencil8: return FORMAT_D32_FLOAT_S8_UINT;
+		default: return FORMAT_NONE;
+		}
+	}
+
+	// PRESENT_MODE_BEST_AVAILABLE has no WebGPU spelling, so it is resolved against what the surface
+	// supports before this is reached (see GPU::detail::pick_present_mode)
+	inline WGPUPresentMode present2wgpu(PRESENT_MODE mode) {
+		switch (mode) {
+		case PRESENT_MODE_IMMEDIATE: return WGPUPresentMode_Immediate;
+		case PRESENT_MODE_FIFO_RELAXED: return WGPUPresentMode_FifoRelaxed;
+		case PRESENT_MODE_MAILBOX: return WGPUPresentMode_Mailbox;
+		default: return WGPUPresentMode_Fifo;
+		}
+	}
+
+	inline PRESENT_MODE wgpu2present(WGPUPresentMode mode) {
+		switch (mode) {
+		case WGPUPresentMode_Immediate: return PRESENT_MODE_IMMEDIATE;
+		case WGPUPresentMode_FifoRelaxed: return PRESENT_MODE_FIFO_RELAXED;
+		case WGPUPresentMode_Mailbox: return PRESENT_MODE_MAILBOX;
+		default: return PRESENT_MODE_FIFO;
+		}
 	}
 
 	inline WGPUCompareFunction op2wgpu(OP op) {
