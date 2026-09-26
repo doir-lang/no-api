@@ -4,7 +4,9 @@
 // Synchronization Extension
 // ---------------------------------------------------------------------------
 
-#include "compute.hpp"
+#include "compute.h"
+
+NOAPI_EXTERN_C_BEGIN
 
 /**
  * gpuGetSubmissionSemaphoreEXT – Returns a semaphore that tracks the currently
@@ -27,26 +29,39 @@ void gpuWaitIdleEXT(GpuQueue* queue);
 /**
  * @brief gpuSyncMemoryEXT - If this memory is MEMORY_DEFAULT this will copy the CPU data to the GPU.
  * If this memory is MEMORY_READBACK this will copy the GPU data to the CPU!
- * 
- * @note Only necessary on WebGPU due to the restrictiveness of its buffer model. 
+ *
+ * @note Only necessary on WebGPU due to the restrictiveness of its buffer model.
  * On other backends this is a noop.
  *
  * @param cmd Command buffer to enqueue the commands on
  * @param mem The memory to synchronize
- * @return  
+ * @return
  */
 void gpuSyncMemoryEXT(GpuCommandBuffer* cmd, gpu* mem);
 
 /**
- * @brief gpuSyncMemoryEXT - If this memory is MEMORY_DEFAULT this will copy the CPU data to the GPU.
+ * @brief gpuSyncMemoryImmediateEXT - If this memory is MEMORY_DEFAULT this will copy the CPU data to the GPU.
  * If this memory is MEMORY_READBACK this will copy the GPU data to the CPU!
- * 
+ *
  * @note This variant submits the sync right away rather than enqueing it.
- * @note Only necessary on WebGPU due to the restrictiveness of its buffer model. 
+ * @note Spelled gpuSyncMemoryEXT in C++, where it is an overload of the command buffer flavour.
+ * @note Only necessary on WebGPU due to the restrictiveness of its buffer model.
  * On other backends this is a noop.
  *
  * @param queue Queue the memory was created from.
  * @param mem The memory to synchronize
- * @return  
+ * @return
  */
-void gpuSyncMemoryEXT(GpuQueue* queue, gpu* mem);
+void gpuSyncMemoryImmediateEXT(GpuQueue* queue, gpu* mem);
+
+NOAPI_EXTERN_C_END
+
+#ifdef __cplusplus
+/**
+ * gpuSyncMemoryEXT – C++ spelling of gpuSyncMemoryImmediateEXT.
+ *
+ * @param queue Queue the memory was created from.
+ * @param mem The memory to synchronize
+ */
+inline void gpuSyncMemoryEXT(GpuQueue* queue, gpu* mem) { gpuSyncMemoryImmediateEXT(queue, mem); }
+#endif

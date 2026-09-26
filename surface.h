@@ -1,8 +1,6 @@
 #pragma once
 
-#include "graphics.hpp"
-
-#include <vector>
+#include "graphics.h"
 
 // ---------------------------------------------------------------------------
 // Surface Extension
@@ -21,7 +19,7 @@
  * intentionally follows the simpler WebGPU-style model where the presentation
  * system is represented as a single reconfigurable object.
  */
-struct GpuSurface;
+typedef struct GpuSurface GpuSurface;
 
 /**
  * PRESENT_MODE – Swapchain presentation scheduling behavior.
@@ -29,7 +27,7 @@ struct GpuSurface;
  * The exact implementation depends on platform compositor support and GPU
  * driver capabilities.
  */
-enum PRESENT_MODE {
+typedef enum PRESENT_MODE {
 	/**
 	 * Present immediately without waiting for vertical sync. Lowest latency
 	 * but may introduce visible tearing.
@@ -61,7 +59,16 @@ enum PRESENT_MODE {
 	 * typically preferring MAILBOX, then FIFO_RELAXED, then FIFO.
 	 */
 	PRESENT_MODE_BEST_AVAILABLE
-};
+} PRESENT_MODE;
+
+/**
+ * GPU_MAX_SURFACE_FORMATS / GPU_MAX_SURFACE_PRESENT_MODES – Capacity of the lists in
+ * GpuSurfaceCapabilities. Fixed rather than allocated so that the struct can be returned
+ * by value to a C caller with nothing to free; both are comfortably larger than the
+ * number of distinct FORMAT / PRESENT_MODE values a surface can report.
+ */
+#define GPU_MAX_SURFACE_FORMATS 32
+#define GPU_MAX_SURFACE_PRESENT_MODES 4
 
 /**
  * GpuSurfaceCapabilities – Queryable presentation capabilities for a surface.
@@ -75,34 +82,47 @@ enum PRESENT_MODE {
  * surface that reports neither list as empty can always be configured with any
  * entry in them.
  */
-struct GpuSurfaceCapabilities {
+typedef struct GpuSurfaceCapabilities {
 	/**
-	 * Supported swapchain texture formats, best first.
+	 * Supported swapchain texture formats, best first. The first formatCount entries
+	 * are meaningful.
 	 *
 	 * Typically includes formats such as FORMAT_BGRA8_SRGB, FORMAT_BGRA8_UNORM,
 	 * and optionally HDR formats such as FORMAT_RGB10_A2_UNORM. Formats the rest
 	 * of the API can't name, and formats only offered outside the nonlinear sRGB
 	 * color space the swapchain is built for, are left out.
 	 */
-	std::vector<FORMAT> formats;
+	FORMAT formats[GPU_MAX_SURFACE_FORMATS];
+	uint32_t formatCount NOAPI_DEFAULT(0); ///< How many entries of formats are filled in.
 
 	/**
-	 * Supported presentation scheduling modes, best first. Never contains
-	 * PRESENT_MODE_BEST_AVAILABLE, which is a request rather than a mode.
+	 * Supported presentation scheduling modes, best first. The first presentModeCount
+	 * entries are meaningful. Never contains PRESENT_MODE_BEST_AVAILABLE, which is a
+	 * request rather than a mode.
 	 */
-	std::vector<PRESENT_MODE> presentModes;
+	PRESENT_MODE presentModes[GPU_MAX_SURFACE_PRESENT_MODES];
+	uint32_t presentModeCount NOAPI_DEFAULT(0); ///< How many entries of presentModes are filled in.
 
 	/**
 	 * True if the compositor supports transparent or alpha-composited windows,
 	 * which is what a surface configured with `opaque = false` asks for.
 	 */
-	bool supportsTransparency = false;
-};
+	bool supportsTransparency NOAPI_DEFAULT(false);
+
+#ifdef __cplusplus
+	/**
+	 * formatList / presentModeList – The filled in part of each array as a span, so that
+	 * C++ can iterate the lists without carrying their counts around.
+	 */
+	std::span<const FORMAT> formatList() const noexcept { return {formats, formatCount}; }
+	std::span<const PRESENT_MODE> presentModeList() const noexcept { return {presentModes, presentModeCount}; }
+#endif
+} GpuSurfaceCapabilities;
 
 /**
  * GpuSurfaceDescriptor – Presentation surface / swapchain configuration.
  */
-struct GpuSurfaceDescriptor {
+typedef struct GpuSurfaceDescriptor {
 	/**
 	 * Descriptor used to create the internally managed presentable textures.
 	 *
@@ -110,7 +130,7 @@ struct GpuSurfaceDescriptor {
 	 * this descriptor. Implementations may impose additional restrictions on
 	 * supported formats/usages depending on platform swapchain limitations.
 	 */
-	GpuTextureDesc texture = {};
+	GpuTextureDesc texture NOAPI_DEFAULT({});
 
 	/**
 	 * Preferred presentation scheduling mode.
@@ -118,7 +138,7 @@ struct GpuSurfaceDescriptor {
 	 * The runtime may silently fall back to another supported mode if the
 	 * requested mode is unavailable on the current system.
 	 */
-	PRESENT_MODE presentMode = PRESENT_MODE_BEST_AVAILABLE;
+	PRESENT_MODE presentMode NOAPI_DEFAULT(PRESENT_MODE_BEST_AVAILABLE);
 
 	/**
 	 * Hint that the presented image is fully opaque.
@@ -126,8 +146,14 @@ struct GpuSurfaceDescriptor {
 	 * Allows compositors to skip destination blending work on platforms that
 	 * support opaque presentation surfaces.
 	 */
-	bool opaque = true;
-};
+	bool opaque NOAPI_DEFAULT(true);
+} GpuSurfaceDescriptor;
+
+/**
+ * GPU_SURFACE_DESCRIPTOR_DEFAULT – The defaults above as an initializer, for C. Keep in
+ * sync with GpuSurfaceDescriptor.
+ */
+#define GPU_SURFACE_DESCRIPTOR_DEFAULT { GPU_TEXTURE_DESC_DEFAULT, PRESENT_MODE_BEST_AVAILABLE, true }
 
 /**
  * gpuCreateSurface – Create a platform presentation surface / swapchain.
@@ -149,6 +175,8 @@ struct GpuSurfaceDescriptor {
  * @param desc Surface configuration descriptor.
  */
 // GpuSurface* gpuCreateSurfaceEXT(/* Platform creation logic up to implementation */);
+
+NOAPI_EXTERN_C_BEGIN
 
 /**
  * gpuFreeSurface – Destroy a presentation surface and release all associated
@@ -177,7 +205,7 @@ void gpuFreeSurfaceEXT(GpuQueue* queue, GpuSurface* surface);
  * @param surface Surface to reconfigure.
  * @param desc New surface configuration.
  */
-void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSurfaceDescriptor& desc);
+void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, NOAPI_CONST_REF(GpuSurfaceDescriptor) desc);
 
 /**
  * gpuGetSurfaceCapabilities – Query presentation capabilities for a surface.
@@ -192,7 +220,7 @@ void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSur
  * @param surface Surface to query.
  * @return What the surface supports, each list ordered best first.
  */
-GpuSurfaceCapabilities gpuGetSurfaceCapabilities(GpuQueue* queue, GpuSurface* surface);
+GpuSurfaceCapabilities gpuGetSurfaceCapabilitiesEXT(GpuQueue* queue, GpuSurface* surface);
 
 /**
  * gpuSurfaceGetConfigurationEXT – Gets the configured properties of the surface.
@@ -232,7 +260,11 @@ GpuSurfaceDescriptor gpuSurfaceGetConfigurationEXT(const GpuSurface* surface);
  */
 const GpuTexture* gpuSurfaceNextTextureEXT(GpuQueue* queue, GpuSurface* surface);
 
-constexpr static uint64_t NO_SUBMISSION_WAIT = -1;
+#ifdef __cplusplus
+	constexpr static uint64_t NO_SUBMISSION_WAIT = -1;
+#else
+	#define NO_SUBMISSION_WAIT ((uint64_t)-1)
+#endif
 
 /**
  * gpuSurfacePresent – Queue the currently acquired surface texture for display.
@@ -247,6 +279,8 @@ constexpr static uint64_t NO_SUBMISSION_WAIT = -1;
  * (as returned by gpuSubmit), or NO_SUBMISSION_WAIT to present without waiting
  * on a specific submission.
  */
-void gpuSurfacePresentEXT(GpuQueue* queue, GpuSurface* surface, uint64_t wait_submission_index = NO_SUBMISSION_WAIT);
+void gpuSurfacePresentEXT(GpuQueue* queue, GpuSurface* surface, uint64_t wait_submission_index NOAPI_DEFAULT(NO_SUBMISSION_WAIT));
+
+NOAPI_EXTERN_C_END
 
 

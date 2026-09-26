@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cassert>
+#include <iostream>
 #include <numeric>
 #include <print>
 #include <stdexcept>
@@ -44,67 +45,67 @@
 
 	// Multiplies an array of floats by six, through the two pointers its root data struct holds
 	static const std::string glsl_compute = R"glsl(
-	layout(buffer_reference, std430, buffer_reference_align = 4) buffer Floats {
-		float data[];
-	};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Floats {
+	float data[];
+};
 
-	layout(buffer_reference, std430, buffer_reference_align = 8) buffer ComputeData {
-		Floats upload;
-		Floats download;
-	};
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer ComputeData {
+	Floats upload;
+	Floats download;
+};
 
-	// As many elements as the C++ side allocated. The dispatch covers a whole workgroup, so the threads
-	// past the end have to be sent home rather than left to trample memory that was never theirs.
-	const uint ELEMENT_COUNT = 5;
+// As many elements as the C++ side allocated. The dispatch covers a whole workgroup, so the threads
+// past the end have to be sent home rather than left to trample memory that was never theirs.
+const uint ELEMENT_COUNT = 5;
 
-	layout(local_size_x = 16) in;
+layout(local_size_x = 16) in;
 
-	void main() {
-		if(gl_GlobalInvocationID.x >= ELEMENT_COUNT) return;
+void main() {
+	if(gl_GlobalInvocationID.x >= ELEMENT_COUNT) return;
 
-		ComputeData data = ComputeData(pc.compute_data);
-		Floats u = data.upload;
-		Floats d = data.download;
+	ComputeData data = ComputeData(pc.compute_data);
+	Floats u = data.upload;
+	Floats d = data.download;
 
-		d.data[gl_GlobalInvocationID.x] = u.data[gl_GlobalInvocationID.x] * 6;
-	}
+	d.data[gl_GlobalInvocationID.x] = u.data[gl_GlobalInvocationID.x] * 6;
+}
 	)glsl";
 
 	// There are no vertex buffers — the vertex shader loads each vertex out of the array its root data
 	// points at.
 	static const std::string glsl_vertex = R"glsl(
-	layout(buffer_reference, std430, buffer_reference_align = 4) buffer Vertices {
-		float data[];
-	};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Vertices {
+	float data[];
+};
 
-	layout(buffer_reference, std430, buffer_reference_align = 8) buffer TriangleData {
-		Vertices vertices;
-	};
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer TriangleData {
+	Vertices vertices;
+};
 
-	// One entry of that array is {x, y, r, g, b}: five floats, matching Vertex on the C++ side
-	const uint VERTEX_STRIDE = 5;
+// One entry of that array is {x, y, r, g, b}: five floats, matching Vertex on the C++ side
+const uint VERTEX_STRIDE = 5;
 
-	layout(location = 0) out vec3 frag_color;
+layout(location = 0) out vec3 frag_color;
 
-	void main() {
-		Vertices verts = TriangleData(pc.vertex_data).vertices;
-		uint at = gl_VertexIndex * VERTEX_STRIDE;
+void main() {
+	Vertices verts = TriangleData(pc.vertex_data).vertices;
+	uint at = gl_VertexIndex * VERTEX_STRIDE;
 
-		// Vulkan's clip space points the opposite way down the Y axis to WebGPU's, so the same vertices
-		// have to be flipped to land the triangle the same way up
-		gl_Position = vec4(verts.data[at], -verts.data[at + 1], 0.0, 1.0);
-		frag_color = vec3(verts.data[at + 2], verts.data[at + 3], verts.data[at + 4]);
-	}
+	// Vulkan's clip space points the opposite way down the Y axis to WebGPU's, so the same vertices
+	// have to be flipped to land the triangle the same way up
+	gl_Position = vec4(verts.data[at], -verts.data[at + 1], 0.0, 1.0);
+	frag_color = vec3(verts.data[at + 2], verts.data[at + 3], verts.data[at + 4]);
+}
 	)glsl";
 
 	// The fragment stage never touches the root data it was handed; it just interpolates
 	static const std::string glsl_fragment = R"glsl(
-	layout(location = 0) in vec3 frag_color;
-	layout(location = 0) out vec4 out_color;
+layout(location = 0) in vec3 frag_color;
+layout(location = 0) out vec4 out_color;
 
-	void main() {
-		out_color = vec4(frag_color, 1.0);
-	}
+void main() {
+	out_color = vec4(frag_color, 1.0);
+}
 	)glsl";
 
 	using GpuBackendDefault = GpuVulkanDefault;
@@ -266,6 +267,10 @@
 #endif
 
 
+// c_compat.c is the same API driven from C; this is its half of a check that the two faces of
+// the headers agree on how a sampler description is laid out and packed
+extern "C" uint16_t noapi_c_compat_packed_default_sampler(void);
+
 typedef struct AppState {
 	GLFWwindow *window;
 	GpuBackendDefault backend;
@@ -344,12 +349,14 @@ static void emscripten_frame(void *arg) {
 #endif
 
 int real_main() {
+	assert(noapi_c_compat_packed_default_sampler() == GpuSamplerDesc{}.pack() && "C and C++ disagree about GpuSamplerDesc");
+
 	AppState state = {0};
 	const int initial_width = 800;
 	const int initial_height = 600;
 
 	if (!glfwInit()) {
-		fprintf(stderr, "Glfw initialization failed\n");
+		std::println(std::cerr, "Glfw initialization failed\n");
 		return -1;
 	}
 
@@ -417,18 +424,18 @@ int real_main() {
 		.presentMode = PRESENT_MODE_FIFO,
 	});
 
-	auto caps = gpuGetSurfaceCapabilities(state.queue, state.surface);
+	auto caps = gpuGetSurfaceCapabilitiesEXT(state.queue, state.surface);
 	std::print("surface formats (best first):");
-	for(auto format: caps.formats)
-		std::print(" {}{}", (int)format, gpuFormatIsSrgb(format) ? " (srgb)" : "");
+	for(auto format: caps.formatList())
+		std::print(" {}{}", (int)format, gpuFormatIsSrgbEXT(format) ? " (srgb)" : "");
 	std::print("\npresent modes (best first):");
-	for(auto mode: caps.presentModes)
+	for(auto mode: caps.presentModeList())
 		std::print(" {}", (int)mode);
 	std::println("\ntransparency: {}", caps.supportsTransparency);
 
 	GpuSurfaceDescriptor config;
-	for(auto format: caps.formats)
-		if(!gpuFormatIsSrgb(format)) {
+	for(auto format: caps.formatList())
+		if(!gpuFormatIsSrgbEXT(format)) {
 			config = gpuSurfaceGetConfigurationEXT(state.surface);
 			config.texture.format = format;
 			gpuSurfaceReconfigureEXT(state.queue, state.surface, config);

@@ -92,7 +92,7 @@ VkPipelineStageFlags2KHR stage2vulkan(STAGE stage) {
 
 std::pair<VkAccessFlags2KHR, VkAccessFlags2KHR> hazard2access(HAZARD_FLAGS hazards) {
 	VkAccessFlags2KHR src_access = {}, dst_access = {};
-	
+
 	// HAZARD_DRAW_ARGUMENTS
 	// A compute shader wrote an indirect argument buffer. The command
 	// processor must not prefetch the arguments until the write is visible.

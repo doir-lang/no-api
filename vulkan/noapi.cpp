@@ -298,16 +298,131 @@ namespace GPU::detail {
 
 
 
-thread_local static VkDebugUtilsMessageSeverityFlagBitsEXT severity_filter;
+extern const char* const COMPUTE_SHADER_PROLOGUE = R"(
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_buffer_reference : require
 
-void GPU::default_::error_callback(void* queue, int type, std::string_view message) {
-	auto mt = vkb::to_string_message_type(type);
-	printf("[%s]\n%s\n", mt, message.data());
+const uint ADDRESS_MODE_CLAMP = 0;
+const uint ADDRESS_MODE_MIRROR_REPEAT = 1;
+const uint ADDRESS_MODE_REPEAT = 2;
+
+const uint FILTER_NEAREST = 0;
+const uint FILTER_LINEAR = 1;
+
+struct GpuSamplerDesc {
+	uint address_mode_u; // CLAMP, REPEAT, MIRROR_REPEAT
+	uint address_mode_v; // CLAMP, REPEAT, MIRROR_REPEAT
+	uint address_mode_w; // CLAMP, REPEAT, MIRROR_REPEAT
+	uint mag_filter; // NEAREST, LINEAR
+	uint min_filter; // NEAREST, LINEAR
+	uint mip_filter; // NEAREST, LINEAR
+};
+
+uint gpuPackSamplerDesc(const GpuSamplerDesc d) {
+	return (d.address_mode_u)
+	| (d.address_mode_v << 2)
+	| (d.address_mode_w << 4)
+	| (d.mag_filter << 6)
+	| (d.min_filter << 7)
+	| (d.mip_filter << 8);
 }
 
-std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(
-	GPU::function_t<VkSurfaceKHR(VkInstance)> surface_loader, void(*error_callback)(void* queue, int type, std::string_view message) /* = GPU::default_::error_callback */, VkDebugUtilsMessageSeverityFlagBitsEXT severity_filter_set /* = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT */,
-	std::span<const char*> instance_extensions /* = {} */, std::span<const char*> extra_layers /* = {} */, std::span<const char*> device_extensions /* = {} */, bool debug /* = true */
+GpuSamplerDesc gpuDefaultSampler() {
+	return GpuSamplerDesc(ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, FILTER_LINEAR, FILTER_LINEAR, FILTER_LINEAR);
+}
+
+layout(buffer_reference, std430) buffer GpuSamplerMap {
+	uint data[];
+};
+
+layout(push_constant) uniform PushConstants {
+	uint64_t compute_data;
+	GpuSamplerMap sampler_map;
+} pc;
+
+uint gpuGetSamplerIndex(const GpuSamplerDesc desc) {
+	return pc.sampler_map.data[gpuPackSamplerDesc(desc)];
+}
+
+// End prologue
+)";
+
+extern const char* const GRAPHICS_SHADER_PROLOGUE = R"(
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_buffer_reference : require
+
+const uint ADDRESS_MODE_CLAMP = 0;
+const uint ADDRESS_MODE_MIRROR_REPEAT = 1;
+const uint ADDRESS_MODE_REPEAT = 2;
+
+const uint FILTER_NEAREST = 0;
+const uint FILTER_LINEAR = 1;
+
+struct GpuSamplerDesc {
+	uint address_mode_u; // CLAMP, REPEAT, MIRROR_REPEAT
+	uint address_mode_v; // CLAMP, REPEAT, MIRROR_REPEAT
+	uint address_mode_w; // CLAMP, REPEAT, MIRROR_REPEAT
+	uint mag_filter; // NEAREST, LINEAR
+	uint min_filter; // NEAREST, LINEAR
+	uint mip_filter; // NEAREST, LINEAR
+};
+
+uint gpuPackSamplerDesc(const GpuSamplerDesc d) {
+	return (d.address_mode_u)
+	| (d.address_mode_v << 2)
+	| (d.address_mode_w << 4)
+	| (d.mag_filter << 6)
+	| (d.min_filter << 7)
+	| (d.mip_filter << 8);
+}
+
+GpuSamplerDesc gpuDefaultSampler() {
+	return GpuSamplerDesc(ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, FILTER_LINEAR, FILTER_LINEAR, FILTER_LINEAR);
+}
+
+layout(buffer_reference, std430) buffer GpuSamplerMap {
+	uint data[];
+};
+
+layout(push_constant) uniform PushConstants {
+	uint64_t vertex_data;
+	uint64_t fragment_data;
+	uint64_t index_data;
+	GpuSamplerMap sampler_map;
+} pc;
+
+uint gpuGetSamplerIndex(const GpuSamplerDesc desc) {
+	return pc.sampler_map.data[gpuPackSamplerDesc(desc)];
+}
+
+// End prologue
+)";
+
+
+thread_local static VkDebugUtilsMessageSeverityFlagBitsEXT severity_filter;
+
+void gpuDefaultErrorCallbackEXT(void* queue, int type, GpuStringView message) {
+	auto mt = vkb::to_string_message_type(type);
+	printf("[%s]\n%.*s\n", mt, (int)message.count, message.ptr);
+}
+
+// Copies why the setup gave up into the caller's buffer (which is allowed to be absent) and
+// reports the failure
+static bool setup_failed(char* out_error, size_t out_error_capacity, const std::string& message) {
+	if(out_error && out_error_capacity) {
+		auto length = std::min(message.size(), out_error_capacity - 1);
+		memcpy(out_error, message.data(), length);
+		out_error[length] = '\0';
+	}
+	return false;
+}
+
+bool gpuSetupDefaultVulkanEXT(GpuVulkanSurfaceLoaderEXT surface_loader, void* surface_loader_userdata,
+	GpuErrorCallbackEXT error_callback, VkDebugUtilsMessageSeverityFlagBitsEXT severity_filter_set,
+	GpuCStringSpan instance_extensions, GpuCStringSpan extra_layers, GpuCStringSpan device_extensions, bool debug,
+	GpuVulkanDefault* out_default, char* out_error, size_t out_error_capacity
 ) {
 	GpuVulkanDefault out;
 	severity_filter = severity_filter_set;
@@ -324,19 +439,20 @@ std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(
 	if(debug) instance_builder.set_debug_callback(+[](VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity, VkDebugUtilsMessageTypeFlagsEXT messageTypes, const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData, void* pUserData) -> VkBool32 {
 			if(messageSeverity < severity_filter) return VK_FALSE;
 
-			auto error_callback = (void(*)(void* queue, int type, std::string_view message))pUserData;
+			auto error_callback = (GpuErrorCallbackEXT)pUserData;
 			error_callback(nullptr, messageTypes, {pCallbackData->pMessage, strlen(pCallbackData->pMessage)});
 			return VK_FALSE;
 		}).set_debug_callback_user_data_pointer((void*)error_callback);//.use_default_debug_messenger();
 	auto inst = instance_builder.build();
-	if (!inst) return std::unexpected(inst.error().message());
+	if (!inst) return setup_failed(out_error, out_error_capacity, inst.error().message());
 	auto instance = inst.value();
 	out.instance = instance.instance;
 	out.messenger = instance.debug_messenger;
 
-	out.surface = surface_loader(out.instance);
+	out.surface = surface_loader(out.instance, surface_loader_userdata);
 
-	auto extensions = gpuRequiredVulkanDeviceExtensionsEXT();
+	auto required = gpuRequiredVulkanDeviceExtensionsEXT();
+	std::vector<const char*> extensions(required.begin(), required.end());
 	extensions.insert(extensions.end(), device_extensions.begin(), device_extensions.end());
 
 	// Physical Device
@@ -350,21 +466,22 @@ std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(
 		.set_surface(out.surface)
 		.set_minimum_version(1, 4)
 		.select();
-	if (!phys) return std::unexpected(phys.error().message());
+	if (!phys) return setup_failed(out_error, out_error_capacity, phys.error().message());
 	auto gpu = phys.value();
 	out.gpu = gpu.physical_device;
 
 	// Logical Device
 	vkb::DeviceBuilder device_builder{gpu};
 	auto dev = device_builder.add_pNext(gpuRequiredVulkanDeviceCreateInfoPnextEXT()).build();
-	if (!dev) return std::unexpected(dev.error().message());
+	if (!dev) return setup_failed(out_error, out_error_capacity, dev.error().message());
 	auto device = dev.value();
 	out.device = device.device;
 
 	out.graphics_queue = device.get_queue(vkb::QueueType::graphics).value();
 	out.graphics_queue_family = device.get_queue_index(vkb::QueueType::graphics).value();
 
-	return out;
+	*out_default = out;
+	return true;
 }
 
 
@@ -542,7 +659,7 @@ void gpuFreeCommandBuffer(GpuCommandBuffer* cmd) {
 	queue->cpu_allocator(cmd, 0);
 }
 
-uint64_t gpuSubmitNoFree(GpuQueue* queue, std::span<GpuCommandBuffer*> commandBuffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signalValue /* = 0 */) {
+uint64_t gpuSubmitNoFreeEXT(GpuQueue* queue, GpuCommandBufferSpan commandBuffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signalValue /* = 0 */) {
 	std::vector<VkSemaphoreSubmitInfo> waits;
 	std::vector<VkCommandBufferSubmitInfo> submits; submits.reserve(commandBuffers.size());
 	for(auto& cmd: commandBuffers) {
@@ -594,8 +711,8 @@ uint64_t gpuSubmitNoFree(GpuQueue* queue, std::span<GpuCommandBuffer*> commandBu
 	return queue->command_submission_timeline_semaphore_next_value++;
 }
 
-uint64_t gpuSubmit(GpuQueue* queue, std::span<GpuCommandBuffer*> commandBuffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signalValue /* = 0 */) {
-	auto submission_index = gpuSubmitNoFree(queue, commandBuffers, semaphore, signalValue);
+uint64_t gpuSubmit(GpuQueue* queue, GpuCommandBufferSpan commandBuffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signalValue /* = 0 */) {
+	auto submission_index = gpuSubmitNoFreeEXT(queue, commandBuffers, semaphore, signalValue);
 
 	for(auto& cmd: commandBuffers) {
 		queue->command_buffers_pending_free.emplace_back(cmd->command_buffer, submission_index);
@@ -697,7 +814,7 @@ void gpuFree(GpuQueue* queue, void* ptr) {
 		gpuFree(queue, (gpu*)queue->host2gpu[ptr]);
 	}
 }
-void gpuFree(GpuQueue* queue, gpu* ptr) {
+void gpuFreeDevicePointerEXT(GpuQueue* queue, gpu* ptr) {
 	auto gpu_ptr = (VkDeviceAddress)ptr;
 	if(!queue->allocations.contains(gpu_ptr)) return;
 
@@ -836,8 +953,8 @@ static GpuTextureDescriptor gpuTextureViewDescriptorImpl(GpuQueue* queue, const 
 		.viewType = GPU::detail::type2vulkan(texture->descriptor.type),
 		.format = GPU::detail::format2vulkan(format),
 		.subresourceRange = {
-			.aspectMask = static_cast<VkImageAspectFlags>(gpuFormatIsDepth(format)
-				? VK_IMAGE_ASPECT_DEPTH_BIT | (gpuFormatIsStencil(format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)
+			.aspectMask = static_cast<VkImageAspectFlags>(gpuFormatIsDepthEXT(format)
+				? VK_IMAGE_ASPECT_DEPTH_BIT | (gpuFormatIsStencilEXT(format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)
 				: VK_IMAGE_ASPECT_COLOR_BIT),
 			.baseMipLevel = desc.baseMip,
 			.levelCount = desc.mipCount == ALL_MIPS ? texture->descriptor.mipCount - desc.baseMip : desc.mipCount,
@@ -885,7 +1002,7 @@ void gpuSyncMemoryEXT(GpuCommandBuffer* cmd, gpu* mem) {
 	// Do nothing!
 }
 
-void gpuSyncMemoryEXT(GpuQueue* queue, gpu* mem) {
+void gpuSyncMemoryImmediateEXT(GpuQueue* queue, gpu* mem) {
 	// Do nothing!
 }
 
@@ -897,7 +1014,7 @@ struct ComputePipelinePushConstants {
 	gpu* sampler_map;
 };
 
-GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, std::span<const std::byte> computeIR) {
+GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, GpuByteSpan computeIR) {
 	auto out = (GpuPipeline*)queue->cpu_allocator(nullptr, sizeof(GpuPipeline));
 	out->color_target_count = {}; // Null indicating compute pipeline
 
@@ -968,8 +1085,8 @@ void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* 
 		.bufferRowLength = texture->descriptor.dimensions.x,
 		.bufferImageHeight = texture->descriptor.dimensions.y,
 		.imageSubresource = {
-			.aspectMask = static_cast<VkImageAspectFlags>(gpuFormatIsDepth(texture->descriptor.format)
-				? VK_IMAGE_ASPECT_DEPTH_BIT | (gpuFormatIsStencil(texture->descriptor.format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)
+			.aspectMask = static_cast<VkImageAspectFlags>(gpuFormatIsDepthEXT(texture->descriptor.format)
+				? VK_IMAGE_ASPECT_DEPTH_BIT | (gpuFormatIsStencilEXT(texture->descriptor.format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)
 				: VK_IMAGE_ASPECT_COLOR_BIT),
 			.mipLevel = 0,
 			.baseArrayLayer = 0,
@@ -998,8 +1115,8 @@ void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuT
 		.bufferRowLength = texture->descriptor.dimensions.x,
 		.bufferImageHeight = texture->descriptor.dimensions.y,
 		.imageSubresource = {
-			.aspectMask = static_cast<VkImageAspectFlags>(gpuFormatIsDepth(texture->descriptor.format)
-				? VK_IMAGE_ASPECT_DEPTH_BIT | (gpuFormatIsStencil(texture->descriptor.format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)
+			.aspectMask = static_cast<VkImageAspectFlags>(gpuFormatIsDepthEXT(texture->descriptor.format)
+				? VK_IMAGE_ASPECT_DEPTH_BIT | (gpuFormatIsStencilEXT(texture->descriptor.format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)
 				: VK_IMAGE_ASPECT_COLOR_BIT),
 			.mipLevel = 0,
 			.baseArrayLayer = 0,
@@ -1364,7 +1481,7 @@ namespace GPU::detail {
 	}
 }
 
-void gpuSetEnabledSamplersEXT(GpuCommandBuffer* cmd, std::span<GpuSamplerDesc> enabled_samplers) {
+void gpuSetEnabledSamplersEXT(GpuCommandBuffer* cmd, GpuSamplerDescSpan enabled_samplers) {
 	GPU::detail::bind_sampler_set(cmd, GPU::detail::ensure_sampler_set(cmd->queue, enabled_samplers));
 }
 
@@ -1422,7 +1539,7 @@ namespace GPU::detail {
 
 
 
-GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, std::span<const std::byte> vertexIR, std::span<const std::byte> fragmentIR, const GpuRasterDesc& desc) {
+GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, GpuByteSpan fragmentIR, const GpuRasterDesc& desc) {
 	constexpr static auto topology2vulkan = [](TOPOLOGY t) -> VkPrimitiveTopology{
 		switch (t) {
 			// case TOPOLOGY_POINT_LIST: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
@@ -1511,7 +1628,7 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, std::span<const std::byt
 	{
 		attachments.reserve(desc.colorTargets.size());
 
-		const bool blendEnabled = desc.blendstate.has_value();
+		const bool blendEnabled = desc.blendstate.has_value;
 		const GpuBlendDesc blend = desc.blendstate.value_or(GpuBlendDesc{});
 
 		for (const GpuColorTarget& target : desc.colorTargets) {
@@ -1784,9 +1901,9 @@ namespace GPU::detail {
 	// The aspects a format's views and barriers have to name. A depth/stencil image described with
 	// VK_IMAGE_ASPECT_COLOR_BIT is invalid, which is what the barriers here used to do.
 	inline VkImageAspectFlags texture_aspect(FORMAT format) {
-		if(!gpuFormatIsDepthStencil(format)) return VK_IMAGE_ASPECT_COLOR_BIT;
-		return (gpuFormatIsDepth(format) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0)
-			| (gpuFormatIsStencil(format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+		if(!gpuFormatIsDepthStencilEXT(format)) return VK_IMAGE_ASPECT_COLOR_BIT;
+		return (gpuFormatIsDepthEXT(format) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0)
+			| (gpuFormatIsStencilEXT(format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
 	}
 
 	inline uvec2 mip_extent(const GpuTexture* texture, uint32_t mip) {
@@ -2028,7 +2145,7 @@ void gpuBeginRenderPass(GpuCommandBuffer* cmd, const GpuRenderPassDesc& desc) {
 	gpuSetScissorRectEXT(cmd, extent);
 }
 
-void gpuEndRenderPass(GpuCommandBuffer* cmd, std::optional<const GpuRenderPassDesc> desc /*= {}*/) {
+void gpuEndRenderPass(GpuCommandBuffer* cmd, GpuOptionalRenderPassDesc desc /*= {}*/) {
 	vkCmdEndRendering(cmd->command_buffer);
 
 	if(desc) for(auto& color: desc->colorAttachments)
@@ -2329,7 +2446,7 @@ void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const Gpu
 	assert(cmd->state == GpuCommandBuffer::Recording && "A blit opens a render pass of its own, so it can't be recorded inside another one");
 	assert((source->descriptor.usage & USAGE_SAMPLED) && "The blit source must have been created with USAGE_SAMPLED");
 	assert((destination->descriptor.usage & USAGE_COLOR_ATTACHMENT) && "The blit destination must have been created with USAGE_COLOR_ATTACHMENT");
-	assert(!gpuFormatIsDepthStencil(source->descriptor.format) && !gpuFormatIsDepthStencil(destination->descriptor.format) && "Depth/stencil textures can't be blitted");
+	assert(!gpuFormatIsDepthStencilEXT(source->descriptor.format) && !gpuFormatIsDepthStencilEXT(destination->descriptor.format) && "Depth/stencil textures can't be blitted");
 	assert(source->descriptor.type != TEXTURE_3D && "A slice of a 3D texture can't be sampled on its own, blit out of a 2D array instead");
 	assert(source_mip < source->descriptor.mipCount && destination_mip < destination->descriptor.mipCount);
 
@@ -2373,7 +2490,7 @@ void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const Gpu
 	{
 		// Textures in this backend live in VK_IMAGE_LAYOUT_GENERAL, the same layout their heap
 		// descriptors are written against
-		bool filtering = linear_filter && gpuFormatIsFilterable(source->descriptor.format);
+		bool filtering = linear_filter && gpuFormatIsFilterableEXT(source->descriptor.format);
 		VkDescriptorImageInfo image {
 			.sampler = queue->blit_samplers[filtering],
 			.imageView = source_view,
@@ -2661,7 +2778,7 @@ GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, VkSurfaceKHR surface, const Gpu
 	return out;
 }
 
-static void gpuFreeSurfaceNoSemaphores(GpuQueue* queue, GpuSurface* surface) { 
+static void gpuFreeSurfaceNoSemaphores(GpuQueue* queue, GpuSurface* surface) {
 	for(auto view: surface->image_views)
 		vkDestroyImageView(queue->device, view, queue->callbacks);
 	if(surface->swapchain)
@@ -2745,8 +2862,8 @@ void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSur
 		};
 }
 
-GpuSurfaceCapabilities gpuGetSurfaceCapabilities(GpuQueue* queue, GpuSurface* surface) {
-	GpuSurfaceCapabilities out;
+GpuSurfaceCapabilities gpuGetSurfaceCapabilitiesEXT(GpuQueue* queue, GpuSurface* surface) {
+	GpuSurfaceCapabilities out = {};
 
 	uint32_t count = 0;
 	vkGetPhysicalDeviceSurfaceFormatsKHR(queue->gpu, surface->surface, &count, nullptr);
@@ -2761,14 +2878,14 @@ GpuSurfaceCapabilities gpuGetSurfaceCapabilities(GpuQueue* queue, GpuSurface* su
 	};
 	auto append = [&out](VkFormat format) {
 		auto named = GPU::detail::vulkan2format(format);
-		if(std::ranges::find(out.formats, named) == out.formats.end())
-			out.formats.push_back(named);
+		auto listed = out.formatList();
+		if(std::ranges::find(listed, named) == listed.end() && out.formatCount < GPU_MAX_SURFACE_FORMATS)
+			out.formats[out.formatCount++] = named;
 	};
 
 	// vk-bootstrap asks for these two first whenever the caller names no format of its own, and
 	// falls back to whatever the driver listed first, so walking them in that order makes
 	// formats[0] the format a FORMAT_NONE request resolves to
-	out.formats.reserve(formats.size());
 	for(auto preferred: {VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB})
 		for(auto format: formats)
 			if(format.format == preferred && usable(format))
@@ -2785,8 +2902,9 @@ GpuSurfaceCapabilities gpuGetSurfaceCapabilities(GpuQueue* queue, GpuSurface* su
 	// is what PRESENT_MODE_BEST_AVAILABLE resolves to. Immediate trails the tear free modes rather
 	// than leading on its latency, matching the mode that fallback list never reaches for.
 	for(auto mode: {PRESENT_MODE_MAILBOX, PRESENT_MODE_FIFO_RELAXED, PRESENT_MODE_FIFO, PRESENT_MODE_IMMEDIATE})
-		if(std::ranges::find(modes, GPU::detail::present2vulkan(mode)) != modes.end())
-			out.presentModes.push_back(mode);
+		if(std::ranges::find(modes, GPU::detail::present2vulkan(mode)) != modes.end()
+			&& out.presentModeCount < GPU_MAX_SURFACE_PRESENT_MODES)
+			out.presentModes[out.presentModeCount++] = mode;
 
 	VkSurfaceCapabilitiesKHR caps {};
 	vkGetPhysicalDeviceSurfaceCapabilitiesKHR(queue->gpu, surface->surface, &caps);
@@ -2826,7 +2944,7 @@ const GpuTexture* gpuSurfaceNextTextureEXT(GpuQueue* queue, GpuSurface* surface)
 	}
 	if(acquired == VK_SUBOPTIMAL_KHR) errno = SURFACE_SUBOPTIMAL;
 
-	
+
 	surface->images[surface->current_image].available_semaphore = surface->image_available_semaphores[surface->semaphore_counter];
 	return &surface->images[surface->current_image];
 }

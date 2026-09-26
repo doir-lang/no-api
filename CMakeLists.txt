@@ -33,7 +33,7 @@ if(NOT NOAPI_ENABLE_VULKAN AND NOT NOAPI_ENABLE_WEBGPU)
 endif()
 
 if(NOAPI_ENABLE_VULKAN)
-	add_subdirectory(vulkan) 
+	add_subdirectory(vulkan)
 endif()
 
 if(NOAPI_ENABLE_WEBGPU)

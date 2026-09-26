@@ -783,15 +783,29 @@ fn cs_set_max() {
 
 const GpuQueue::MonotextureRange GpuQueue::MonotextureRange::INVALID = {static_cast<uint32_t>(-1), static_cast<uint32_t>(-1), static_cast<uint32_t>(-1)};
 
-void GPU::default_::error_callback(void* queue, int type, std::string_view message) {
-	std::cerr << "WGPU Device Error " << type << ": " << message << std::endl;
+void gpuDefaultErrorCallbackEXT(void* queue, int type, GpuStringView message) {
+	std::cerr << "WGPU Device Error " << type << ": " << std::string_view(message) << std::endl;
 #ifdef _WIN32
 	system("pause");
 #endif
 	exit(-1);
 }
 
-std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::function_t<WGPUSurface(WGPUInstance)> surface_loader, void(*error_callback)(void* queue, int type, std::string_view message) /* = GPU::default_::error_callback */, bool prefer_high_power /* = true */){
+// Copies why the setup gave up into the caller's buffer (which is allowed to be absent) and
+// reports the failure
+static bool setup_failed(char* out_error, size_t out_error_capacity, std::string_view message) {
+	if(out_error && out_error_capacity) {
+		auto length = std::min(message.size(), out_error_capacity - 1);
+		memcpy(out_error, message.data(), length);
+		out_error[length] = '\0';
+	}
+	return false;
+}
+
+bool gpuSetupDefaultWebGPUEXT(GpuWebGPUSurfaceLoaderEXT surface_loader, void* surface_loader_userdata,
+	GpuErrorCallbackEXT error_callback, bool prefer_high_power,
+	GpuWebGPUDefault* out_default, char* out_error, size_t out_error_capacity
+) {
 	GpuWebGPUDefault out;
 
 	{ // Instance
@@ -800,9 +814,9 @@ std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::funct
 		};
 		out.instance = wgpuCreateInstance(&d);
 	}
-	if(!out.instance) return std::unexpected("Failld to create WebGPU instance");
+	if(!out.instance) return setup_failed(out_error, out_error_capacity, "Failed to create WebGPU instance");
 
-	out.surface = surface_loader(out.instance);
+	out.surface = surface_loader(out.instance, surface_loader_userdata);
 
 	{ // Adapter
 		WGPURequestAdapterOptions adapter_opts {
@@ -818,7 +832,7 @@ std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::funct
 			.mode = WGPUCallbackMode_AllowSpontaneous,
 			.callback = +[](WGPURequestAdapterStatus status, WGPUAdapter adapter, WGPUStringView message, void* userdata1, void* userdata2) {
 				RequestAdapterResult* result = (RequestAdapterResult*)userdata1;
-				auto error_callback = *(void(**)(void* queue, int type, std::string_view message))userdata2;
+				auto error_callback = *(GpuErrorCallbackEXT*)userdata2;
 				result->done = true;
 				if (status != WGPURequestAdapterStatus_Success)
 					error_callback(nullptr, WGPUErrorType_Validation, {message.data, message.length});
@@ -835,7 +849,7 @@ std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::funct
 		}
 		out.adapter = result.adapter;
 	}
-	if(!out.adapter) return std::unexpected("Failed to create WebGPU adapter");
+	if(!out.adapter) return setup_failed(out_error, out_error_capacity, "Failed to create WebGPU adapter");
 
 	out.limits = {}; // Emscripten apparently asserts that the limits have been zeroed out!
 	wgpuAdapterGetLimits(out.adapter, &out.limits);
@@ -848,14 +862,14 @@ std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::funct
 				.callback = +[](WGPUDevice const* device, WGPUDeviceLostReason reason, WGPUStringView message, void* userdata1, void* _) {
 					if(reason == WGPUDeviceLostReason_Destroyed) return;
 
-					auto callback = (void(*)(WGPUDevice const* device, WGPUErrorType type, std::string_view message))userdata1;
+					auto callback = (void(*)(WGPUDevice const* device, WGPUErrorType type, GpuStringView message))userdata1;
 					callback(device, (WGPUErrorType)reason, {message.data, message.length});
 				},
 				.userdata1 = (void*)error_callback
 			},
 			.uncapturedErrorCallbackInfo = {
 				.callback = +[](WGPUDevice const* device, WGPUErrorType type, WGPUStringView message, void* userdata1, void* _){
-					auto callback = (void(*)(WGPUDevice const* device, WGPUErrorType type, std::string_view message))userdata1;
+					auto callback = (void(*)(WGPUDevice const* device, WGPUErrorType type, GpuStringView message))userdata1;
 					callback(device, type, {message.data, message.length});
 				},
 				.userdata1 = (void*)error_callback
@@ -870,7 +884,7 @@ std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::funct
 			.mode = WGPUCallbackMode_AllowSpontaneous,
 			.callback = +[](WGPURequestDeviceStatus status, WGPUDevice device, WGPUStringView message, void* userdata1, void* userdata2) {
 				RequestDeviceResult* result = (RequestDeviceResult*)userdata1;
-				auto& error_callback = *(GPU::function_t<void(WGPUDevice const* device, WGPUErrorType type, std::string_view message)>*)userdata2;
+				auto error_callback = *(GpuErrorCallbackEXT*)userdata2;
 				result->done = true;
 				if (status != WGPURequestDeviceStatus_Success)
 					error_callback(nullptr, WGPUErrorType_Validation, {message.data, message.length});
@@ -887,9 +901,10 @@ std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::funct
 		}
 		out.device = result.device;
 	}
-	if(!out.device) return std::unexpected("Failed to create WebGPU device");
+	if(!out.device) return setup_failed(out_error, out_error_capacity, "Failed to create WebGPU device");
 
-	return out;
+	*out_default = out;
+	return true;
 }
 
 // Group 0 describes the monobuffers, the active texture heap, the sampler/texture metadata buffer,
@@ -1138,15 +1153,15 @@ void update_pipeline_layouts(GpuQueue* queue) {
 		});
 	}
 
-	if(queue->current_bind_group_layout1) queue->code_pending_submission_finished.emplace_back([l = queue->current_bind_group_layout1, gp = queue->current_bind_group1](){ 
-		wgpuBindGroupLayoutRelease(l); 
-		wgpuBindGroupRelease(gp); 
+	if(queue->current_bind_group_layout1) queue->code_pending_submission_finished.emplace_back([l = queue->current_bind_group_layout1, gp = queue->current_bind_group1](){
+		wgpuBindGroupLayoutRelease(l);
+		wgpuBindGroupRelease(gp);
 	}, queue->next_submission_index);
 	std::tie(queue->current_bind_group_layout1, queue->current_bind_group1) = create_layout_and_group(group1, group1entries);
 
-	if(queue->current_bind_group_layout2) queue->code_pending_submission_finished.emplace_back([l = queue->current_bind_group_layout2, gp = queue->current_bind_group2](){ 
-		wgpuBindGroupLayoutRelease(l); 
-		wgpuBindGroupRelease(gp); 
+	if(queue->current_bind_group_layout2) queue->code_pending_submission_finished.emplace_back([l = queue->current_bind_group_layout2, gp = queue->current_bind_group2](){
+		wgpuBindGroupLayoutRelease(l);
+		wgpuBindGroupRelease(gp);
 	}, queue->next_submission_index);
 	std::tie(queue->current_bind_group_layout2, queue->current_bind_group2) = create_layout_and_group(group2, group2entries);
 
@@ -1291,6 +1306,7 @@ std::string generate_binding_prologue(GpuQueue* queue, bool compute) {
 		: "struct GPUShaderData {\n"
 		"	vertex: vec2<u32>,\n"
 		"	fragment: vec2<u32>,\n"
+		"	indicies: vec2<u32>,\n"
 		"}\n")
 	+ std::format("@group(0) @binding({}) var<uniform> shader_data : GPUShaderData;\n\n", binding++);
 
@@ -1541,9 +1557,9 @@ gpu* gpuEncodeWebGPUAddressEXT(uint8_t monobuffer, uint64_t address) {
 	uint64_t debug = uint64_t(monobuffer + 1) << 61 | address;
 	return (gpu*)debug;
 }
-std::pair<uint8_t, uint64_t> gpuDecodeWebGPUAddressEXT(gpu* addr) {
+GpuWebGPUAddressEXT gpuDecodeWebGPUAddressEXT(gpu* addr) {
 	auto address = (uint64_t)addr;
-	return {(address >> 61) - 1, address & gpu_address_max};
+	return {(uint8_t)((address >> 61) - 1), address & gpu_address_max};
 }
 
 void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY memory /* = MEMORY_DEFAULT */) {
@@ -1678,7 +1694,7 @@ void gpuFree(GpuQueue* queue, void* ptr) {
 	auto device = gpuHostToDevicePointer(queue, ptr);
 	if(device) gpuFree(queue, device);
 }
-void gpuFree(GpuQueue* queue, gpu* ptr) {
+void gpuFreeDevicePointerEXT(GpuQueue* queue, gpu* ptr) {
 	if(!queue->allocations.contains(ptr)) return;
 
 	// TODO: Extra buffers go here
@@ -1968,7 +1984,7 @@ void update_render_pipeline(GpuQueue* queue, const GpuPipeline* pipeline, const 
 	auto& desc = cache.descriptor;
 
 	// A dynamically applied blend state takes precedence over one baked into the rasterizer description
-	auto effective_blend = blend ? blend : desc.blendstate;
+	auto effective_blend = blend ? blend : std::optional<GpuBlendDesc>(desc.blendstate);
 	WGPUBlendState blend_state {
 		.color = {
 			.operation = GPU::blend2wgpu(effective_blend.value_or(GpuBlendDesc{}).colorOp),
@@ -1995,8 +2011,8 @@ void update_render_pipeline(GpuQueue* queue, const GpuPipeline* pipeline, const 
 
 	auto depth_stencil_format = desc.depthFormat != FORMAT_NONE ? desc.depthFormat : desc.stencilFormat;
 	auto state = depth_stencil.value_or(GpuDepthStencilDesc{});
-	auto has_depth = gpuFormatIsDepth(depth_stencil_format);
-	auto has_stencil = gpuFormatIsStencil(depth_stencil_format);
+	auto has_depth = gpuFormatIsDepthEXT(depth_stencil_format);
+	auto has_stencil = gpuFormatIsStencilEXT(depth_stencil_format);
 
 	auto stencil2wgpu = [](const GpuStencil& stencil) {
 		return WGPUStencilFaceState {
@@ -2072,7 +2088,7 @@ void update_render_pipeline(GpuQueue* queue, const GpuPipeline* pipeline, const 
 	if(fragment_module) wgpuShaderModuleRelease(fragment_module);
 }
 
-GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, std::span<const std::byte> computeIR) {
+GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, GpuByteSpan computeIR) {
 	auto out = (GpuPipeline*)queue->cpu_allocator(nullptr, sizeof(GpuPipeline));
 	new(out) GpuPipeline{
 		.reference_layout = nullptr,
@@ -2085,7 +2101,7 @@ GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, std::span<const std::byte
 	return out;
 }
 
-GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, std::span<const std::byte> vertexIR, std::span<const std::byte> fragmentIR, const GpuRasterDesc& desc) {
+GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, GpuByteSpan fragmentIR, const GpuRasterDesc& desc) {
 	auto out = (GpuPipeline*)queue->cpu_allocator(nullptr, sizeof(GpuPipeline));
 	new(out) GpuPipeline{
 		.reference_layout = nullptr,
@@ -2188,7 +2204,7 @@ void gpuFreeCommandBuffer(GpuCommandBuffer* cmd) {
 	allocator(cmd, 0);
 }
 
-uint64_t gpuSubmitNoFree(GpuQueue* queue, std::span<GpuCommandBuffer*> command_buffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signal_value /* = 0 */) {
+uint64_t gpuSubmitNoFreeEXT(GpuQueue* queue, GpuCommandBufferSpan command_buffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signal_value /* = 0 */) {
 	std::vector<WGPUCommandBuffer> buffers; buffers.reserve(command_buffers.size() + 1);
 	for(auto buffer: command_buffers) {
 		endCurrentPass(buffer);
@@ -2241,8 +2257,8 @@ uint64_t gpuSubmitNoFree(GpuQueue* queue, std::span<GpuCommandBuffer*> command_b
 	return queue->next_submission_index++;
 }
 
-uint64_t gpuSubmit(GpuQueue* queue, std::span<GpuCommandBuffer*> command_buffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signal_value /* = 0 */) {
-	auto submission = gpuSubmitNoFree(queue, command_buffers, semaphore, signal_value);
+uint64_t gpuSubmit(GpuQueue* queue, GpuCommandBufferSpan command_buffers, GpuSemaphore* semaphore /* = nullptr */, uint64_t signal_value /* = 0 */) {
+	auto submission = gpuSubmitNoFreeEXT(queue, command_buffers, semaphore, signal_value);
 	for(auto cmd: command_buffers)
 		gpuFreeCommandBuffer(cmd);
 	return submission;
@@ -2294,7 +2310,7 @@ void gpuSyncMemoryEXT(GpuCommandBuffer* cmd, gpu* mem) {
 	}
 }
 
-void gpuSyncMemoryEXT(GpuQueue* queue, gpu* mem) {
+void gpuSyncMemoryImmediateEXT(GpuQueue* queue, gpu* mem) {
 	auto cmd = gpuStartCommandRecording(queue);
 	gpuSyncMemoryEXT(cmd, mem);
 	auto submit_index = gpuSubmit(queue, {&cmd, 1});
@@ -2699,7 +2715,7 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap, bool n
 
 
 
-void gpuSetEnabledSamplersEXT(GpuCommandBuffer* cmd, std::span<GpuSamplerDesc> enabled_samplers) {
+void gpuSetEnabledSamplersEXT(GpuCommandBuffer* cmd, GpuSamplerDescSpan enabled_samplers) {
 	// Nothing is recorded into the encoder: the set only decides which group 3 (and which copy of the
 	// metadata buffer in group 0) the next dispatch or draw binds
 	cmd->sampler_set = GPU::detail::ensure_sampler_set(cmd->queue, enabled_samplers);
@@ -2772,6 +2788,7 @@ struct ComputeShaderData {
 struct GraphicsShaderData {
 	gpu* vertex;
 	gpu* fragment;
+	gpu* indices;
 };
 
 // Builds group 0: every monobuffer, the active texture heap, and a throwaway uniform holding the
@@ -2870,8 +2887,8 @@ void bindComputeGroups(GpuCommandBuffer* cmd, gpu* data) {
 	bindGroups(cmd, &shader_data, sizeof(shader_data), true);
 }
 
-void bindGraphicsGroups(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data) {
-	GraphicsShaderData shader_data { .vertex = vertex_data, .fragment = fragment_data };
+void bindGraphicsGroups(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data, gpu* index_data) {
+	GraphicsShaderData shader_data { .vertex = vertex_data, .fragment = fragment_data, .indices = index_data };
 	bindGroups(cmd, &shader_data, sizeof(shader_data), false);
 }
 
@@ -2990,13 +3007,13 @@ void gpuBeginRenderPass(GpuCommandBuffer* cmd, const GpuRenderPassDesc& desc) {
 		depth_stencil.view = GPU::detail::attachment_view(cmd, merged->texture, merged->mipLevel, merged->slice);
 
 		// Both aspects of the format need ops, whether or not the user described that aspect
-		if(gpuFormatIsDepth(format)) {
+		if(gpuFormatIsDepthEXT(format)) {
 			auto& attachment = desc.depthAttachment ? *desc.depthAttachment : *merged;
 			depth_stencil.depthLoadOp = desc.depthAttachment ? GPU::load2wgpu(attachment.loadOp) : WGPULoadOp_Load;
 			depth_stencil.depthStoreOp = desc.depthAttachment ? GPU::store2wgpu(attachment.storeOp) : WGPUStoreOp_Store;
 			depth_stencil.depthClearValue = static_cast<float>(attachment.clearValue);
 		}
-		if(gpuFormatIsStencil(format)) {
+		if(gpuFormatIsStencilEXT(format)) {
 			auto& attachment = desc.stencilAttachment ? *desc.stencilAttachment : *merged;
 			depth_stencil.stencilLoadOp = desc.stencilAttachment ? GPU::load2wgpu(attachment.loadOp) : WGPULoadOp_Load;
 			depth_stencil.stencilStoreOp = desc.stencilAttachment ? GPU::store2wgpu(attachment.storeOp) : WGPUStoreOp_Store;
@@ -3018,7 +3035,7 @@ void gpuBeginRenderPass(GpuCommandBuffer* cmd, const GpuRenderPassDesc& desc) {
 	gpuSetScissorRectEXT(cmd, extent);
 }
 
-void gpuEndRenderPass(GpuCommandBuffer* cmd, std::optional<const GpuRenderPassDesc> desc /* = {} */) {
+void gpuEndRenderPass(GpuCommandBuffer* cmd, GpuOptionalRenderPassDesc desc /* = {} */) {
 	// The descriptor is only needed by backends that transition images by hand, WebGPU tracks that itself
 	endRenderPass(cmd);
 }
@@ -3180,7 +3197,7 @@ void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const Gpu
 	assert(!cmd->render_pass && "A blit opens a render pass of its own, so it can't be recorded inside another one");
 	assert((source->descriptor.usage & USAGE_SAMPLED) && "The blit source must have been created with USAGE_SAMPLED");
 	assert((destination->descriptor.usage & USAGE_COLOR_ATTACHMENT) && "The blit destination must have been created with USAGE_COLOR_ATTACHMENT");
-	assert(!gpuFormatIsDepthStencil(source->descriptor.format) && !gpuFormatIsDepthStencil(destination->descriptor.format) && "Depth/stencil textures can't be blitted");
+	assert(!gpuFormatIsDepthStencilEXT(source->descriptor.format) && !gpuFormatIsDepthStencilEXT(destination->descriptor.format) && "Depth/stencil textures can't be blitted");
 	assert(source->descriptor.type != TEXTURE_3D && "A slice of a 3D texture can't be bound on its own, blit out of a 2D array instead");
 	assert(source_mip < source->descriptor.mipCount && destination_mip < destination->descriptor.mipCount);
 
@@ -3206,7 +3223,7 @@ void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const Gpu
 	}, cmd->queue->next_submission_index);
 
 	// Building the pipeline is what brings the matching layout and sampler into existence
-	bool filtering = linear_filter && gpuFormatIsFilterable(source->descriptor.format);
+	bool filtering = linear_filter && gpuFormatIsFilterableEXT(source->descriptor.format);
 	auto pipeline = GPU::detail::blit_pipeline(cmd->queue, GPU::format2wgpu(destination->descriptor.format), filtering);
 
 	// The viewport is opened up to the whole monotexture slot so that fragments exist past the
@@ -3315,7 +3332,7 @@ void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragm
 
 	cmd->index_type = index_type;
 	bindRenderPipeline(cmd);
-	bindGraphicsGroups(cmd, vertex_data, fragment_data);
+	bindGraphicsGroups(cmd, vertex_data, fragment_data, indices);
 	GPU::detail::bind_index_buffer(cmd, indices, index_type, no_offsets);
 
 	wgpuRenderPassEncoderDrawIndexed(cmd->render_pass, index_count, instance_count, 0, 0, 0);
@@ -3328,7 +3345,7 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd, gpu* vertex_data, gp
 
 	cmd->index_type = index_type;
 	bindRenderPipeline(cmd);
-	bindGraphicsGroups(cmd, vertex_data, fragment_data);
+	bindGraphicsGroups(cmd, vertex_data, fragment_data, indices);
 	GPU::detail::bind_index_buffer(cmd, indices, index_type, no_offsets);
 
 	auto [range, offset, address] = GPU::detail::closest_buffer(cmd->queue, args, no_offsets);
@@ -3488,8 +3505,8 @@ void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSur
 		|| (alpha_mode == WGPUCompositeAlphaMode_Auto && surface->descriptor.opaque);
 }
 
-GpuSurfaceCapabilities gpuGetSurfaceCapabilities(GpuQueue* queue, GpuSurface* surface) {
-	GpuSurfaceCapabilities out;
+GpuSurfaceCapabilities gpuGetSurfaceCapabilitiesEXT(GpuQueue* queue, GpuSurface* surface) {
+	GpuSurfaceCapabilities out = {};
 
 	WGPUSurfaceCapabilities caps = {};
 	if(wgpuSurfaceGetCapabilities(surface->surface, queue->adapter, &caps) != WGPUStatus_Success) {
@@ -3501,23 +3518,25 @@ GpuSurfaceCapabilities gpuGetSurfaceCapabilities(GpuQueue* queue, GpuSurface* su
 	// GPU::detail::pick_surface_format walks, so keeping it makes formats[0] the FORMAT_NONE pick.
 	// The same format can be listed more than once (once per configuration the surface would
 	// accept it in), so the first sighting is the one that counts.
-	out.formats.reserve(caps.formatCount);
-	for(size_t i = 0; i < caps.formatCount; ++i) {
+	for(size_t i = 0; i < caps.formatCount && out.formatCount < GPU_MAX_SURFACE_FORMATS; ++i) {
 		auto format = GPU::wgpu2format(caps.formats[i]);
 		// A format the rest of the API can't name is one it could never be configured with either
 		if(format == FORMAT_NONE) continue;
-		if(std::ranges::find(out.formats, format) == out.formats.end())
-			out.formats.push_back(format);
+		auto listed = out.formatList();
+		if(std::ranges::find(listed, format) == listed.end())
+			out.formats[out.formatCount++] = format;
 	}
 
 	// GPU::detail::pick_present_mode's preference, so presentModes[0] is what
 	// PRESENT_MODE_BEST_AVAILABLE resolves to. Immediate trails the tear free modes rather than
 	// leading on its latency, matching the mode that picker never reaches for on its own.
 	for(auto mode: {PRESENT_MODE_MAILBOX, PRESENT_MODE_FIFO_RELAXED, PRESENT_MODE_FIFO, PRESENT_MODE_IMMEDIATE}) {
+		if(out.presentModeCount >= GPU_MAX_SURFACE_PRESENT_MODES) break;
+
 		auto wanted = GPU::present2wgpu(mode);
 		for(size_t i = 0; i < caps.presentModeCount; ++i)
 			if(caps.presentModes[i] == wanted) {
-				out.presentModes.push_back(mode);
+				out.presentModes[out.presentModeCount++] = mode;
 				break;
 			}
 	}

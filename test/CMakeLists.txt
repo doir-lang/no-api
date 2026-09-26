@@ -22,6 +22,14 @@ endif()
 target_link_libraries(test PUBLIC glfw noapi::noapi)
 set_target_properties(test PROPERTIES CXX_STANDARD 26)
 
+# The API headers are meant to be usable from C too, so one translation unit of the test is
+# compiled as C and linked in: a header that stops parsing as C, or an entry point whose C
+# declaration no longer matches the exported symbol, then fails the build here
+add_library(noapi-c-compat OBJECT c_compat.c)
+target_link_libraries(noapi-c-compat PRIVATE noapi::noapi)
+set_target_properties(noapi-c-compat PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+target_link_libraries(test PUBLIC noapi-c-compat)
+
 # Vulkan gets its surface from glfw itself; only WebGPU needs a helper to bridge the two
 if(NOAPI_DEFAULT_BACKEND STREQUAL "webgpu")
 	add_library(glfw3webgpu STATIC glfw3webgpu.c)

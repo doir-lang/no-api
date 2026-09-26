@@ -1,9 +1,9 @@
 #pragma once
 
-#include "../surface.hpp"
-#include "../sync.hpp"
-#include "../samplers.hpp"
-#include "../allocator.hpp"
+// The backend's C interface: the setup helper, the queue and surface constructors, the
+// address helpers and the constants. This file adds the C++ conveniences on top of it,
+// along with the definitions of the objects behind the API's opaque handles.
+#include "noapi.h"
 
 #include <expected>
 #include <functional>
@@ -17,8 +17,6 @@
 #include <vector>
 #include <bit>
 
-#include <webgpu/webgpu.h>
-
 namespace GPU {
 #ifdef __cpp_lib_function_ref
 	template<typename T>
@@ -29,27 +27,37 @@ namespace GPU {
 #endif
 
 	namespace default_ {
-		void error_callback(void* queue, int type, std::string_view message);
+		// The C hook, under the name the rest of the C++ code knows it by
+		inline constexpr GpuErrorCallbackEXT error_callback = gpuDefaultErrorCallbackEXT;
 	}
 }
 
-struct GpuWebGPUDefault {
-	WGPUInstance instance;
-	WGPUAdapter adapter;
-	WGPULimits limits;
-	WGPUDevice device;
-	WGPUSurface surface;
-};
-std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(GPU::function_t<WGPUSurface(WGPUInstance)> surface_loader, void(*error_callback)(void* queue, int type, std::string_view message) = GPU::default_::error_callback, bool prefer_high_power = true);
+/**
+ * gpuSetupDefaultWebGPUEXT – C++ flavour of the setup helper: takes any callable (a
+ * capturing lambda, say) as the surface loader and reports failure as the string a
+ * std::expected carries, rather than through out parameters.
+ *
+ * @param surface_loader Creates the presentation surface from the new instance.
+ * @param error_callback Where device and validation errors are reported.
+ * @param prefer_high_power Ask for the discrete GPU rather than the integrated one.
+ */
+inline std::expected<GpuWebGPUDefault, std::string> gpuSetupDefaultWebGPUEXT(
+	GPU::function_t<WGPUSurface(WGPUInstance)> surface_loader,
+	GpuErrorCallbackEXT error_callback = gpuDefaultErrorCallbackEXT,
+	bool prefer_high_power = true
+) {
+	// The loader is handed across the C boundary as a plain function and the callable it
+	// stands for rides along as the userdata
+	auto load_surface = +[](WGPUInstance instance, void* userdata) -> WGPUSurface {
+		return (*(GPU::function_t<WGPUSurface(WGPUInstance)>*)userdata)(instance);
+	};
 
-// WebGPU can't index an array of samplers, so every slot gets its own binding and shaders pick
-// between them with a switch over the slot the lookup map handed back. Shaders are compiled against
-// however many slots exist, so this is the 16 maxSamplersPerShaderStage guarantees rather than
-// whatever a particular device offers.
-constexpr static uint32_t gpu_sampler_slot_count = 16;
-
-gpu* gpuEncodeWebGPUAddressEXT(uint8_t monobuffer, uint64_t address);
-std::pair<uint8_t, uint64_t> gpuDecodeWebGPUAddressEXT(gpu* addr);\
+	GpuWebGPUDefault out = {};
+	char error[512] = {};
+	if(!gpuSetupDefaultWebGPUEXT(load_surface, &surface_loader, error_callback, prefer_high_power, &out, error, sizeof(error)))
+		return std::unexpected(std::string(error));
+	return out;
+}
 
 struct GpuSemaphore {
 	WGPUBuffer buffer;			// 8 bytes, Storage | CopySrc | CopyDst
@@ -219,7 +227,6 @@ struct GpuQueue {
 	std::unordered_map<uint64_t, WGPURenderPipeline> blit_pipelines; // keyed by destination format and filtering
 };
 
-GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limits, CpuAllocatorFunc allocator = default_::cpu_allocator);
 inline GpuQueue* gpuCreateQueue(GpuWebGPUDefault def, CpuAllocatorFunc allocator = default_::cpu_allocator) {
 	return gpuCreateQueue(def.adapter, def.device, def.limits, allocator);
 }
@@ -281,11 +288,6 @@ struct GpuTextureDescriptorImpl {
 };
 static_assert(sizeof(GpuTextureDescriptorImpl) == sizeof(GpuTextureDescriptor), "GPU Texture Descriptors of The Wrong Size");
 
-// Statuses gpuSurfaceNextTextureEXT leaves in errno. A suboptimal texture is still perfectly usable
-// (it just no longer matches the window), an out of date one means the configuration has to be redone.
-constexpr static int SURFACE_SUBOPTIMAL = WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal;
-constexpr static int SURFACE_OUT_OF_DATE = WGPUSurfaceGetCurrentTextureStatus_Outdated;
-
 struct GpuPipeline {
 	struct ComputeCache {
 		std::string IR;
@@ -324,7 +326,6 @@ struct GpuSurface {
 	bool acquired = false;
 };
 
-GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, WGPUSurface surface, const GpuSurfaceDescriptor& desc);
 inline GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, GpuWebGPUDefault def, const GpuSurfaceDescriptor& desc) {
 	return gpuCreateSurfaceEXT(queue, def.surface, desc);
 }

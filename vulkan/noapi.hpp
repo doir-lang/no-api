@@ -1,11 +1,10 @@
 #pragma once
 
-#include "../surface.hpp"
-#include "../sync.hpp"
-#include "../samplers.hpp"
-#include "../allocator.hpp"
+// The backend's C interface: the setup helper, the feature/extension requirements, the
+// queue and surface constructors and the constants. This file adds the C++ conveniences on
+// top of it, along with the definitions of the objects behind the API's opaque handles.
+#include "noapi.h"
 
-#include <vulkan/vulkan_core.h>
 #include <vk_mem_alloc.h>
 
 #include <vector>
@@ -20,13 +19,14 @@ namespace GPU {
 #ifdef __cpp_lib_function_ref
 	template<typename T>
 	using function_t = std::function_ref<T>;
-#else 
+#else
 	template<typename T>
 	using function_t = std::function<T>;
 #endif
 
 	namespace default_ {
-		void error_callback(void* queue, int type, std::string_view message);
+		// The C hook, under the name the rest of the C++ code knows it by
+		inline constexpr GpuErrorCallbackEXT error_callback = gpuDefaultErrorCallbackEXT;
 	}
 }
 
@@ -38,61 +38,38 @@ namespace GPU {
 	}\
 } while(false)
 
-struct GpuVulkanDefault {
-	VkInstance instance = VK_NULL_HANDLE;
-	VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
-	VkSurfaceKHR surface = VK_NULL_HANDLE;
-	VkPhysicalDevice gpu = VK_NULL_HANDLE;
-	VkDevice device = VK_NULL_HANDLE;
-	VkQueue graphics_queue = VK_NULL_HANDLE;
-	uint32_t graphics_queue_family;
-};
-std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(
-	GPU::function_t<VkSurfaceKHR(VkInstance)> surface_loader, void(*error_callback)(void* queue, int type, std::string_view message) = GPU::default_::error_callback, VkDebugUtilsMessageSeverityFlagBitsEXT severity_filter = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
-	std::span<const char*> instance_extensions = {}, std::span<const char*> extra_layers = {}, std::span<const char*> device_extensions = {}, bool debug = true
-);
-
-inline VkPhysicalDeviceFeatures gpuEnableRequiredVulkanFeaturesEXT(VkPhysicalDeviceFeatures features) {
-	features.shaderInt64 = true;
-	return features;
-}
-
-inline VkPhysicalDeviceVulkan12Features gpuEnableRequiredVulkan12FeaturesEXT(VkPhysicalDeviceVulkan12Features features) {
-	features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-	features.bufferDeviceAddress = true;
-	features.timelineSemaphore = true;
-	return features;
-}
-
-inline VkPhysicalDeviceVulkan13Features gpuEnableRequiredVulkan13FeaturesEXT(VkPhysicalDeviceVulkan13Features features) {
-	features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-	features.dynamicRendering = true;
-	features.synchronization2 = true;
-	return features;
-}
-
-inline VkPhysicalDeviceVulkan14Features gpuEnableRequiredVulkan14FeaturesEXT(VkPhysicalDeviceVulkan14Features features) {
-	features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
-	// features.pushDescriptor = true;
-	features.indexTypeUint8 = true;
-	return features;
-}
-
-inline std::vector<const char*> gpuRequiredVulkanDeviceExtensionsEXT() {
-	return {"VK_EXT_descriptor_heap", "VK_KHR_shader_untyped_pointers"};
-}
-
-inline void* gpuRequiredVulkanDeviceCreateInfoPnextEXT() {
-	static VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptor_heap_info {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT,
-		.descriptorHeap = true
+/**
+ * gpuSetupDefaultVulkanEXT – C++ flavour of the setup helper: takes any callable (a
+ * capturing lambda, say) as the surface loader and reports failure as the string a
+ * std::expected carries, rather than through out parameters.
+ *
+ * @param surface_loader Creates the presentation surface from the new instance.
+ * @param error_callback Where validation messages are reported.
+ * @param severity_filter Messages below this severity are dropped.
+ * @param instance_extensions Extra instance extensions to enable.
+ * @param extra_layers Extra instance layers to enable.
+ * @param device_extensions Extra device extensions to enable.
+ * @param debug Enable the validation layers and the debug messenger.
+ */
+inline std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(
+	GPU::function_t<VkSurfaceKHR(VkInstance)> surface_loader,
+	GpuErrorCallbackEXT error_callback = gpuDefaultErrorCallbackEXT,
+	VkDebugUtilsMessageSeverityFlagBitsEXT severity_filter = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
+	std::span<const char*> instance_extensions = {}, std::span<const char*> extra_layers = {},
+	std::span<const char*> device_extensions = {}, bool debug = true
+) {
+	// The loader is handed across the C boundary as a plain function and the callable it
+	// stands for rides along as the userdata
+	auto load_surface = +[](VkInstance instance, void* userdata) -> VkSurfaceKHR {
+		return (*(GPU::function_t<VkSurfaceKHR(VkInstance)>*)userdata)(instance);
 	};
-	static VkPhysicalDeviceShaderUntypedPointersFeaturesKHR untyped_pointers_info {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR,
-		.pNext = &descriptor_heap_info,
-		.shaderUntypedPointers = true
-	};
-	return &untyped_pointers_info;
+
+	GpuVulkanDefault out;
+	char error[512] = {};
+	if(!gpuSetupDefaultVulkanEXT(load_surface, &surface_loader, error_callback, severity_filter,
+		instance_extensions, extra_layers, device_extensions, debug, &out, error, sizeof(error)))
+		return std::unexpected(std::string(error));
+	return out;
 }
 
 struct GpuQueue {
@@ -145,7 +122,6 @@ struct GpuQueue {
 	// builds one per attachment, which is what lets an attachment's mip level and slice be honored.
 	std::vector<std::pair<VkImageView, uint64_t>> views_in_flight;
 };
-GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue = VK_NULL_HANDLE, uint32_t queue_family = -1, bool is_graphics_queue = true, CpuAllocatorFunc allocator = default_::cpu_allocator, VkAllocationCallbacks* callbacks = nullptr);
 inline GpuQueue* gpuCreateQueue(const GpuVulkanDefault& vulkan, CpuAllocatorFunc allocator = default_::cpu_allocator, VkAllocationCallbacks* callbacks = nullptr) {
 	return gpuCreateQueue(vulkan.instance, vulkan.gpu, vulkan.device, vulkan.graphics_queue, vulkan.graphics_queue_family, true, allocator, callbacks);
 }
@@ -194,9 +170,6 @@ namespace vkb {
 	struct Swapchain;
 }
 
-constexpr static int SURFACE_SUBOPTIMAL = VK_SUBOPTIMAL_KHR;
-constexpr static int SURFACE_OUT_OF_DATE = VK_ERROR_OUT_OF_DATE_KHR;
-
 struct GpuSurface {
 	VkSurfaceKHR surface;
 	std::shared_ptr<vkb::Swapchain> swapchain = nullptr;
@@ -208,111 +181,6 @@ struct GpuSurface {
 
 	uint32_t current_image = uint32_t(-1), semaphore_counter = 0;
 };
-GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, VkSurfaceKHR surface, const GpuSurfaceDescriptor& desc);
 inline GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, const GpuVulkanDefault& vulkan, const GpuSurfaceDescriptor& desc) {
 	return gpuCreateSurfaceEXT(queue, vulkan.surface, desc);
 }
-
-
-
-constexpr static std::string_view COMPUTE_SHADER_PROLOGUE = R"(
-#version 460
-#extension GL_EXT_shader_explicit_arithmetic_types : require
-#extension GL_EXT_buffer_reference : require
-
-const uint ADDRESS_MODE_CLAMP = 0;
-const uint ADDRESS_MODE_MIRROR_REPEAT = 1;
-const uint ADDRESS_MODE_REPEAT = 2;
-
-const uint FILTER_NEAREST = 0;
-const uint FILTER_LINEAR = 1;
-
-struct GpuSamplerDesc {
-	uint address_mode_u; // CLAMP, REPEAT, MIRROR_REPEAT
-	uint address_mode_v; // CLAMP, REPEAT, MIRROR_REPEAT
-	uint address_mode_w; // CLAMP, REPEAT, MIRROR_REPEAT
-	uint mag_filter; // NEAREST, LINEAR
-	uint min_filter; // NEAREST, LINEAR
-	uint mip_filter; // NEAREST, LINEAR
-};
-
-uint gpuPackSamplerDesc(const GpuSamplerDesc d) {
-	return (d.address_mode_u)
-	| (d.address_mode_v << 2)
-	| (d.address_mode_w << 4)
-	| (d.mag_filter << 6)
-	| (d.min_filter << 7)
-	| (d.mip_filter << 8);
-}
-
-GpuSamplerDesc gpuDefaultSampler() {
-	return GpuSamplerDesc(ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, FILTER_LINEAR, FILTER_LINEAR, FILTER_LINEAR);
-}
-
-layout(buffer_reference, std430) buffer GpuSamplerMap {
-	uint data[];
-};
-
-layout(push_constant) uniform PushConstants {
-	uint64_t compute_data;
-	GpuSamplerMap sampler_map;
-} pc;
-
-uint gpuGetSamplerIndex(const GpuSamplerDesc desc) {
-	return pc.sampler_map.data[gpuPackSamplerDesc(desc)];
-}
-
-// End prologue
-)";
-
-constexpr static std::string_view GRAPHICS_SHADER_PROLOGUE = R"(
-#version 460
-#extension GL_EXT_shader_explicit_arithmetic_types : require
-#extension GL_EXT_buffer_reference : require
-
-const uint ADDRESS_MODE_CLAMP = 0;
-const uint ADDRESS_MODE_MIRROR_REPEAT = 1;
-const uint ADDRESS_MODE_REPEAT = 2;
-
-const uint FILTER_NEAREST = 0;
-const uint FILTER_LINEAR = 1;
-
-struct GpuSamplerDesc {
-	uint address_mode_u; // CLAMP, REPEAT, MIRROR_REPEAT
-	uint address_mode_v; // CLAMP, REPEAT, MIRROR_REPEAT
-	uint address_mode_w; // CLAMP, REPEAT, MIRROR_REPEAT
-	uint mag_filter; // NEAREST, LINEAR
-	uint min_filter; // NEAREST, LINEAR
-	uint mip_filter; // NEAREST, LINEAR
-};
-
-uint gpuPackSamplerDesc(const GpuSamplerDesc d) {
-	return (d.address_mode_u)
-	| (d.address_mode_v << 2)
-	| (d.address_mode_w << 4)
-	| (d.mag_filter << 6)
-	| (d.min_filter << 7)
-	| (d.mip_filter << 8);
-}
-
-GpuSamplerDesc gpuDefaultSampler() {
-	return GpuSamplerDesc(ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, FILTER_LINEAR, FILTER_LINEAR, FILTER_LINEAR);
-}
-
-layout(buffer_reference, std430) buffer GpuSamplerMap {
-	uint data[];
-};
-
-layout(push_constant) uniform PushConstants {
-	uint64_t vertex_data;
-	uint64_t fragment_data;
-	uint64_t index_data;
-	GpuSamplerMap sampler_map;
-} pc;
-
-uint gpuGetSamplerIndex(const GpuSamplerDesc desc) {
-	return pc.sampler_map.data[gpuPackSamplerDesc(desc)];
-}
-
-// End prologue
-)";

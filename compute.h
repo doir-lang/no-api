@@ -20,22 +20,26 @@
  * - The entire public surface fits in ~150 lines.
  */
 
-#include <cstddef> // size_t
-#include <cstdint> // uint8_t, uint16_t, uint32_t, uint64_t
-#include <span> // std::std::span (C++20)
-#include <string_view> // std::string_view (C++17)
-#include <algorithm> // std::max
+#include "compat.h" // size_t, the integer types, and the C compatible span/optional stand-ins
+
+#ifdef __cplusplus
+	#include <algorithm> // std::max
+	#include <string_view> // std::string_view (C++17)
+#endif
 
 // ---------------------------------------------------------------------------
 // Basic helpers used by the API
 // ---------------------------------------------------------------------------
-struct uvec3 { uint32_t x, y, z; };
+typedef struct uvec3 { uint32_t x, y, z; } uvec3;
 
+#ifdef __cplusplus
 /**
  * string_to_bytes – Reinterpret a string_view's characters as a read-only byte
  * span, useful for passing shader IR source text to functions expecting bytes.
  *
  * @param str String to view as bytes.
+ *
+ * @note C++ only sugar; a C caller builds the GpuByteSpan itself.
  */
 inline std::span<const std::byte> string_to_bytes(std::string_view str) {
 	return {reinterpret_cast<const std::byte*>(str.data()), str.size()};
@@ -50,7 +54,8 @@ inline std::span<const std::byte> string_to_bytes(std::string_view str) {
 template<typename T>
 std::span<const std::byte> byte_span(std::span<const T> span) {
 	return {reinterpret_cast<const std::byte*>(span.data()), span.size_bytes()};
-} 
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Opaque GPU object handles
@@ -60,14 +65,14 @@ std::span<const std::byte> byte_span(std::span<const T> span) {
  * Semantically equivalent to void. Some functions will expect a gpu* instead of
  * a void* to indicate that the data should be on the gpu.
  */
-struct gpu { char size_equals_one; };
+typedef struct gpu { char size_equals_one; } gpu;
 
 /**
  * GpuQueue
  * Represents a GPU submission queue (graphics, compute, or copy). Work is
  * recorded into GpuCommandBuffer objects and submitted via gpuSubmit.
  */
-struct GpuQueue;
+typedef struct GpuQueue GpuQueue;
 
 /**
  * GpuTexture
@@ -77,7 +82,7 @@ struct GpuQueue;
  * gpuCreateTexture. The 256-bit sampler descriptor written into the descriptor
  * heap is a separate GpuTextureDescriptor value (see below).
  */
-struct GpuTexture;
+typedef struct GpuTexture GpuTexture;
 
 /**
  * GpuPipeline
@@ -86,7 +91,7 @@ struct GpuTexture;
  * gpuCreateGraphicsMeshletPipeline. Contains hardware-specific shader microcode.
  * Freed with gpuFreePipeline.
  */
-struct GpuPipeline;
+typedef struct GpuPipeline GpuPipeline;
 
 /**
  * GpuCommandBuffer
@@ -95,7 +100,13 @@ struct GpuPipeline;
  * intentionally not supported: one-shot buffers simplify driver memory management
  * (bump allocator vs. heap allocator) and avoid accidentally replaying stale work.
  */
-struct GpuCommandBuffer;
+typedef struct GpuCommandBuffer GpuCommandBuffer;
+
+/**
+ * GpuCommandBufferSpan – A read only list of command buffers, as gpuSubmit takes them:
+ * std::span<GpuCommandBuffer* const> in C++, a {ptr, count} pair in C.
+ */
+NOAPI_SPAN_TYPE(GpuCommandBufferSpan, GpuCommandBuffer* const);
 
 /**
  * GpuSemaphore
@@ -105,7 +116,7 @@ struct GpuCommandBuffer;
  * replace the older Vulkan/Metal per-submit fence objects and N-buffering patterns.
  * Created by gpuCreateSemaphore(initialValue); destroyed by gpuFreeSemaphore.
  */
-struct GpuSemaphore;
+typedef struct GpuSemaphore GpuSemaphore;
 
 // ---------------------------------------------------------------------------
 // Enumerations
@@ -138,13 +149,13 @@ struct GpuSemaphore;
  * MEMORY_TEXTURE_READBACK – Semantically identical to MEMORY_READBACK but with the
  * same internal optimizations as MEMORY_TEXTURE.
  */
-enum MEMORY { MEMORY_DEFAULT, MEMORY_GPU, MEMORY_READBACK, MEMORY_TEXTURE, MEMORY_TEXTURE_READBACK };
+typedef enum MEMORY { MEMORY_DEFAULT, MEMORY_GPU, MEMORY_READBACK, MEMORY_TEXTURE, MEMORY_TEXTURE_READBACK } MEMORY;
 
 /**
  * OP – Comparison operator used by depth tests, stencil tests, and semaphore
  * wait conditions (gpuWaitBefore).
  */
-enum OP {
+typedef enum OP {
 	OP_NEVER, ///< Test always fails.
 	OP_LESS, ///< Passes if incoming < reference.
 	OP_EQUAL, ///< Passes if incoming == reference.
@@ -153,19 +164,19 @@ enum OP {
 	OP_NOT_EQUAL, ///< Passes if incoming != reference.
 	OP_GREATER_EQUAL, ///< Passes if incoming >= reference.
 	OP_ALWAYS, ///< Test always passes.
-};
+} OP;
 
 /**
  * TEXTURE – Texture dimensionality / view type.
  */
-enum TEXTURE {
+typedef enum TEXTURE {
 	TEXTURE_1D, // NOTE: Not supported on WebGPU
 	TEXTURE_2D,
 	TEXTURE_3D,
 	TEXTURE_CUBE, // TODO: Can we emulate cubemaps since everything is getting merged into a big array?
 	TEXTURE_2D_ARRAY,
 	TEXTURE_CUBE_ARRAY,
-};
+} TEXTURE;
 
 /**
  * FORMAT – Pixel / texel formats. The set is the one WebGPU names, since that is the
@@ -176,7 +187,7 @@ enum TEXTURE {
  * reject them: the 16 bit unorm/snorm ones need `texture-formats-tier1` and
  * FORMAT_D32_FLOAT_S8_UINT needs `depth32float-stencil8`.
  */
-enum FORMAT {
+typedef enum FORMAT {
 	FORMAT_NONE,
 
 	// 1 byte per texel
@@ -243,8 +254,10 @@ enum FORMAT {
 	FORMAT_D24_PLUS_S8_UINT,
 	FORMAT_D32_FLOAT,
 	FORMAT_D32_FLOAT_S8_UINT, // EXT
-	// TODO: extend with BC/ETC/ASTC compressed formats. 
-};
+	// TODO: extend with BC/ETC/ASTC compressed formats.
+} FORMAT;
+
+NOAPI_EXTERN_C_BEGIN
 
 /**
  * gpuFormatIsDepth – Returns true if `format` carries a depth aspect. A stencil-only
@@ -252,7 +265,7 @@ enum FORMAT {
  *
  * @param format Format to test.
  */
-inline bool gpuFormatIsDepth(FORMAT format) {
+NOAPI_INLINE bool gpuFormatIsDepthEXT(FORMAT format) {
 	switch (format) {
 	case FORMAT_D16_UNORM:
 	case FORMAT_D24_PLUS:
@@ -269,7 +282,7 @@ inline bool gpuFormatIsDepth(FORMAT format) {
  *
  * @param format Format to test.
  */
-inline bool gpuFormatIsStencil(FORMAT format) {
+NOAPI_INLINE bool gpuFormatIsStencilEXT(FORMAT format) {
 	switch (format) {
 	case FORMAT_S8_UINT:
 	case FORMAT_D24_PLUS_S8_UINT:
@@ -285,8 +298,8 @@ inline bool gpuFormatIsStencil(FORMAT format) {
  *
  * @param format Format to test.
  */
-inline bool gpuFormatIsDepthStencil(FORMAT format) {
-	return gpuFormatIsDepth(format) || gpuFormatIsStencil(format);
+NOAPI_INLINE bool gpuFormatIsDepthStencilEXT(FORMAT format) {
+	return gpuFormatIsDepthEXT(format) || gpuFormatIsStencilEXT(format);
 }
 
 /**
@@ -295,7 +308,7 @@ inline bool gpuFormatIsDepthStencil(FORMAT format) {
  *
  * @param format Format to test.
  */
-inline bool gpuFormatIsSrgb(FORMAT format) {
+NOAPI_INLINE bool gpuFormatIsSrgbEXT(FORMAT format) {
 	return format == FORMAT_RGBA8_SRGB || format == FORMAT_BGRA8_SRGB;
 }
 
@@ -307,7 +320,7 @@ inline bool gpuFormatIsSrgb(FORMAT format) {
  *
  * @param format Format to test.
  */
-inline bool gpuFormatIsFilterable(FORMAT format) {
+NOAPI_INLINE bool gpuFormatIsFilterableEXT(FORMAT format) {
 	switch (format) {
 	case FORMAT_R8_UINT:
 	case FORMAT_R8_SINT:
@@ -332,9 +345,11 @@ inline bool gpuFormatIsFilterable(FORMAT format) {
 	case FORMAT_RGBA32_SINT:
 	case FORMAT_RGBA32_FLOAT:
 		return false;
-	default: return !gpuFormatIsDepthStencil(format);
+	default: return !gpuFormatIsDepthStencilEXT(format);
 	}
 }
+
+NOAPI_EXTERN_C_END
 
 /**
  * TEXTURE_USAGE_FLAGS – Bitmask describing how a GpuTexture allocation will be used.
@@ -342,14 +357,14 @@ inline bool gpuFormatIsFilterable(FORMAT format) {
  * enable hardware features (DCC compression, HiZ, MSAA resolve, etc.).
  * Combine with bitwise-OR.
  */
-enum TEXTURE_USAGE_FLAGS {
+typedef enum TEXTURE_USAGE_FLAGS {
 	USAGE_SAMPLED = 0x01, ///< Readable by texture samplers.
 	USAGE_STORAGE = 0x02, ///< Read/write access from compute shaders.
 	USAGE_COLOR_ATTACHMENT = 0x04, ///< Rasterizer color render target.
 	USAGE_DEPTH_STENCIL_ATTACHMENT = 0x08, ///< Rasterizer depth/stencil target.
 	USAGE_TRANSFER_SRC = 0x10, ///< Source of copy operations.
 	USAGE_TRANSFER_DST = 0x20, ///< Destination of copy operations.
-};
+} TEXTURE_USAGE_FLAGS;
 
 /**
  * STAGE – GPU pipeline stage used in barrier producer/consumer descriptions and
@@ -361,7 +376,7 @@ enum TEXTURE_USAGE_FLAGS {
  *
  * Combine multiple stages with bitwise-OR to express "any of these stages".
  */
-enum STAGE {
+typedef enum STAGE {
 	STAGE_TRANSFER = 0x001, ///< DMA / copy engine (gpuMemCpy, gpuCopyToTexture).
 	STAGE_COMPUTE = 0x002, ///< Compute shader execution.
 	STAGE_VERTEX_SHADER = 0x004, ///< Vertex or mesh shader execution.
@@ -370,7 +385,7 @@ enum STAGE {
 	STAGE_RASTER_DEPTH_OUT = 0x020, ///< Rasterizer depth/stencil output.
 	STAGE_ALL = 0x03F, ///< All stages (conservative; use sparingly).
 	// NOTE: In WebGPU will we be able to get any more granular than all?
-};
+} STAGE;
 
 /**
  * HAZARD_FLAGS – Optional bitmask passed to gpuBarrier / gpuWaitBefore to request
@@ -383,7 +398,7 @@ enum STAGE {
  * HiZ / depth-metadata caches) that require explicit invalidation in specific
  * scenarios.
  */
-enum HAZARD_FLAGS {
+typedef enum HAZARD_FLAGS {
 	/**
 	 * HAZARD_DRAW_ARGUMENTS – Stall the GPU command-processor's prefetch until the
 	 * producing stage has finished writing draw/dispatch argument buffers.
@@ -407,7 +422,7 @@ enum HAZARD_FLAGS {
 	 * subsequently be consumed by the depth/stencil unit as a depth buffer.
 	 */
 	HAZARD_DEPTH_STENCIL = 0x4,
-};
+} HAZARD_FLAGS;
 
 /**
  * SIGNAL – Atomic operation applied when gpuSignalAfter writes to the counter
@@ -421,7 +436,7 @@ enum HAZARD_FLAGS {
  * multi-producer bitmask patterns: wait until all
  * producers have set their bit).
  */
-enum SIGNAL { SIGNAL_ATOMIC_SET, SIGNAL_ATOMIC_MAX, SIGNAL_ATOMIC_OR };
+typedef enum SIGNAL { SIGNAL_ATOMIC_SET, SIGNAL_ATOMIC_MAX, SIGNAL_ATOMIC_OR } SIGNAL;
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -432,15 +447,21 @@ enum SIGNAL { SIGNAL_ATOMIC_SET, SIGNAL_ATOMIC_MAX, SIGNAL_ATOMIC_OR };
  * Passed to gpuTextureSizeAlign (to query the required memory footprint) and then
  * to gpuCreateTexture (to obtain a GpuTexture CPU handle for rasterization binding).
  */
-struct GpuTextureDesc {
-	TEXTURE type = TEXTURE_2D; ///< Dimensionality and view type.
-	uvec3 dimensions = {1, 1, 1}; ///< Dimensions in texels.
-	uint32_t mipCount = 1; ///< Number of mip levels (1 = no mips). // TODO: Should we view this as upload data, and then generate all missing mips (since we are storing textures as big arrays)
-	uint32_t layerCount = 1; ///< Array layer count (for TEXTURE_2D_ARRAY / TEXTURE_CUBE_ARRAY).
-	uint32_t sampleCount = 1; ///< MSAA sample count.
-	FORMAT format = FORMAT_NONE; ///< Texel format.
-	TEXTURE_USAGE_FLAGS usage = (TEXTURE_USAGE_FLAGS)0; ///< Bitmask of TEXTURE_USAGE_FLAGS values describing intended use.
-};
+typedef struct GpuTextureDesc {
+	TEXTURE type NOAPI_DEFAULT(TEXTURE_2D); ///< Dimensionality and view type.
+	uvec3 dimensions NOAPI_DEFAULT({1, 1, 1}); ///< Dimensions in texels.
+	uint32_t mipCount NOAPI_DEFAULT(1); ///< Number of mip levels (1 = no mips). // TODO: Should we view this as upload data, and then generate all missing mips (since we are storing textures as big arrays)
+	uint32_t layerCount NOAPI_DEFAULT(1); ///< Array layer count (for TEXTURE_2D_ARRAY / TEXTURE_CUBE_ARRAY).
+	uint32_t sampleCount NOAPI_DEFAULT(1); ///< MSAA sample count.
+	FORMAT format NOAPI_DEFAULT(FORMAT_NONE); ///< Texel format.
+	TEXTURE_USAGE_FLAGS usage NOAPI_DEFAULT((TEXTURE_USAGE_FLAGS)0); ///< Bitmask of TEXTURE_USAGE_FLAGS values describing intended use.
+} GpuTextureDesc;
+
+/**
+ * GPU_TEXTURE_DESC_DEFAULT – The defaults above as an initializer, for C (where default
+ * member initializers don't exist). Keep in sync with GpuTextureDesc.
+ */
+#define GPU_TEXTURE_DESC_DEFAULT { TEXTURE_2D, {1, 1, 1}, 1, 1, 1, FORMAT_NONE, (TEXTURE_USAGE_FLAGS)0 }
 
 /**
  * GpuViewDesc – Describes a sub-range of a GpuTexture for use in a descriptor.
@@ -449,16 +470,27 @@ struct GpuTextureDesc {
  *
  * ALL_MIPS / ALL_LAYERS sentinel values indicate "from base to the last level/layer".
  */
-static constexpr uint8_t ALL_MIPS = 0xff;
-static constexpr uint16_t ALL_LAYERS = 0xffff;
+#ifdef __cplusplus
+	static constexpr uint8_t ALL_MIPS = 0xff;
+	static constexpr uint16_t ALL_LAYERS = 0xffff;
+#else
+	#define ALL_MIPS ((uint8_t)0xff)
+	#define ALL_LAYERS ((uint16_t)0xffff)
+#endif
 
-struct GpuViewDesc {
-	FORMAT format = FORMAT_NONE; ///< Override format, or FORMAT_NONE to use the texture's own format.
-	uint8_t baseMip = 0; ///< Index of the first mip level included in the view.
-	uint8_t mipCount = ALL_MIPS; ///< Number of mip levels included (ALL_MIPS = all remaining).
-	uint16_t baseLayer = 0; ///< First array layer / cube face included in the view.
-	uint16_t layerCount= ALL_LAYERS; ///< Number of layers included (ALL_LAYERS = all remaining).
-};
+typedef struct GpuViewDesc {
+	FORMAT format NOAPI_DEFAULT(FORMAT_NONE); ///< Override format, or FORMAT_NONE to use the texture's own format.
+	uint8_t baseMip NOAPI_DEFAULT(0); ///< Index of the first mip level included in the view.
+	uint8_t mipCount NOAPI_DEFAULT(ALL_MIPS); ///< Number of mip levels included (ALL_MIPS = all remaining).
+	uint16_t baseLayer NOAPI_DEFAULT(0); ///< First array layer / cube face included in the view.
+	uint16_t layerCount NOAPI_DEFAULT(ALL_LAYERS); ///< Number of layers included (ALL_LAYERS = all remaining).
+} GpuViewDesc;
+
+/**
+ * GPU_VIEW_DESC_DEFAULT – The defaults above as an initializer, for C. Keep in sync with
+ * GpuViewDesc.
+ */
+#define GPU_VIEW_DESC_DEFAULT { FORMAT_NONE, 0, ALL_MIPS, 0, ALL_LAYERS }
 
 /**
  * GpuTextureSizeAlign – Returned by gpuTextureSizeAlign.
@@ -466,10 +498,10 @@ struct GpuViewDesc {
  * be passed to gpuMalloc before calling gpuCreateTexture. The driver accounts for
  * vendor-specific Morton swizzling, DCC metadata, and alignment padding.
  */
-struct GpuTextureSizeAlign {
+typedef struct GpuTextureSizeAlign {
 	size_t size; ///< Total allocation size in bytes (including metadata).
 	size_t align; ///< Required alignment in bytes for the gpuMalloc call.
-};
+} GpuTextureSizeAlign;
 
 /**
  * GpuTextureDescriptor – A 256-bit opaque hardware-specific texture descriptor blob.
@@ -483,11 +515,13 @@ struct GpuTextureSizeAlign {
  * Created by gpuTextureViewDescriptor (sampled, read-only) or
  * gpuRWTextureViewDescriptor (storage / read-write).
  */
-struct GpuTextureDescriptor { uint64_t data[4]; };
+typedef struct GpuTextureDescriptor { uint64_t data[4]; } GpuTextureDescriptor;
 
 // ---------------------------------------------------------------------------
 // Functions
 // ---------------------------------------------------------------------------
+
+NOAPI_EXTERN_C_BEGIN
 
 /**
  * gpuCreateQueue – Create a GPU submission queue (device and queue selection
@@ -531,7 +565,7 @@ void gpuFreeQueue(GpuQueue* queue);
  * @param align Required alignment in bytes (must be a power of two). Default is 16.
  * @param memory Memory heap type (default is MEMORY_DEFAULT).
  */
-void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align = 16, MEMORY memory = MEMORY_DEFAULT);
+void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align NOAPI_DEFAULT(16), MEMORY memory NOAPI_DEFAULT(MEMORY_DEFAULT));
 
 /**
  * gpuMalloc – Overload that allocates memory sized/aligned for a texture, using
@@ -540,7 +574,11 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align = 16, MEMORY memory 
  * @param queue The GPU queue (device) on which the memory will be used.
  * @param sizeAlign Size and alignment as returned by gpuTextureSizeAlign.
  * @param memory Memory heap type (default is MEMORY_TEXTURE).
+ *
+ * @note C++ only; from C call gpuMalloc(queue, sizeAlign.size, sizeAlign.align, memory).
  */
+NOAPI_EXTERN_C_END
+#ifdef __cplusplus
 inline void* gpuMalloc(GpuQueue* queue, GpuTextureSizeAlign sizeAlign, MEMORY memory = MEMORY_TEXTURE) {
 	return gpuMalloc(queue, sizeAlign.size, sizeAlign.align, memory);
 }
@@ -553,11 +591,15 @@ inline void* gpuMalloc(GpuQueue* queue, GpuTextureSizeAlign sizeAlign, MEMORY me
  * @param queue The GPU queue (device) on which the memory will be used.
  * @param count Number of T elements to allocate space for (default 1).
  * @param memory Memory heap type (default is MEMORY_DEFAULT).
+ *
+ * @note C++ only.
  */
 template<typename T>
 T* gpuMalloc(GpuQueue* queue, size_t count = 1, MEMORY memory = MEMORY_DEFAULT) {
 	return (T*)gpuMalloc(queue, sizeof(T) * count, std::max<size_t>(alignof(T), 16), memory);
 }
+#endif
+NOAPI_EXTERN_C_BEGIN
 
 /**
  * gpuFree – Free a GPU memory block previously returned by gpuMalloc.
@@ -570,13 +612,27 @@ T* gpuMalloc(GpuQueue* queue, size_t count = 1, MEMORY memory = MEMORY_DEFAULT) 
 void gpuFree(GpuQueue* queue, void* ptr);
 
 /**
- * gpuFree – Overload of gpuFree for GPU virtual addresses (e.g. as returned by
+ * gpuFreeDevicePointer – gpuFree for GPU virtual addresses (e.g. as returned by
  * gpuHostToDevicePointer or a MEMORY_GPU allocation).
+ *
+ * @note Spelled gpuFree in C++, where it is an overload of the host pointer flavour.
  *
  * @param queue The GPU queue (device) the memory was allocated on.
  * @param ptr GPU pointer returned by gpuMalloc. Must not be null.
  */
-void gpuFree(GpuQueue* queue, gpu* ptr);
+void gpuFreeDevicePointerEXT(GpuQueue* queue, gpu* ptr);
+
+NOAPI_EXTERN_C_END
+#ifdef __cplusplus
+/**
+ * gpuFree – C++ spelling of gpuFreeDevicePointer.
+ *
+ * @param queue The GPU queue (device) the memory was allocated on.
+ * @param ptr GPU pointer returned by gpuMalloc. Must not be null.
+ */
+inline void gpuFree(GpuQueue* queue, gpu* ptr) { gpuFreeDevicePointerEXT(queue, ptr); }
+#endif
+NOAPI_EXTERN_C_BEGIN
 
 /**
  * gpuHostToDevicePointer – Translate a CPU-mapped GPU pointer (from MEMORY_DEFAULT
@@ -626,7 +682,7 @@ void* gpuDeviceToHostPointerEXT(GpuQueue* queue, gpu* ptr);
  * @param queue The GPU queue (device) on which the texture will be created.
  * @param desc Texture description used to determine size.
  */
-GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue* queue, const GpuTextureDesc& desc);
+GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue* queue, NOAPI_CONST_REF(GpuTextureDesc) desc);
 
 /**
  * gpuCreateTexture – Create a CPU-side GpuTexture handle backed by an existing GPU
@@ -645,7 +701,7 @@ GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue* queue, const GpuTextureDesc& d
  * @param desc Texture description matching the one passed to gpuTextureSizeAlign.
  * @param memory MEMORY_TEXTURE/MEMORY_TEXTURE_READBACK pointer from gpuMalloc (GPU virtual address).
  */
-GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* memory);
+GpuTexture* gpuCreateTexture(GpuQueue* queue, NOAPI_CONST_REF(GpuTextureDesc) desc, gpu* memory);
 
 /**
  * gpuTextureViewDescriptor – Create a read-only (sampled) 256-bit descriptor blob
@@ -660,7 +716,7 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
  * @param texture Handle returned by gpuCreateTexture.
  * @param desc Mip/layer sub-range and optional format override.
  */
-GpuTextureDescriptor gpuTextureViewDescriptor(GpuQueue* queue, const GpuTexture* texture, const GpuViewDesc& desc);
+GpuTextureDescriptor gpuTextureViewDescriptor(GpuQueue* queue, const GpuTexture* texture, NOAPI_CONST_REF(GpuViewDesc) desc);
 
 /**
  * gpuRWTextureViewDescriptor – Create a read/write (storage image / UAV) 256-bit
@@ -674,7 +730,7 @@ GpuTextureDescriptor gpuTextureViewDescriptor(GpuQueue* queue, const GpuTexture*
  * @param texture Handle returned by gpuCreateTexture.
  * @param desc Mip/layer sub-range and optional format override.
  */
-GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue* queue, const GpuTexture* texture, const GpuViewDesc& desc);
+GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue* queue, const GpuTexture* texture, NOAPI_CONST_REF(GpuViewDesc) desc);
 
 // ---------------------------------------------------------------------------
 // Pipeline creation
@@ -691,7 +747,7 @@ GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue* queue, const GpuTextur
  * @param queue The GPU queue (device) on which the pipeline will be created.
  * @param computeIR Platform IR blob (SPIRV on Vulkan, WGSL on WebGPU).
  */
-GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, std::span<const std::byte> computeIR);
+GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, GpuByteSpan computeIR);
 
 /**
  * gpuFreePipeline – Release a previously compiled GpuPipeline and its associated
@@ -730,7 +786,7 @@ GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue);
  *
  * @note You should prefer using gpuSubmit which will automatically destroy the submitted
  * buffers while ensuring they aren't destroyed before submission.
- * 
+ *
  * @param cmd The command buffer to destroy
  */
 void gpuFreeCommandBuffer(GpuCommandBuffer* cmd);
@@ -749,7 +805,7 @@ void gpuFreeCommandBuffer(GpuCommandBuffer* cmd);
  * @param signal_value Value to write to the semaphore on completion (monotonically
  * increasing). Ignored if semaphore is null.
  */
-uint64_t gpuSubmit(GpuQueue* queue, std::span<GpuCommandBuffer*> command_buffers, GpuSemaphore* semaphore = nullptr, uint64_t signal_value = 0);
+uint64_t gpuSubmit(GpuQueue* queue, GpuCommandBufferSpan command_buffers, GpuSemaphore* semaphore NOAPI_DEFAULT(NULL), uint64_t signal_value NOAPI_DEFAULT(0));
 
 /**
  * gpuSubmitNoFree – Identical to gpuSubmit, except the submitted command
@@ -763,7 +819,7 @@ uint64_t gpuSubmit(GpuQueue* queue, std::span<GpuCommandBuffer*> command_buffers
  * @param signal_value Value to write to the semaphore on completion (monotonically
  * increasing). Ignored if semaphore is null.
  */
-uint64_t gpuSubmitNoFree(GpuQueue* queue, std::span<GpuCommandBuffer*> commandBuffers, GpuSemaphore* semaphore = nullptr, uint64_t signal_value = 0);
+uint64_t gpuSubmitNoFreeEXT(GpuQueue* queue, GpuCommandBufferSpan commandBuffers, GpuSemaphore* semaphore NOAPI_DEFAULT(NULL), uint64_t signal_value NOAPI_DEFAULT(0));
 
 // ---------------------------------------------------------------------------
 // Timeline semaphores (GPU <-> CPU synchronization)
@@ -797,7 +853,7 @@ GpuSemaphore* gpuCreateSemaphore(GpuQueue* queue, uint64_t initial_value);
  * @param value Counter value to wait for, or GPU_GET_VALUE to return the current value immediately.
  * @param timeout Maximum time to wait, in nanoseconds (default: wait forever).
  */
-uint64_t gpuWaitSemaphore(GpuQueue* queue, const GpuSemaphore* semaphore, uint64_t value, uint64_t timeout = UINT64_MAX);
+uint64_t gpuWaitSemaphore(GpuQueue* queue, const GpuSemaphore* semaphore, uint64_t value, uint64_t timeout NOAPI_DEFAULT(UINT64_MAX));
 
 /**
  * gpuFreeSemaphore – Destroy a timeline semaphore object.
@@ -825,7 +881,7 @@ void gpuFreeSemaphore(GpuQueue* queue, GpuSemaphore* semaphore);
  * @param bytes Number of bytes to copy.
  * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest, gpu* src, size_t bytes, bool no_offsets = false);
+void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest, gpu* src, size_t bytes, bool no_offsets NOAPI_DEFAULT(false));
 
 /**
  * gpuCopyToTexture – Record a copy from a linear CPU-mapped staging region into a
@@ -843,7 +899,7 @@ void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest, gpu* src, size_t bytes, bool no
  * @param texture GpuTexture handle describing the layout/format for swizzling.
  * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, GpuTexture* texture, bool no_offsets = false);
+void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, GpuTexture* texture, bool no_offsets NOAPI_DEFAULT(false));
 
 /**
  * gpuCopyFromTexture – Record a copy from a MEMORY_GPU texture back to a linear
@@ -856,7 +912,7 @@ void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, GpuTexture* te
  * @param texture GpuTexture handle.
  * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, const GpuTexture* texture, bool no_offsets = false);
+void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, const GpuTexture* texture, bool no_offsets NOAPI_DEFAULT(false));
 
 /**
  * gpuBlitTextureEXT – Copy one texture subresource onto another by sampling it in a
@@ -892,9 +948,9 @@ void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, const GpuTex
  * @param source_slice Array layer / cube face sampled from.
  */
 void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const GpuTexture* source,
-	bool linear_filter = true,
-	uint32_t destination_mip = 0, uint32_t destination_slice = 0,
-	uint32_t source_mip = 0, uint32_t source_slice = 0);
+	bool linear_filter NOAPI_DEFAULT(true),
+	uint32_t destination_mip NOAPI_DEFAULT(0), uint32_t destination_slice NOAPI_DEFAULT(0),
+	uint32_t source_mip NOAPI_DEFAULT(0), uint32_t source_slice NOAPI_DEFAULT(0));
 
 // ---------------------------------------------------------------------------
 // GPU commands – texture heap
@@ -916,7 +972,7 @@ void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const Gpu
  * @param texture_heap GPU virtual address of the first GpuTextureDescriptor in the heap.
  * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap, bool no_offsets = false);
+void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap, bool no_offsets NOAPI_DEFAULT(false));
 
 // ---------------------------------------------------------------------------
 // GPU commands – barriers and split barriers
@@ -947,7 +1003,7 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap, bool n
  * @param after Bitmask of STAGE values for the consuming stage(s).
  * @param hazards Optional HAZARD_FLAGS bitmask for special cache invalidation.
  */
-void gpuBarrier(GpuCommandBuffer* cmd, STAGE before, STAGE after, HAZARD_FLAGS hazards = (HAZARD_FLAGS)0);
+void gpuBarrier(GpuCommandBuffer* cmd, STAGE before, STAGE after, HAZARD_FLAGS hazards NOAPI_DEFAULT((HAZARD_FLAGS)0));
 
 /**
  * gpuSignalAfter – Split-barrier producer: after `before` finishes, atomically
@@ -984,7 +1040,7 @@ void gpuSignalAfter(GpuCommandBuffer* cmd, STAGE before, gpu* ptr, uint64_t valu
  * @param hazards Optional HAZARD_FLAGS for cache invalidation after the wait.
  * @param mask Bitmask applied to the counter before comparison (default: all bits).
  */
-void gpuWaitBefore(GpuCommandBuffer* cmd, STAGE after, gpu* ptr, uint64_t value, OP op, HAZARD_FLAGS hazards = (HAZARD_FLAGS)0, uint64_t mask = ~uint64_t(0));
+void gpuWaitBefore(GpuCommandBuffer* cmd, STAGE after, gpu* ptr, uint64_t value, OP op, HAZARD_FLAGS hazards NOAPI_DEFAULT((HAZARD_FLAGS)0), uint64_t mask NOAPI_DEFAULT(~(uint64_t)0));
 
 // ---------------------------------------------------------------------------
 // GPU commands – pipeline binding
@@ -1016,7 +1072,7 @@ void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline);
  * @param data GPU pointer to the root data struct (see root arguments design).
  * @param grid_dimensions Thread group grid (x * y * z total groups).
  */
-void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions, bool no_offsets = false);
+void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions, bool no_offsets NOAPI_DEFAULT(false));
 
 /**
  * gpuDispatchIndirect – Like gpuDispatch but reads the thread group dimensions from
@@ -1029,4 +1085,6 @@ void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions, bool n
  * @param grid_dimensions_gpu GPU pointer to a uvec3 holding the group dimensions.
  * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* data, gpu* grid_dimensions_gpu, bool no_offsets = false);
+void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* data, gpu* grid_dimensions_gpu, bool no_offsets NOAPI_DEFAULT(false));
+
+NOAPI_EXTERN_C_END

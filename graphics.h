@@ -5,22 +5,20 @@
  * "No Graphics API" by Sebastian Aaltonen
  * https://www.sebastianaaltonen.com/blog/no-graphics-api
  *
- * This file contains the graphics specific public API while compute.hpp contains
+ * This file contains the graphics specific public API while compute.h contains
  * all of the shared code used for both graphics and compute.
  *
  * NOTE: The original API did not include any API for swapchain/surface support.
  * Thus I have taken the liberty of lifting a WebGPU inspired API for surfaces.
  */
 
-#include "compute.hpp"
-
-#include <optional>
+#include "compute.h"
 
 // ---------------------------------------------------------------------------
 // Basic math types used in the API
 // ---------------------------------------------------------------------------
-struct uvec2 { uint32_t x, y; };
-struct ivec2 { int32_t x, y; };
+typedef struct uvec2 { uint32_t x, y; } uvec2;
+typedef struct ivec2 { int32_t x, y; } ivec2;
 
 // ---------------------------------------------------------------------------
 // Opaque GPU object handles
@@ -32,7 +30,7 @@ struct ivec2 { int32_t x, y; };
  * PSO (as Metal does) reduces pipeline permutations. Applied per-command-buffer
  * via gpuSetDepthStencilState. Created by gpuCreateDepthStencilState.
  */
-struct GpuDepthStencilState;
+typedef struct GpuDepthStencilState GpuDepthStencilState;
 
 /**
  * GpuBlendState
@@ -43,7 +41,7 @@ struct GpuDepthStencilState;
  * may instead use framebuffer-fetch intrinsics and author a parametrised formula.
  * Created by gpuCreateBlendState; requires a device feature flag.
  */
-struct GpuBlendState;
+typedef struct GpuBlendState GpuBlendState;
 
 // ---------------------------------------------------------------------------
 // Enumerations
@@ -57,7 +55,7 @@ struct GpuBlendState;
  * that only needs depth from the rasterizer's early-Z).
  * CULL_NONE – No culling; both faces are rasterized.
  */
-enum CULL { CULL_CCW, CULL_CW, CULL_ALL, CULL_NONE };
+typedef enum CULL { CULL_CCW, CULL_CW, CULL_ALL, CULL_NONE } CULL;
 
 /**
  * DEPTH_FLAGS – Bitmask controlling depth-buffer access in GpuDepthStencilDesc.
@@ -65,13 +63,13 @@ enum CULL { CULL_CCW, CULL_CW, CULL_ALL, CULL_NONE };
  * DEPTH_WRITE – Passing fragments update the depth buffer.
  * Combine with bitwise-OR, e.g. DEPTH_READ | DEPTH_WRITE.
  */
-enum DEPTH_FLAGS { DEPTH_READ = 0x1, DEPTH_WRITE = 0x2 };
+typedef enum DEPTH_FLAGS { DEPTH_READ = 0x1, DEPTH_WRITE = 0x2 } DEPTH_FLAGS;
 
 /**
  * STENCIL_OP – Action taken on the stencil buffer depending on depth/stencil
  * test outcomes.
  */
-enum STENCIL_OP {
+typedef enum STENCIL_OP {
 	STENCIL_OP_KEEP, ///< Keep the current stencil value unchanged.
 	STENCIL_OP_ZERO, ///< Set stencil to 0.
 	STENCIL_OP_REPLACE, ///< Replace with the reference value.
@@ -80,26 +78,26 @@ enum STENCIL_OP {
 	STENCIL_OP_INVERT, ///< Bitwise-invert the stencil value.
 	STENCIL_OP_INCR_WRAP, ///< Increment, wrapping to 0 on overflow.
 	STENCIL_OP_DECR_WRAP, ///< Decrement, wrapping on underflow.
-};
+} STENCIL_OP;
 
 /**
  * BLEND – RGB / alpha blend equation applied by the fixed-function blender
  * (or emulated via framebuffer-fetch on mobile TBDR GPUs).
  * result = src * srcFactor <BLEND> dst * dstFactor
  */
-enum BLEND {
+typedef enum BLEND {
 	BLEND_ADD, ///< result = src*srcF + dst*dstF (standard alpha blend)
 	BLEND_SUBTRACT, ///< result = src*srcF - dst*dstF
 	BLEND_REV_SUBTRACT, ///< result = dst*dstF - src*srcF
 	BLEND_MIN, ///< result = min(src, dst) (factors ignored)
 	BLEND_MAX, ///< result = max(src, dst) (factors ignored)
-};
+} BLEND;
 
 /**
  * FACTOR – Blend scale factors applied to source and destination colours/alphas.
  * Maps 1:1 to DX12/Vulkan blend factor enumerations.
  */
-enum FACTOR {
+typedef enum FACTOR {
 	FACTOR_ZERO, ///< 0
 	FACTOR_ONE, ///< 1
 	FACTOR_SRC_COLOR, ///< Source RGB
@@ -114,7 +112,7 @@ enum FACTOR {
 	FACTOR_ONE_MINUS_SRC1_COLOR, ///< 1 - second source RGB
 	FACTOR_SRC1_ALPHA, ///< Second source alpha (dual-source blending)
 	FACTOR_ONE_MINUS_SRC1_ALPHA, ///< 1 - second source alpha
-};
+} FACTOR;
 
 /**
  * TOPOLOGY – Primitive assembly topology for the rasterizer.
@@ -123,17 +121,17 @@ enum FACTOR {
  * TOPOLOGY_TRIANGLE_FAN – Vertices fan around the first vertex.
  * NOTE: Supporting points and lines will increase the API surface... but we would only gain an optional line width parameter
  */
-enum TOPOLOGY {
+typedef enum TOPOLOGY {
 	TOPOLOGY_TRIANGLE_LIST,
 	TOPOLOGY_TRIANGLE_STRIP,
 	// TOPOLOGY_TRIANGLE_FAN, // Not supported by WebGPU
-};
+} TOPOLOGY;
 
-enum INDEX_TYPE_EXT {
+typedef enum INDEX_TYPE_EXT {
 	INDEX_TYPE_UINT8,
 	INDEX_TYPE_UINT16,
 	INDEX_TYPE_UINT32
-};
+} INDEX_TYPE_EXT;
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -142,13 +140,19 @@ enum INDEX_TYPE_EXT {
 /**
  * Stencil – Per-face stencil operation description used inside GpuDepthStencilDesc.
  */
-struct GpuStencil {
-	OP test = OP_ALWAYS; ///< Stencil comparison function.
-	STENCIL_OP failOp = STENCIL_OP_KEEP; ///< Action when stencil test fails.
-	STENCIL_OP passOp = STENCIL_OP_KEEP; ///< Action when both tests pass.
-	STENCIL_OP depthFailOp = STENCIL_OP_KEEP; ///< Action when stencil passes but depth fails.
-	uint8_t reference = 0; ///< Stencil reference value.
-};
+typedef struct GpuStencil {
+	OP test NOAPI_DEFAULT(OP_ALWAYS); ///< Stencil comparison function.
+	STENCIL_OP failOp NOAPI_DEFAULT(STENCIL_OP_KEEP); ///< Action when stencil test fails.
+	STENCIL_OP passOp NOAPI_DEFAULT(STENCIL_OP_KEEP); ///< Action when both tests pass.
+	STENCIL_OP depthFailOp NOAPI_DEFAULT(STENCIL_OP_KEEP); ///< Action when stencil passes but depth fails.
+	uint8_t reference NOAPI_DEFAULT(0); ///< Stencil reference value.
+} GpuStencil;
+
+/**
+ * GPU_STENCIL_DEFAULT – The defaults above as an initializer, for C. Keep in sync with
+ * GpuStencil.
+ */
+#define GPU_STENCIL_DEFAULT { OP_ALWAYS, STENCIL_OP_KEEP, STENCIL_OP_KEEP, STENCIL_OP_KEEP, 0 }
 
 /**
  * GpuDepthStencilDesc – Full description of depth/stencil test and write behavior.
@@ -162,17 +166,23 @@ struct GpuStencil {
  * All fields have sensible defaults: by default depth testing is disabled and
  * stencil operations are all KEEP / ALWAYS.
  */
-struct GpuDepthStencilDesc {
-	DEPTH_FLAGS depthMode = (DEPTH_FLAGS)0; ///< Bitmask: DEPTH_READ, DEPTH_WRITE, or both.
-	OP depthTest = OP_ALWAYS; ///< Depth comparison function (e.g. OP_LESS_EQUAL).
-	float depthBias = 0.0f; ///< Constant depth value added to each fragment.
-	float depthBiasSlopeFactor = 0.0f; ///< Depth bias scaled by triangle slope (shadow mapping).
-	float depthBiasClamp = 0.0f; ///< Maximum magnitude of the slope-scaled depth bias.
-	uint8_t stencilReadMask = 0xff; ///< Mask ANDed with the stencil buffer before comparison.
-	uint8_t stencilWriteMask = 0xff; ///< Mask ANDed with written stencil values.
-	GpuStencil stencilFront; ///< Stencil ops for front-facing (CCW) triangles.
-	GpuStencil stencilBack; ///< Stencil ops for back-facing (CW) triangles.
-};
+typedef struct GpuDepthStencilDesc {
+	DEPTH_FLAGS depthMode NOAPI_DEFAULT((DEPTH_FLAGS)0); ///< Bitmask: DEPTH_READ, DEPTH_WRITE, or both.
+	OP depthTest NOAPI_DEFAULT(OP_ALWAYS); ///< Depth comparison function (e.g. OP_LESS_EQUAL).
+	float depthBias NOAPI_DEFAULT(0.0f); ///< Constant depth value added to each fragment.
+	float depthBiasSlopeFactor NOAPI_DEFAULT(0.0f); ///< Depth bias scaled by triangle slope (shadow mapping).
+	float depthBiasClamp NOAPI_DEFAULT(0.0f); ///< Maximum magnitude of the slope-scaled depth bias.
+	uint8_t stencilReadMask NOAPI_DEFAULT(0xff); ///< Mask ANDed with the stencil buffer before comparison.
+	uint8_t stencilWriteMask NOAPI_DEFAULT(0xff); ///< Mask ANDed with written stencil values.
+	GpuStencil stencilFront NOAPI_DEFAULT(GPU_STENCIL_DEFAULT); ///< Stencil ops for front-facing (CCW) triangles.
+	GpuStencil stencilBack NOAPI_DEFAULT(GPU_STENCIL_DEFAULT); ///< Stencil ops for back-facing (CW) triangles.
+} GpuDepthStencilDesc;
+
+/**
+ * GPU_DEPTH_STENCIL_DESC_DEFAULT – The defaults above as an initializer, for C. Keep in
+ * sync with GpuDepthStencilDesc.
+ */
+#define GPU_DEPTH_STENCIL_DESC_DEFAULT { (DEPTH_FLAGS)0, OP_ALWAYS, 0.0f, 0.0f, 0.0f, 0xff, 0xff, GPU_STENCIL_DEFAULT, GPU_STENCIL_DEFAULT }
 
 /**
  * GpuBlendDesc – Alpha blending configuration for a single color render target.
@@ -187,16 +197,28 @@ struct GpuDepthStencilDesc {
  * into the pixel shader; consider framebuffer-fetch + a parametrized blend formula
  * instead to avoid PSO permutations.
  */
-struct GpuBlendDesc {
-	BLEND colorOp = BLEND_ADD; ///< Blend equation for RGB channels.
-	FACTOR srcColorFactor = FACTOR_ONE; ///< Scale factor applied to the source (incoming) color.
-	FACTOR dstColorFactor = FACTOR_ZERO; ///< Scale factor applied to the destination (existing) color.
-	BLEND alphaOp = BLEND_ADD; ///< Blend equation for the alpha channel.
-	FACTOR srcAlphaFactor = FACTOR_ONE; ///< Scale factor applied to the source alpha.
-	FACTOR dstAlphaFactor = FACTOR_ZERO; ///< Scale factor applied to the destination alpha.
-	uint8_t colorWriteMask = 0xf; ///< Per-channel write enable: bit 0=R, 1=G, 2=B, 3=A.
+typedef struct GpuBlendDesc {
+	BLEND colorOp NOAPI_DEFAULT(BLEND_ADD); ///< Blend equation for RGB channels.
+	FACTOR srcColorFactor NOAPI_DEFAULT(FACTOR_ONE); ///< Scale factor applied to the source (incoming) color.
+	FACTOR dstColorFactor NOAPI_DEFAULT(FACTOR_ZERO); ///< Scale factor applied to the destination (existing) color.
+	BLEND alphaOp NOAPI_DEFAULT(BLEND_ADD); ///< Blend equation for the alpha channel.
+	FACTOR srcAlphaFactor NOAPI_DEFAULT(FACTOR_ONE); ///< Scale factor applied to the source alpha.
+	FACTOR dstAlphaFactor NOAPI_DEFAULT(FACTOR_ZERO); ///< Scale factor applied to the destination alpha.
+	uint8_t colorWriteMask NOAPI_DEFAULT(0xf); ///< Per-channel write enable: bit 0=R, 1=G, 2=B, 3=A.
 	// TODO: Should we just mandate this be done in the pixel shader?
-};
+} GpuBlendDesc;
+
+/**
+ * GPU_BLEND_DESC_DEFAULT – The defaults above as an initializer, for C. Keep in sync with
+ * GpuBlendDesc.
+ */
+#define GPU_BLEND_DESC_DEFAULT { BLEND_ADD, FACTOR_ONE, FACTOR_ZERO, BLEND_ADD, FACTOR_ONE, FACTOR_ZERO, 0xf }
+
+/**
+ * GpuOptionalBlendDesc – An optionally present GpuBlendDesc: std::optional<GpuBlendDesc>
+ * in C++, a {has_value, value} pair in C.
+ */
+NOAPI_OPTIONAL_TYPE(GpuOptionalBlendDesc, GpuBlendDesc);
 
 /**
  * ColorTarget – Render target format and write mask entry in GpuRasterDesc.
@@ -207,10 +229,22 @@ struct GpuBlendDesc {
  * from GpuBlendDesc::colorWriteMask, which applies when a dynamic GpuBlendState is
  * in use.
  */
-struct GpuColorTarget {
-	FORMAT format = FORMAT_NONE; ///< Pixel format of this render target attachment.
-	uint8_t writeMask = 0xf; ///< Bitmask: bit 0=R, 1=G, 2=B, 3=A. 0xf = write all channels.
-};
+typedef struct GpuColorTarget {
+	FORMAT format NOAPI_DEFAULT(FORMAT_NONE); ///< Pixel format of this render target attachment.
+	uint8_t writeMask NOAPI_DEFAULT(0xf); ///< Bitmask: bit 0=R, 1=G, 2=B, 3=A. 0xf = write all channels.
+} GpuColorTarget;
+
+/**
+ * GPU_COLOR_TARGET_DEFAULT – The defaults above as an initializer, for C. Keep in sync
+ * with GpuColorTarget.
+ */
+#define GPU_COLOR_TARGET_DEFAULT { FORMAT_NONE, 0xf }
+
+/**
+ * GpuColorTargetSpan – A read only list of color render targets:
+ * std::span<const GpuColorTarget> in C++, a {ptr, count} pair in C.
+ */
+NOAPI_SPAN_TYPE(GpuColorTargetSpan, const GpuColorTarget);
 
 /**
  * GpuRasterDesc – Minimal rasterizer state baked into a graphics PSO.
@@ -224,46 +258,52 @@ struct GpuColorTarget {
  * topology, cull, alphaToCoverage, supportDualSourceBlending, sampleCount,
  * depthFormat, stencilFormat, colorTargets, and (optionally) blendstate.
  */
-struct GpuRasterDesc {
+typedef struct GpuRasterDesc {
 	///< Primitive assembly mode. Affects vertex grouping in the rasterizer.
-	TOPOLOGY topology = TOPOLOGY_TRIANGLE_LIST;
+	TOPOLOGY topology NOAPI_DEFAULT(TOPOLOGY_TRIANGLE_LIST);
 
 	///< Triangle facing cull mode.
-	CULL cull = CULL_NONE;
+	CULL cull NOAPI_DEFAULT(CULL_NONE);
 
 	///< When true, MSAA coverage is derived from the pixel shader's output alpha.
 	///< Useful for alpha-tested foliage rendered into an MSAA buffer.
-	bool alphaToCoverage = false;
+	bool alphaToCoverage NOAPI_DEFAULT(false);
 
 	///< When true, the shader compiler enables the second pixel-shader color
 	///< output (SV_Color1) for use as the second blend source. Only valid when
 	///< a single color target is used. Requires blendstate to reference
 	///< FACTOR_SRC1_* blend factors.
-	bool supportDualSourceBlending = false;
+	bool supportDualSourceBlending NOAPI_DEFAULT(false);
 	// TODO: WebGPU supports?
 
 	///< MSAA sample count (1, 2, 4, 8). Must match the resolve and depth targets.
-	uint8_t sampleCount = 1;
+	uint8_t sampleCount NOAPI_DEFAULT(1);
 
 	///< Depth attachment format, or FORMAT_NONE if no depth buffer is used.
-	FORMAT depthFormat = FORMAT_NONE;
+	FORMAT depthFormat NOAPI_DEFAULT(FORMAT_NONE);
 
 	///< Stencil attachment format, or FORMAT_NONE. On most hardware the depth
 	///< and stencil share the same memory allocation (e.g. FORMAT_D24_PLUS_S8_UINT).
-	FORMAT stencilFormat = FORMAT_NONE;
+	FORMAT stencilFormat NOAPI_DEFAULT(FORMAT_NONE);
 
 	///< List of color render target formats and write masks. Maximum is
-	///< hardware-defined (typically 8). An empty std::span means no color output
+	///< hardware-defined (typically 8). An empty span means no color output
 	///< (e.g. depth-only shadow pass).
-	std::span<GpuColorTarget> colorTargets = {};
+	GpuColorTargetSpan colorTargets NOAPI_DEFAULT({});
 
 	///< Optional pointer to an embedded (baked) blend state. When non-null the
 	///< blend equation is compiled into the PSO, allowing the driver to dead-code-
 	///< eliminate color exports on the mobile shader path. When null, blending
 	///< must be applied dynamically via gpuSetBlendState (requires device feature).
-	std::optional<GpuBlendDesc> blendstate = std::nullopt;
+	GpuOptionalBlendDesc blendstate NOAPI_DEFAULT({});
 	// TODO: Should we require one by default?
-};
+} GpuRasterDesc;
+
+/**
+ * GPU_RASTER_DESC_DEFAULT – The defaults above as an initializer, for C. Keep in sync with
+ * GpuRasterDesc.
+ */
+#define GPU_RASTER_DESC_DEFAULT { TOPOLOGY_TRIANGLE_LIST, CULL_NONE, false, false, 1, FORMAT_NONE, FORMAT_NONE, {NULL, 0}, {false, GPU_BLEND_DESC_DEFAULT} }
 
 // ---------------------------------------------------------------------------
 // Render pass descriptions
@@ -279,11 +319,11 @@ struct GpuRasterDesc {
  * LOAD_OP_CLEAR – Clear the attachment to the specified clear value.
  * LOAD_OP_DONT_CARE – Previous contents are undefined and may be discarded.
  */
-enum LOAD_OP {
+typedef enum LOAD_OP {
 	LOAD_OP_LOAD,
 	LOAD_OP_CLEAR,
 	LOAD_OP_DONT_CARE,
-};
+} LOAD_OP;
 
 /**
  * STORE_OP – Operation performed on an attachment when a render pass ends.
@@ -294,25 +334,31 @@ enum LOAD_OP {
  * STORE_OP_STORE – Preserve the rendered contents after the pass.
  * STORE_OP_DONT_CARE – Final contents are undefined and may be discarded.
  */
-enum STORE_OP {
+typedef enum STORE_OP {
 	STORE_OP_STORE,
 	STORE_OP_DONT_CARE,
-};
+} STORE_OP;
 
 /**
  * ClearColor – RGBA floating-point clear value for color attachments.
  */
-struct ClearColor {
-	float r = 0.0f;
-	float g = 0.0f;
-	float b = 0.0f;
-	float a = 1.0f;
-};
+typedef struct ClearColor {
+	float r NOAPI_DEFAULT(0.0f);
+	float g NOAPI_DEFAULT(0.0f);
+	float b NOAPI_DEFAULT(0.0f);
+	float a NOAPI_DEFAULT(1.0f);
+} ClearColor;
+
+/**
+ * GPU_CLEAR_COLOR_DEFAULT – The defaults above as an initializer, for C. Keep in sync with
+ * ClearColor.
+ */
+#define GPU_CLEAR_COLOR_DEFAULT { 0.0f, 0.0f, 0.0f, 1.0f }
 
 /**
  * GpuColorAttachment – Color render target binding used by GpuRenderPassDesc.
  */
-struct GpuColorAttachment {
+typedef struct GpuColorAttachment {
 	/**
 	* Texture subresource used as the render target.
 	* Must have been created with TEXTURE_USAGE_RENDER_TARGET.
@@ -322,12 +368,12 @@ struct GpuColorAttachment {
 	/**
 	* Mip level to render into.
 	*/
-	uint32_t mipLevel = 0;
+	uint32_t mipLevel NOAPI_DEFAULT(0);
 
 	/**
 	* Array layer or 3D slice to render into.
 	*/
-	uint32_t slice = 0;
+	uint32_t slice NOAPI_DEFAULT(0);
 
 	/**
 	* Optional MSAA resolve target.
@@ -335,23 +381,35 @@ struct GpuColorAttachment {
 	* When texture is multisampled and resolveTexture is valid, the rasterized
 	* image is automatically resolved into this texture at the end of the pass.
 	*/
-	const GpuTexture* resolveTexture = nullptr;
+	const GpuTexture* resolveTexture NOAPI_DEFAULT(NULL);
 
 	/**
 	* Load operation performed at render pass begin.
 	*/
-	LOAD_OP loadOp = LOAD_OP_LOAD;
+	LOAD_OP loadOp NOAPI_DEFAULT(LOAD_OP_LOAD);
 
 	/**
 	* Store operation performed at render pass end.
 	*/
-	STORE_OP storeOp = STORE_OP_STORE;
+	STORE_OP storeOp NOAPI_DEFAULT(STORE_OP_STORE);
 
 	/**
 	* Clear value used when loadOp == LOAD_OP_CLEAR.
 	*/
-	ClearColor clearValue = {};
-};
+	ClearColor clearValue NOAPI_DEFAULT({});
+} GpuColorAttachment;
+
+/**
+ * GPU_COLOR_ATTACHMENT_DEFAULT – The defaults above as an initializer, for C. Keep in sync
+ * with GpuColorAttachment.
+ */
+#define GPU_COLOR_ATTACHMENT_DEFAULT { NULL, 0, 0, NULL, LOAD_OP_LOAD, STORE_OP_STORE, GPU_CLEAR_COLOR_DEFAULT }
+
+/**
+ * GpuColorAttachmentSpan – A read only list of color attachments:
+ * std::span<const GpuColorAttachment> in C++, a {ptr, count} pair in C.
+ */
+NOAPI_SPAN_TYPE(GpuColorAttachmentSpan, const GpuColorAttachment);
 
 /**
  * GpuDepthAttachment – Depth/stencil attachment binding used by
@@ -360,7 +418,7 @@ struct GpuColorAttachment {
  * Depth and stencil load/store operations are separated because some APIs
  * (Vulkan/WebGPU/Metal) expose them independently.
  */
-struct GpuDepthStencilAttachment {
+typedef struct GpuDepthStencilAttachment {
 	/**
 	* Texture subresource used as the depth/stencil target.
 	* Must have been created with TEXTURE_USAGE_DEPTH_STENCIL.
@@ -370,27 +428,39 @@ struct GpuDepthStencilAttachment {
 	/**
 	 * Mip level to render into.
 	 */
-	uint32_t mipLevel = 0;
+	uint32_t mipLevel NOAPI_DEFAULT(0);
 
 	/**
 	 * Array layer or 3D slice to render into.
 	 */
-	uint32_t slice = 0;
+	uint32_t slice NOAPI_DEFAULT(0);
 
 	/**
 	 * Depth load operation
 	 */
-	LOAD_OP loadOp = LOAD_OP_LOAD;
+	LOAD_OP loadOp NOAPI_DEFAULT(LOAD_OP_LOAD);
 	/**
 	 * Depth store operation
 	 */
-	STORE_OP storeOp = STORE_OP_STORE;
+	STORE_OP storeOp NOAPI_DEFAULT(STORE_OP_STORE);
 
 	/**
 	 * Clear depth value used when depthLoadOp == LOAD_OP_CLEAR.
 	 */
-	double clearValue = 1.0f;
-};
+	double clearValue NOAPI_DEFAULT(1.0f);
+} GpuDepthStencilAttachment;
+
+/**
+ * GPU_DEPTH_STENCIL_ATTACHMENT_DEFAULT – The defaults above as an initializer, for C. Keep
+ * in sync with GpuDepthStencilAttachment.
+ */
+#define GPU_DEPTH_STENCIL_ATTACHMENT_DEFAULT { NULL, 0, 0, LOAD_OP_LOAD, STORE_OP_STORE, 1.0 }
+
+/**
+ * GpuOptionalDepthStencilAttachment – An optionally present GpuDepthStencilAttachment:
+ * std::optional<GpuDepthStencilAttachment> in C++, a {has_value, value} pair in C.
+ */
+NOAPI_OPTIONAL_TYPE(GpuOptionalDepthStencilAttachment, GpuDepthStencilAttachment);
 
 /**
  * GpuRenderPassDesc – Full render pass attachment configuration.
@@ -403,28 +473,46 @@ struct GpuDepthStencilAttachment {
  * specified directly at command recording time, more closely matching Metal
  * and WebGPU.
  */
-struct GpuRenderPassDesc {
+typedef struct GpuRenderPassDesc {
 	/**
 	 * Optional depth attachment.
 	 */
-	std::optional<GpuDepthStencilAttachment> depthAttachment = std::nullopt;
+	GpuOptionalDepthStencilAttachment depthAttachment NOAPI_DEFAULT({});
 
 	/**
 	 * Optional stencil attachment.
 	 */
-	std::optional<GpuDepthStencilAttachment> stencilAttachment = std::nullopt;
+	GpuOptionalDepthStencilAttachment stencilAttachment NOAPI_DEFAULT({});
 
 	/**
 	 * List of color render targets.
 	 *
 	 * An empty span is valid for depth-only rendering passes such as shadow maps.
 	 */
-	std::span<const GpuColorAttachment> colorAttachments = {};
-};
+	GpuColorAttachmentSpan colorAttachments NOAPI_DEFAULT({});
+} GpuRenderPassDesc;
+
+/**
+ * GPU_RENDER_PASS_DESC_DEFAULT – The defaults above as an initializer, for C. Keep in sync
+ * with GpuRenderPassDesc.
+ */
+#define GPU_RENDER_PASS_DESC_DEFAULT { \
+	{false, GPU_DEPTH_STENCIL_ATTACHMENT_DEFAULT}, \
+	{false, GPU_DEPTH_STENCIL_ATTACHMENT_DEFAULT}, \
+	{NULL, 0} \
+}
+
+/**
+ * GpuOptionalRenderPassDesc – An optionally present GpuRenderPassDesc:
+ * std::optional<GpuRenderPassDesc> in C++, a {has_value, value} pair in C.
+ */
+NOAPI_OPTIONAL_TYPE(GpuOptionalRenderPassDesc, GpuRenderPassDesc);
 
 // ---------------------------------------------------------------------------
 // Functions
 // ---------------------------------------------------------------------------
+
+NOAPI_EXTERN_C_BEGIN
 
 /**
  * gpuCreateGraphicsPipeline – Compile a vertex + pixel shader pipeline.
@@ -440,7 +528,7 @@ struct GpuRenderPassDesc {
  * @param fragmentIR Pixel shader IR blob (SPIRV on Vulkan, WGSL on WebGPU)
  * @param desc Rasterizer, format, and optional embedded blend state.
  */
-GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, std::span<const std::byte> vertexIR, std::span<const std::byte> fragmentIR, const GpuRasterDesc& desc);
+GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, GpuByteSpan fragmentIR, NOAPI_CONST_REF(GpuRasterDesc) desc);
 
 /**
  * gpuCreateGraphicsMeshletPipeline – Compile a mesh shader + pixel shader pipeline.
@@ -472,7 +560,7 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, std::span<const std::byt
  * @param queue The GPU queue (device) on which the state object will be created.
  * @param desc Depth/stencil test and write configuration.
  */
-GpuDepthStencilState* gpuCreateDepthStencilState(GpuQueue* queue, const GpuDepthStencilDesc& desc);
+GpuDepthStencilState* gpuCreateDepthStencilState(GpuQueue* queue, NOAPI_CONST_REF(GpuDepthStencilDesc) desc);
 
 /**
  * gpuCreateBlendState – Bake a blend configuration into a reusable state object.
@@ -484,7 +572,7 @@ GpuDepthStencilState* gpuCreateDepthStencilState(GpuQueue* queue, const GpuDepth
  * @param queue The GPU queue (device) on which the state object will be created.
  * @param desc Blend equation and factor configuration.
  */
-GpuBlendState* gpuCreateBlendState(GpuQueue* queue, const GpuBlendDesc& desc);
+GpuBlendState* gpuCreateBlendState(GpuQueue* queue, NOAPI_CONST_REF(GpuBlendDesc) desc);
 
 /**
  * gpuFreeDepthStencilState – Release a GpuDepthStencilState object.
@@ -544,7 +632,7 @@ void gpuSetBlendState(GpuCommandBuffer* cmd, const GpuBlendState* state);
  * @param depth_min Minimum depth range value (default: 0).
  * @param depth_max Maximum depth range value (default: 1).
  */
-void gpuSetViewportEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin = {0, 0}, float depth_min = 0, float depth_max = 1);
+void gpuSetViewportEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin NOAPI_DEFAULT({0, 0}), float depth_min NOAPI_DEFAULT(0), float depth_max NOAPI_DEFAULT(1));
 
 /**
  * gpuSetScissorRectEXT – Set the scissor rectangle that clips rasterizer output.
@@ -556,7 +644,7 @@ void gpuSetViewportEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin = {0, 0
  * @param extent Width and height of the scissor rectangle in pixels.
  * @param origin Top-left corner of the scissor rectangle in pixels (default: {0, 0}).
  */
-void gpuSetScissorRectEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin = {0, 0});
+void gpuSetScissorRectEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin NOAPI_DEFAULT({0, 0}));
 
 // ---------------------------------------------------------------------------
 // GPU commands – render passes
@@ -577,7 +665,7 @@ void gpuSetScissorRectEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin = {0
  * @param cmd Command buffer to record into.
  * @param desc Render target attachments and their load/store behavior.
  */
-void gpuBeginRenderPass(GpuCommandBuffer* cmd, const GpuRenderPassDesc& desc);
+void gpuBeginRenderPass(GpuCommandBuffer* cmd, NOAPI_CONST_REF(GpuRenderPassDesc) desc);
 
 /**
  * gpuEndRenderPass – End the current render pass and trigger (on TBDR GPUs) tile
@@ -590,7 +678,7 @@ void gpuBeginRenderPass(GpuCommandBuffer* cmd, const GpuRenderPassDesc& desc);
  * @param cmd The command buffer to bind against.
  * @param desc (optionally) the same render pass descriptor that was passed to gpuBeginRenderPass (transitions the images to a more optimal presentation layout if provided)
  */
-void gpuEndRenderPass(GpuCommandBuffer* cmd, std::optional<const GpuRenderPassDesc> desc = {});
+void gpuEndRenderPass(GpuCommandBuffer* cmd, GpuOptionalRenderPassDesc desc NOAPI_DEFAULT({}));
 
 // ---------------------------------------------------------------------------
 // GPU commands – rasterizer draw calls
@@ -614,12 +702,12 @@ void gpuEndRenderPass(GpuCommandBuffer* cmd, std::optional<const GpuRenderPassDe
  * @param index_type expected type of the bound indices
  * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  * @param no_index_buffer_changes When true reuses the last value in interal index buffer (skips copying any changed indices)
- * 
+ *
  */
 void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd,
  gpu* vertex_data, gpu* fragment_data,
- gpu* indices, uint32_t index_count, uint32_t instance_count, 
- INDEX_TYPE_EXT index_type = INDEX_TYPE_UINT32, bool no_offsets = false, bool no_index_buffer_changes = false);
+ gpu* indices, uint32_t index_count, uint32_t instance_count,
+ INDEX_TYPE_EXT index_type NOAPI_DEFAULT(INDEX_TYPE_UINT32), bool no_offsets NOAPI_DEFAULT(false), bool no_index_buffer_changes NOAPI_DEFAULT(false));
 
 /**
  * gpuDrawIndexedInstancedIndirect – GPU-driven indexed instanced draw. Reads the
@@ -641,8 +729,8 @@ void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd,
  */
 void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd,
  gpu* vertex_data, gpu* fragment_data,
- gpu* indices, gpu* args, 
- INDEX_TYPE_EXT index_type = INDEX_TYPE_UINT32, bool no_offsets = false, bool no_index_buffer_changes = false);
+ gpu* indices, gpu* args,
+ INDEX_TYPE_EXT index_type NOAPI_DEFAULT(INDEX_TYPE_UINT32), bool no_offsets NOAPI_DEFAULT(false), bool no_index_buffer_changes NOAPI_DEFAULT(false));
 
 // TODO: Why does this one not take an index buffer?
 // /**
@@ -670,7 +758,7 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd,
 // void gpuDrawIndexedInstancedIndirectMulti(GpuCommandBuffer* cmd,
 //  gpu* dataVxGpu, uint32_t vxStride,
 //  gpu* dataPxGpu, uint32_t pxStride,
-//  gpu* argsGpu, gpu* drawCountGpu, 
+//  gpu* argsGpu, gpu* drawCountGpu,
 //  INDEX_TYPE_EXT index_type = INDEX_TYPE_UINT32, bool no_offsets = false, bool no_index_buffer_changes = false);
 
 /**
@@ -687,7 +775,7 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd,
  * @param dim Thread group grid dimensions (typically x = meshlet count).
  */
 void gpuDrawMeshlets(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, uvec3 dim);
-// 
+//
 
 /**
  * gpuDrawMeshletsIndirect – GPU-driven mesh shader dispatch. Reads the thread
@@ -702,4 +790,6 @@ void gpuDrawMeshlets(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_dat
  * @param dim GPU pointer to a uvec3 containing group dimensions.
  * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, gpu* dim, bool no_offsets = false);
+void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, gpu* dim, bool no_offsets NOAPI_DEFAULT(false));
+
+NOAPI_EXTERN_C_END
