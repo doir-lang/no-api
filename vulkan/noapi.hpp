@@ -30,16 +30,6 @@ namespace GPU {
 	}
 }
 
-template<>
-struct std::hash<std::vector<GpuSamplerDesc>> {
-	size_t operator()(const std::vector<GpuSamplerDesc>& descs) const noexcept {
-		size_t out = 0;
-		for(auto& desc: descs)
-			out ^= desc.pack();
-		return out;
-	}
-};
-
 #define VK_CHECK(expr, RETURN) do {\
 	auto res = expr;\
 	if(res != VK_SUCCESS) {\
@@ -130,7 +120,7 @@ struct GpuQueue {
 	// Mapping from gpu* (Device Addresses) to an associated index buffer
 	std::unordered_map<VkDeviceAddress, std::tuple<VkBuffer, VmaAllocation, VkDeviceSize>> gpu2index;
 
-	std::unordered_map<std::vector<GpuSamplerDesc>, VkDeviceAddress> sampler_cache;
+	std::unordered_map<std::vector<GpuSamplerDesc>, VkDeviceAddress, GpuSamplerDescListHash> sampler_cache;
 
 	VkCommandPool command_pool = VK_NULL_HANDLE;
 	VkSemaphore command_submission_timeline_semaphore = VK_NULL_HANDLE;
@@ -146,10 +136,14 @@ struct GpuQueue {
 	std::array<VkSampler, 2> blit_samplers = {}; // indexed by "linear"
 	std::unordered_map<uint64_t, VkPipeline> blit_pipelines; // keyed by destination VkFormat
 	std::vector<VkDescriptorPool> blit_descriptor_pools;
-	// Sets and views are recycled (or destroyed) once the submission that referenced them has finished
+	// Sets are recycled once the submission that referenced them has finished
 	std::vector<VkDescriptorSet> blit_descriptor_sets_free;
 	std::vector<std::pair<VkDescriptorSet, uint64_t>> blit_descriptor_sets_in_flight;
-	std::vector<std::pair<VkImageView, uint64_t>> blit_views_in_flight;
+
+	// Image views handed to a render pass or to a blit, destroyed once the submission that
+	// referenced them has finished. Shared rather than blit specific because gpuBeginRenderPass
+	// builds one per attachment, which is what lets an attachment's mip level and slice be honored.
+	std::vector<std::pair<VkImageView, uint64_t>> views_in_flight;
 };
 GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue = VK_NULL_HANDLE, uint32_t queue_family = -1, bool is_graphics_queue = true, CpuAllocatorFunc allocator = default_::cpu_allocator, VkAllocationCallbacks* callbacks = nullptr);
 inline GpuQueue* gpuCreateQueue(const GpuVulkanDefault& vulkan, CpuAllocatorFunc allocator = default_::cpu_allocator, VkAllocationCallbacks* callbacks = nullptr) {
@@ -163,9 +157,12 @@ struct GpuPipeline {
 
 struct GpuTexture {
 	VkImage image;
-	VkImageView full_view;
+	VkImageView full_view; // Only a surface's own images keep one; render passes build their own
 	GpuTextureDesc descriptor;
 	VkSemaphore available_semaphore = VK_NULL_HANDLE;
+	// Where this backend last left the image. Tracked rather than assumed so that an attachment
+	// with LOAD_OP_LOAD can be transitioned without discarding what is already in it.
+	VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
 
 struct GpuCommandBuffer {

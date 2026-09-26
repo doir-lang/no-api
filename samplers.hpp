@@ -6,6 +6,7 @@
 
 #include "graphics.hpp"
 #include <cstdint>
+#include <vector>
 
 /**
  * ADDRESS_MODE – Texture coordinate wrapping mode applied when sampling
@@ -61,11 +62,15 @@ struct GpuSamplerDesc {
 	}
 
 	/**
-	 * max_packed – Upper bound on the value returned by pack() for a
-	 * default-constructed GpuSamplerDesc, useful for sizing lookup tables.
+	 * max_packed – Largest value pack() can produce, useful for sizing lookup tables
+	 * indexed by it (which need max_packed() + 1 entries).
+	 *
+	 * Derived from pack()'s bit layout — three 2 bit address modes followed by three 1 bit
+	 * filters — rather than from the largest enumerators that happen to exist today, so
+	 * that adding an addressing or filtering mode cannot silently undersize a table.
 	 */
 	constexpr static uint16_t max_packed() {
-		return GpuSamplerDesc{}.pack();
+		return 0b1'1'1'11'11'11;
 	}
 };
 
@@ -95,6 +100,29 @@ struct std::hash<GpuSamplerDesc> {
 constexpr bool operator==(const GpuSamplerDesc& a, const GpuSamplerDesc& b) noexcept {
 	return a.pack() == b.pack();
 }
+
+// The bit widths pack() (and thus max_packed()) assumes. A new mode past these has to widen
+// the packing before it can be stored.
+static_assert(ADDRESS_MODE_REPEAT <= 0b11, "pack() gives each address mode two bits");
+static_assert(FILTER_LINEAR <= 0b1, "pack() gives each filter one bit");
+
+/**
+ * GpuSamplerDescListHash – Hashes the list of samplers enabled by gpuSetEnabledSamplersEXT so
+ * that it can be used as a cache key.
+ *
+ * Order matters: a description's position in the list is the sampler slot it lands in, so two
+ * orderings of the same descriptions are different sets. Lives here, named, rather than as a
+ * std::hash specialization in each backend's header — those would be two different definitions
+ * of one symbol, which is an ODR violation the moment both backends end up in the same binary.
+ */
+struct GpuSamplerDescListHash {
+	size_t operator()(const std::vector<GpuSamplerDesc>& descs) const noexcept {
+		size_t out = descs.size();
+		for(auto& desc: descs)
+			out = out * 31 + desc.pack();
+		return out;
+	}
+};
 
 /**
  * gpuSetEnabledSamplersEXT – Declare the fixed set of samplers available to

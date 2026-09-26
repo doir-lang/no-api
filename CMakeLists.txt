@@ -1,6 +1,16 @@
 cmake_minimum_required(VERSION 3.21)
 project(NoAPI CXX C)
 
+# A gpu* is a device address carrying a 3 bit monobuffer tag above a 61 bit offset (see
+# gpuEncodeWebGPUAddressEXT), and the generated WGSL reads one as a vec2<u32>, so the host pointer it
+# is stored in has to be 64 bits wide. wasm32 would silently truncate the tag away and leave every
+# root data struct half the size its shader expects, so the web build targets wasm64. Everything
+# linked in has to agree, hence the directory wide flags rather than per target ones.
+if(EMSCRIPTEN)
+	add_compile_options(-sMEMORY64=1)
+	add_link_options(-sMEMORY64=1)
+endif()
+
 # A generator expression is no use here: option() wants a plain constant
 if(EMSCRIPTEN)
 	option(NOAPI_ENABLE_VULKAN "Enable the Vulkan backend" OFF)

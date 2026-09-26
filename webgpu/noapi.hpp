@@ -19,18 +19,6 @@
 
 #include <webgpu/webgpu.h>
 
-// Lets the list of samplers enabled by gpuSetEnabledSamplersEXT be used as a cache key.
-// Order matters: the position of a description in the list is the sampler slot it lands in.
-template<>
-struct std::hash<std::vector<GpuSamplerDesc>> {
-	size_t operator()(const std::vector<GpuSamplerDesc>& descs) const noexcept {
-		size_t out = descs.size();
-		for(auto& desc: descs)
-			out = out * 31 + desc.pack();
-		return out;
-	}
-};
-
 namespace GPU {
 #ifdef __cpp_lib_function_ref
 	template<typename T>
@@ -83,6 +71,11 @@ struct GpuQueue {
 	WGPUComputePipeline semaphore_set_max_pipeline = nullptr;
 
 	size_t next_submission_index = 1;
+	// The highest submission index the queue has reported finished, kept up to date by the
+	// wgpuQueueOnSubmittedWorkDone callback gpuSubmitNoFree registers. Reclaiming deferred deletes
+	// reads this instead of the timeline semaphore, which would mean a blocking readback (see
+	// GPU::process_pending_code).
+	size_t last_finished_submission = 0;
 	GpuSemaphore current_submission_timeline_semaphore;
 
 	// Group 0 has to fit inside maxStorageBuffersPerShaderStage, whose guaranteed minimum is 8.
@@ -98,7 +91,7 @@ struct GpuQueue {
 	struct MonobufferRange {
 		uint8_t buffer;
 		uint32_t start, end;
-		size_t size() { return end - start; }
+		size_t size() const { return end - start; }
 	};
 	std::unordered_map<gpu*, std::tuple<MonobufferRange, void*, MEMORY>> allocations;
 	std::unordered_map<void*, gpu*> cpu2gpu;
@@ -205,7 +198,7 @@ struct GpuQueue {
 		// a fixed size and gets written once, when the set is built.
 		WGPUBuffer lookup_buffer = nullptr;
 	};
-	std::unordered_map<std::vector<GpuSamplerDesc>, SamplerSet> sampler_cache;
+	std::unordered_map<std::vector<GpuSamplerDesc>, SamplerSet, GpuSamplerDescListHash> sampler_cache;
 	SamplerSet* default_sampler_set = nullptr; // What a command buffer gets when it never enables any
 
 	WGPUBindGroupLayout current_compute_bind_group_layout0 = nullptr; // 0 == buffers

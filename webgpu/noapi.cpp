@@ -317,8 +317,18 @@ fn cs_set_max() {
 
 
 	// Processess all of the pending code snippets associated with already finished submissions
+	// Runs whatever was deferred until the submission that still needed it finished. Reading the
+	// timeline semaphore here would mean a blocking buffer readback, and in the browser blocking means
+	// unwinding to the event loop: a frame that did that between acquiring the presentable texture and
+	// submitting would resume in a later task, by which point the canvas texture has expired. So this
+	// leans on the submission index gpuSubmitNoFree's completion callback publishes, which costs
+	// nothing and never yields. The callback only arrives while the instance is being pumped, which is
+	// what the browser does between frames and what wgpuDeviceTick does natively.
 	inline void process_pending_code(GpuQueue* queue) {
-		auto current_finished_submission = GPU::semaphore_value(queue, queue->current_submission_timeline_semaphore);
+#ifndef __EMSCRIPTEN__
+		wgpuDeviceTick(queue->device);
+#endif
+		auto current_finished_submission = queue->last_finished_submission;
 		if(queue->code_pending_submission_finished.size())
 			for(size_t i = queue->code_pending_submission_finished.size(); i--; ) {
 				auto& [code, submit] = queue->code_pending_submission_finished[i];
@@ -430,8 +440,12 @@ fn cs_set_max() {
 		case FORMAT_R8_UINT: return WGPUTextureFormat_R8Uint;
 		case FORMAT_R8_SINT: return WGPUTextureFormat_R8Sint;
 
+		// The 16-bit normalized formats come from Dawn's unorm16/snorm16 extensions; emdawnwebgpu
+		// doesn't expose them, so on the web they fall through to WGPUTextureFormat_Undefined
+#ifndef __EMSCRIPTEN__
 		case FORMAT_R16_UNORM: return WGPUTextureFormat_R16Unorm;
 		case FORMAT_R16_SNORM: return WGPUTextureFormat_R16Snorm;
+#endif
 		case FORMAT_R16_UINT: return WGPUTextureFormat_R16Uint;
 		case FORMAT_R16_SINT: return WGPUTextureFormat_R16Sint;
 		case FORMAT_R16_FLOAT: return WGPUTextureFormat_R16Float;
@@ -443,8 +457,10 @@ fn cs_set_max() {
 		case FORMAT_R32_UINT: return WGPUTextureFormat_R32Uint;
 		case FORMAT_R32_SINT: return WGPUTextureFormat_R32Sint;
 		case FORMAT_R32_FLOAT: return WGPUTextureFormat_R32Float;
+#ifndef __EMSCRIPTEN__
 		case FORMAT_RG16_UNORM: return WGPUTextureFormat_RG16Unorm;
 		case FORMAT_RG16_SNORM: return WGPUTextureFormat_RG16Snorm;
+#endif
 		case FORMAT_RG16_UINT: return WGPUTextureFormat_RG16Uint;
 		case FORMAT_RG16_SINT: return WGPUTextureFormat_RG16Sint;
 		case FORMAT_RG16_FLOAT: return WGPUTextureFormat_RG16Float;
@@ -464,8 +480,10 @@ fn cs_set_max() {
 		case FORMAT_RG32_UINT: return WGPUTextureFormat_RG32Uint;
 		case FORMAT_RG32_SINT: return WGPUTextureFormat_RG32Sint;
 		case FORMAT_RG32_FLOAT: return WGPUTextureFormat_RG32Float;
+#ifndef __EMSCRIPTEN__
 		case FORMAT_RGBA16_UNORM: return WGPUTextureFormat_RGBA16Unorm;
 		case FORMAT_RGBA16_SNORM: return WGPUTextureFormat_RGBA16Snorm;
+#endif
 		case FORMAT_RGBA16_UINT: return WGPUTextureFormat_RGBA16Uint;
 		case FORMAT_RGBA16_SINT: return WGPUTextureFormat_RGBA16Sint;
 		case FORMAT_RGBA16_FLOAT: return WGPUTextureFormat_RGBA16Float;
@@ -517,8 +535,11 @@ fn cs_set_max() {
 		case WGPUTextureFormat_R8Uint: return FORMAT_R8_UINT;
 		case WGPUTextureFormat_R8Sint: return FORMAT_R8_SINT;
 
+		// Dawn-only 16-bit normalized formats; see format2wgpu
+#ifndef __EMSCRIPTEN__
 		case WGPUTextureFormat_R16Unorm: return FORMAT_R16_UNORM;
 		case WGPUTextureFormat_R16Snorm: return FORMAT_R16_SNORM;
+#endif
 		case WGPUTextureFormat_R16Uint: return FORMAT_R16_UINT;
 		case WGPUTextureFormat_R16Sint: return FORMAT_R16_SINT;
 		case WGPUTextureFormat_R16Float: return FORMAT_R16_FLOAT;
@@ -530,8 +551,10 @@ fn cs_set_max() {
 		case WGPUTextureFormat_R32Uint: return FORMAT_R32_UINT;
 		case WGPUTextureFormat_R32Sint: return FORMAT_R32_SINT;
 		case WGPUTextureFormat_R32Float: return FORMAT_R32_FLOAT;
+#ifndef __EMSCRIPTEN__
 		case WGPUTextureFormat_RG16Unorm: return FORMAT_RG16_UNORM;
 		case WGPUTextureFormat_RG16Snorm: return FORMAT_RG16_SNORM;
+#endif
 		case WGPUTextureFormat_RG16Uint: return FORMAT_RG16_UINT;
 		case WGPUTextureFormat_RG16Sint: return FORMAT_RG16_SINT;
 		case WGPUTextureFormat_RG16Float: return FORMAT_RG16_FLOAT;
@@ -551,8 +574,10 @@ fn cs_set_max() {
 		case WGPUTextureFormat_RG32Uint: return FORMAT_RG32_UINT;
 		case WGPUTextureFormat_RG32Sint: return FORMAT_RG32_SINT;
 		case WGPUTextureFormat_RG32Float: return FORMAT_RG32_FLOAT;
+#ifndef __EMSCRIPTEN__
 		case WGPUTextureFormat_RGBA16Unorm: return FORMAT_RGBA16_UNORM;
 		case WGPUTextureFormat_RGBA16Snorm: return FORMAT_RGBA16_SNORM;
+#endif
 		case WGPUTextureFormat_RGBA16Uint: return FORMAT_RGBA16_UINT;
 		case WGPUTextureFormat_RGBA16Sint: return FORMAT_RGBA16_SINT;
 		case WGPUTextureFormat_RGBA16Float: return FORMAT_RGBA16_FLOAT;
@@ -967,6 +992,9 @@ namespace GPU::detail {
 	inline GpuQueue::SamplerSet* ensure_sampler_set(GpuQueue* queue, std::span<const GpuSamplerDesc> requested) {
 		// One slot is spent on the default sampler, so the caller gets the rest
 		assert(requested.size() < gpu_sampler_slot_count && "More samplers enabled at once than there are sampler slots");
+		// The assert is gone in a release build, where the clamp below would otherwise hand every
+		// sampler past the last slot the default sampler without a word about it
+		if(requested.size() >= gpu_sampler_slot_count) errno = WGPUErrorType_Validation;
 		auto count = std::min<size_t>(requested.size(), gpu_sampler_slot_count - 1);
 
 		std::vector<GpuSamplerDesc> enabled(count + 1, GpuSamplerDesc{});
@@ -1153,6 +1181,12 @@ void update_pipeline_layouts(GpuQueue* queue) {
 }
 
 
+
+// gpuEncodeWebGPUAddressEXT packs a monobuffer tag above a 61 bit offset and hands the result back as
+// a gpu*, and the prologue below has the shader read that pointer as a vec2<u32>. A narrower host
+// pointer would truncate the tag away and leave every root data struct half the size its shader
+// expects, so the web build is compiled for wasm64 (see -sMEMORY64 in the top level CMakeLists).
+static_assert(sizeof(gpu*) == sizeof(uint64_t), "A gpu* has to be 64 bits wide to carry a device address");
 
 constexpr static uint64_t gpu_address_max = 0x1FFFFFFFFFFFFFFF; // (2^61 - 1) aka max number storable in 60 bits
 // A gpu pointer reaches WGSL as a vec2<u32>, so the shader works with the halves of those: the bits of
@@ -1540,7 +1574,10 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 
 		// If we find a free space big enough for the allocation... use that
 		auto aligned = align_up(start, align);
-		if(end - aligned > bytes) {
+		// >= rather than >, so a hole the allocation exactly fills is still reused. The first half
+		// of the test matters because aligning up can walk past the end of a small hole, which
+		// would otherwise wrap around into a very large unsigned size.
+		if(aligned <= end && size_t(end) - aligned >= bytes) {
 			start = aligned + bytes;
 			return allocation_bookkeeping(queue, active_buffer, aligned, bytes, memory);
 		}
@@ -2171,6 +2208,32 @@ uint64_t gpuSubmitNoFree(GpuQueue* queue, std::span<GpuCommandBuffer*> command_b
 
 	wgpuQueueSubmit(queue->queue, buffers.size(), buffers.data());
 
+	// Publishes this submission's index once the queue is done with it, so that
+	// GPU::process_pending_code can tell what is safe to reclaim without reading the timeline
+	// semaphore back. The index travels in userdata rather than a capture because the callback is a
+	// plain function pointer; a gpu* is 64 bits wide on every target this backend builds for (see the
+	// static_assert above gpu_address_max), so a submission index fits in one.
+	wgpuQueueOnSubmittedWorkDone(
+		queue->queue,
+		WGPUQueueWorkDoneCallbackInfo {
+			.mode = WGPUCallbackMode_AllowSpontaneous,
+#ifdef __EMSCRIPTEN__
+			.callback = [](WGPUQueueWorkDoneStatus status, WGPU_NULLABLE void* userdata1, WGPU_NULLABLE void* userdata2) {
+#else
+			.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView message, WGPU_NULLABLE void* userdata1, WGPU_NULLABLE void* userdata2) {
+#endif
+				auto queue = static_cast<GpuQueue*>(userdata1);
+				auto finished = reinterpret_cast<size_t>(userdata2);
+				// Completion callbacks can arrive out of order, and an older one must not walk the
+				// mark backwards over deletes a newer one already released
+				if(finished > queue->last_finished_submission)
+					queue->last_finished_submission = finished;
+			},
+			.userdata1 = queue,
+			.userdata2 = reinterpret_cast<void*>(queue->next_submission_index)
+		}
+	);
+
 	for(auto buffer: command_buffers)
 		for(auto code: buffer->code_pending_submission_finished)
 			queue->code_pending_submission_finished.emplace_back(code, queue->next_submission_index);
@@ -2269,33 +2332,51 @@ void gpuFreeSemaphore(GpuQueue* queue, GpuSemaphore* semaphore) {
 
 
 namespace GPU::detail {
-	inline std::tuple<GpuQueue::MonobufferRange, ptrdiff_t, gpu*> closest_buffer(GpuQueue* queue, gpu* addr, bool no_offsets) {
-		gpu* closest = gpuEncodeWebGPUAddressEXT(queue->monobuffers.size() - 1, gpu_address_max - 1);
-		if(no_offsets)
-			closest = addr;
-		else for(auto [key, _]: queue->allocations) {
-			if(closest - addr > size_t(key - addr))
-				closest = key;
+	// Where a GPU address lives: the allocation holding it, how far into that allocation it sits,
+	// and the allocation's base (the key queue->allocations and gpu2textures use). The members are
+	// in that order so the existing `auto [range, offset, base]` call sites read unchanged.
+	struct BufferLocation {
+		GpuQueue::MonobufferRange range = {};
+		ptrdiff_t offset = 0;
+		gpu* base = nullptr; // Null when the address landed outside every allocation
+	};
+
+	// The allocation holding `addr` is the one whose base is the greatest at or below it and whose
+	// size actually reaches it — not, as this used to look for, the nearest base at or *above* it,
+	// which resolved every interior pointer to the next allocation along and handed back a negative
+	// offset. no_offsets promises the address is already a base, which skips the search.
+	//
+	// An address encodes its monobuffer in its top bits, so ordering addresses as integers orders
+	// them by (monobuffer, offset), which is exactly what this walk wants.
+	//
+	// Nothing here inserts into `allocations`: an address belonging to no allocation comes back
+	// null rather than quietly adding an empty entry that the next search would then find.
+	inline BufferLocation closest_buffer(GpuQueue* queue, gpu* addr, bool no_offsets) {
+		if(no_offsets) {
+			auto found = queue->allocations.find(addr);
+			assert(found != queue->allocations.end() && "no_offsets promises an address that is an allocation base");
+			if(found == queue->allocations.end()) return {};
+			return {std::get<GpuQueue::MonobufferRange>(found->second), 0, addr};
 		}
-		return {std::get<GpuQueue::MonobufferRange>(queue->allocations[closest]), closest - addr, closest};
+
+		BufferLocation out;
+		auto address = (uintptr_t)addr;
+		for(const auto& [key, allocation]: queue->allocations) {
+			auto base = (uintptr_t)key;
+			if(base > address) continue; // Starts past the address, so it can't be holding it
+
+			const auto& range = std::get<GpuQueue::MonobufferRange>(allocation);
+			if(address - base >= range.size()) continue; // Ends before it
+			if(out.base && base < (uintptr_t)out.base) continue; // Something tighter was found already
+
+			out = {range, ptrdiff_t(address - base), key};
+		}
+		assert(out.base && "The address doesn't lie inside any allocation");
+		return out;
 	}
 
-	inline std::array<std::tuple<GpuQueue::MonobufferRange, ptrdiff_t, gpu*>, 2> closest_buffer(GpuQueue* queue, gpu* addrA, gpu* addrB, bool no_offsets) {
-		auto last_monobuffer = queue->monobuffers.size() - 1;
-		gpu* closestA = gpuEncodeWebGPUAddressEXT(last_monobuffer, gpu_address_max - 1), *closestB = gpuEncodeWebGPUAddressEXT(last_monobuffer, gpu_address_max - 1); // TODO: There are probably edge cases around setting these to zero!
-		if(no_offsets) {
-			closestA = addrA;
-			closestB = addrB;
-		} else for(auto [key, _]: queue->allocations) {
-			if(closestA - addrA > size_t(key - addrA))
-				closestA = key;
-			if(closestB - addrB > size_t(key - addrB))
-				closestB = key;
-		}
-		return {
-			std::tuple<GpuQueue::MonobufferRange, ptrdiff_t, gpu*>{std::get<GpuQueue::MonobufferRange>(queue->allocations[closestA]), closestA - addrA, closestA},
-			std::tuple<GpuQueue::MonobufferRange, ptrdiff_t, gpu*>{std::get<GpuQueue::MonobufferRange>(queue->allocations[closestB]), closestB - addrB, closestB}
-		};
+	inline std::array<BufferLocation, 2> closest_buffer(GpuQueue* queue, gpu* addrA, gpu* addrB, bool no_offsets) {
+		return {closest_buffer(queue, addrA, no_offsets), closest_buffer(queue, addrB, no_offsets)};
 	}
 }
 
@@ -3376,7 +3457,11 @@ void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSur
 	// name a texture that lives in one. Asking for USAGE_SAMPLED is still worth it where the surface
 	// supports it, because gpuBlitTextureEXT binds its source view directly rather than through the
 	// heap, which makes a presented frame readable that way.
-	auto usage = (GPU::usage2wgpu(texture.usage) | WGPUTextureUsage_RenderAttachment) & caps.usages;
+	// emdawnwebgpu's wgpuSurfaceGetCapabilities never fills usages in, so a zero there means "not
+	// reported" rather than "nothing supported" — masking against it would configure the surface with
+	// no usage at all, which WebGPU rejects
+	auto supported_usages = caps.usages ? caps.usages : WGPUTextureUsage(WGPUTextureUsage_RenderAttachment);
+	auto usage = (GPU::usage2wgpu(texture.usage) | WGPUTextureUsage_RenderAttachment) & supported_usages;
 
 	WGPUSurfaceConfiguration config {
 		.device = queue->device,
