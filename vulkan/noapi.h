@@ -99,9 +99,16 @@ bool gpuSetupDefaultVulkanEXT(GpuVulkanSurfaceLoaderEXT surface_loader, void* su
 /**
  * gpuEnableRequiredVulkanFeaturesEXT – Turns on the core features this backend needs in a
  * feature struct of your own, so that a hand rolled device creation enables them too.
+ *
+ * shaderStorageImageWriteWithoutFormat is what gpuStoreTexture costs: a shader reaches a
+ * texture by a heap index, so the format of the one it is writing is not knowable where the
+ * image is declared, and an unformatted storage image write is the feature that covers exactly
+ * that. Its read counterpart is not asked for, and gpuStoreTexture has no load beside it,
+ * because shaderStorageImageReadWithoutFormat is a feature devices in circulation decline.
  */
 NOAPI_INLINE VkPhysicalDeviceFeatures gpuEnableRequiredVulkanFeaturesEXT(VkPhysicalDeviceFeatures features) {
 	features.shaderInt64 = true;
+	features.shaderStorageImageWriteWithoutFormat = true;
 	return features;
 }
 

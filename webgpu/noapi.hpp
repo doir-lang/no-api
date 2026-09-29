@@ -173,6 +173,9 @@ struct GpuQueue {
 	std::unordered_map<TextureHash, size_t, TextureHash::Hasher> storage_monotextures_lookup;
 	std::vector<std::tuple<uint32_t, WGPUTexture, WGPUTextureView, TextureHash>> sampled_monotextures;
 	std::unordered_map<TextureHash, size_t, TextureHash::Hasher> sampled_monotextures_lookup;
+	// The single mip level views the current group 1 binds the storage monotextures through, which
+	// are not the whole chain views above; see update_pipeline_layouts. Released with that group.
+	std::vector<WGPUTextureView> current_storage_views;
 
 	struct MonotextureRange {
 		const static MonotextureRange INVALID; // = {-1, -1, -1}
@@ -202,12 +205,25 @@ struct GpuQueue {
 		}
 	};
 	std::vector<MonotextureRange> texture_freelist;
+	// The monotextures every texture has been freed out of, keyed the way a MonotextureRange's
+	// _index is (storage flag in the top bit, index in the rest). One of these holds a 1x1 stand in
+	// rather than an atlas and no hash points at it any more, so gpuCreateTexture takes its slot
+	// over for the next monotexture that needs one; see collapse_monotexture_if_empty.
+	std::set<uint32_t> collapsed_monotextures;
 
 
-	WGPUBindGroupLayout current_bind_group_layout1 = nullptr; // 1 == storage textures
-	WGPUBindGroup current_bind_group1 = nullptr;
-	WGPUBindGroupLayout current_bind_group_layout2 = nullptr; // 2 == sampled textures
-	WGPUBindGroup current_bind_group2 = nullptr;
+	// 1 == storage textures and 2 == sampled ones, each in a compute flavor and a graphics one:
+	// no pass may have a texture bound as both at once, so the storage bindings are only ever in
+	// the first and the sampled views of those same monotextures only in the second. See
+	// update_pipeline_layouts.
+	WGPUBindGroupLayout current_compute_bind_group_layout1 = nullptr;
+	WGPUBindGroup current_compute_bind_group1 = nullptr;
+	WGPUBindGroupLayout current_graphics_bind_group_layout1 = nullptr;
+	WGPUBindGroup current_graphics_bind_group1 = nullptr;
+	WGPUBindGroupLayout current_compute_bind_group_layout2 = nullptr;
+	WGPUBindGroup current_compute_bind_group2 = nullptr;
+	WGPUBindGroupLayout current_graphics_bind_group_layout2 = nullptr;
+	WGPUBindGroup current_graphics_bind_group2 = nullptr;
 	WGPUBindGroupLayout current_bind_group_layout3 = nullptr; // 3 == samplers
 
 	// Everything gpuSetEnabledSamplersEXT produces for one list of enabled samplers. It is cached per

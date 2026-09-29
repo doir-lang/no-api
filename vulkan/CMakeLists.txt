@@ -56,6 +56,7 @@ target_link_libraries(noapi-vulkan PUBLIC
 	glslang::SPIRV
 )
 set_target_properties(noapi-vulkan PROPERTIES CXX_STANDARD 26)
+noapi_enable_lto(noapi-vulkan)
 target_include_directories(noapi-vulkan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # Lets anything linking this backend (rather than the other one) pick its shading language and its
 # windowing/instance glue at compile time

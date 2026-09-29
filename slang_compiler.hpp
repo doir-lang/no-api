@@ -71,7 +71,10 @@ constexpr inline bool is_graphics(SHADER_STAGE stage) { return stage != SHADER_S
  * GPU_COMPUTE / GPU_GRAPHICS select which root data accessors exist, and GPU_STORES says
  * whether writes are reachable at all — they are not from a WebGPU graphics stage, where
  * the monobuffers are bound read only, so a pointer there has no setter and `p[i] = v`
- * fails to compile rather than silently going nowhere.
+ * fails to compile rather than silently going nowhere. GPU_TEXTURE_STORES says the same of
+ * gpuStoreTexture, separately, because the two are not limited by the same thing: WebGPU
+ * also binds a storage texture to a compute pass and not to a render one, since no pass may
+ * have a texture bound as writable and as sampled at once.
  */
 constexpr static const char* PORTABLE_MODULE = R"slang(
 module noapi;
@@ -496,6 +499,33 @@ public float4 gpuSample(uint heap_index, uint slot, float3 uv, uint layer, float
 public float4 gpuSample2D(uint heap_index, uint slot, float2 uv) {
 	return gpuBackendSample(heap_index, slot, float3(uv, 0.0), 0u, 0.0);
 }
+
+/**
+ * gpuStoreTexture – Write one texel of the texture at `heap_index` in the active texture
+ * heap, which has to be a read/write entry (gpuRWTextureViewDescriptor of a texture created
+ * with USAGE_STORAGE) rather than the sampled kind gpuSample takes.
+ *
+ * `texel` is a texel coordinate in the mip the entry describes, not a normalized one, and
+ * `layer` is relative to that entry the way gpuSample's is. A coordinate outside the texture
+ * is dropped, not wrapped, whatever addressing mode anything else is sampling it with: a
+ * sampler is not involved in a store.
+ *
+ * Write only, with no matching load, because the two are not equally portable: writing an
+ * image whose format the shader never named costs a Vulkan feature every device offers
+ * (shaderStorageImageWriteWithoutFormat), and reading one costs a second feature that real
+ * devices decline. A shader that needs its own output back reads it through a sampled entry
+ * after a barrier.
+ */
+#if GPU_TEXTURE_STORES
+public void gpuStoreTexture(uint heap_index, uint3 texel, uint layer, float4 value) {
+	gpuBackendStoreTexture(heap_index, texel, layer, value);
+}
+
+/// gpuStoreTexture for the common case: a 2D texture, layer 0.
+public void gpuStoreTexture2D(uint heap_index, uint2 texel, float4 value) {
+	gpuBackendStoreTexture(heap_index, uint3(texel, 0u), 0u, value);
+}
+#endif
 )slang";
 
 // ---------------------------------------------------------------------------

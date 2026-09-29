@@ -1,19 +1,3 @@
-// ---------------------------------------------------------------------------
-// C Compatibility Test
-// ---------------------------------------------------------------------------
-
-/**
- * Compiled as C and linked into the test executable, so that a header which stops parsing
- * as C — or an entry point whose C declaration no longer matches the symbol the C++ library
- * exports — breaks the build rather than being discovered by whoever tries to use the API
- * from C.
- *
- * Nothing in here is meant to run: noapi_c_compat_api is never called, it exists so that
- * the compiler has to accept every declaration and the linker has to resolve every name.
- * noapi_c_compat_packed_default_sampler is called by the test, which checks that C and C++
- * pack a sampler description the same way.
- */
-
 #include <string.h>
 
 #ifdef NOAPI_BACKEND_VULKAN
@@ -22,7 +6,6 @@
 	#include <webgpu/noapi.h>
 #endif
 
-// A dispatch's worth of nothing. The pipeline is never created, so the language doesn't matter.
 static const char shader_ir[] = "// not a shader";
 
 uint16_t noapi_c_compat_packed_default_sampler(void) {
@@ -30,14 +13,12 @@ uint16_t noapi_c_compat_packed_default_sampler(void) {
 	return gpuSamplerDescPackEXT(desc);
 }
 
-// The diagnostic hook, as a C function pointer, so its signature is checked too
 static void noapi_c_compat_diagnostic(GpuQueue* queue, GPU_DIAGNOSTIC kind, GpuStringView message, void* userdata) {
 	(void)queue; (void)kind; (void)message; (void)userdata;
 }
 
 void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data);
 void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data) {
-	// Capabilities and diagnostics
 	GpuCapabilities capabilities = gpuGetCapabilitiesEXT(queue);
 	(void)capabilities.mesh_shaders;
 	(void)capabilities.split_barrier_signals;
@@ -47,14 +28,12 @@ void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data) {
 	(void)capabilities.texture_descriptor_stride_ratio;
 	gpuSetDiagnosticCallbackEXT(queue, noapi_c_compat_diagnostic, NULL);
 
-	// Memory
 	void* host = gpuMalloc(queue, 1024, 16, MEMORY_DEFAULT);
 	void* heap_memory = gpuMalloc(queue, 1024, 64, MEMORY_DESCRIPTOR_HEAP);
 	(void)heap_memory;
 	gpu* device = gpuHostToDevicePointer(queue, host);
 	void* mapped = gpuDeviceToHostPointerEXT(queue, device);
 
-	// Textures
 	GpuTextureDesc texture_desc = GPU_TEXTURE_DESC_DEFAULT;
 	texture_desc.dimensions.x = 256;
 	texture_desc.dimensions.y = 256;
@@ -69,7 +48,6 @@ void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data) {
 	GpuTextureDescriptor sampled = gpuTextureViewDescriptor(queue, texture, &view_desc);
 	GpuTextureDescriptor storage = gpuRWTextureViewDescriptor(queue, texture, &view_desc);
 
-	// Pipelines
 	GpuByteSpan ir;
 	ir.ptr = shader_ir;
 	ir.count = sizeof(shader_ir) - 1;
@@ -88,11 +66,8 @@ void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data) {
 
 	GpuPipeline* graphics = gpuCreateGraphicsPipeline(queue, ir, ir, &raster);
 
-	// Optional, so null is one of the answers this is allowed to give; nothing here runs, so only
-	// the declaration is being checked either way
 	GpuPipeline* meshlet = gpuCreateGraphicsMeshletPipeline(queue, ir, ir, &raster);
 
-	// Dynamic state
 	GpuDepthStencilDesc depth_desc = GPU_DEPTH_STENCIL_DESC_DEFAULT;
 	depth_desc.depthMode = DEPTH_READ | DEPTH_WRITE;
 	depth_desc.depthTest = OP_LESS_EQUAL;
@@ -101,7 +76,6 @@ void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data) {
 	GpuBlendDesc blend_desc = GPU_BLEND_DESC_DEFAULT;
 	GpuBlendState* blend = gpuCreateBlendState(queue, &blend_desc);
 
-	// Command recording
 	GpuCommandBuffer* cmd = gpuStartCommandRecording(queue);
 	uvec3 grid = {1, 1, 1};
 	uvec2 extent = {256, 256};
@@ -130,7 +104,6 @@ void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data) {
 	enabled_samplers.count = 2;
 	gpuSetEnabledSamplersEXT(cmd, enabled_samplers);
 
-	// Render pass
 	GpuColorAttachment color = GPU_COLOR_ATTACHMENT_DEFAULT;
 	color.texture = texture;
 	color.loadOp = LOAD_OP_CLEAR;
@@ -157,7 +130,6 @@ void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data) {
 	gpuDrawMeshletsIndirect(cmd, data, data, data);
 	gpuEndRenderPass(cmd, presented);
 
-	// Submission and synchronization
 	GpuSemaphore* semaphore = gpuCreateSemaphore(queue, 0);
 	GpuCommandBufferSpan buffers;
 	buffers.ptr = &cmd;
@@ -169,7 +141,6 @@ void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data) {
 	gpuSyncMemoryImmediateEXT(queue, data);
 	gpuWaitIdleEXT(queue);
 
-	// Presentation
 	GpuSurfaceCapabilities caps = gpuGetSurfaceCapabilitiesEXT(queue, surface);
 	GpuSurfaceDescriptor config = gpuSurfaceGetConfigurationEXT(surface);
 	if(caps.formatCount) config.texture.format = caps.formats[0];
@@ -223,7 +194,6 @@ void noapi_c_compat_backend(void) {
 		&vulkan, error, sizeof(error)))
 		return;
 
-	// The requirements a hand rolled device creation has to reproduce
 	VkPhysicalDeviceFeatures features;
 	VkPhysicalDeviceVulkan12Features features12;
 	memset(&features, 0, sizeof(features));
@@ -266,7 +236,6 @@ void noapi_c_compat_backend(void) {
 	desc.texture.usage = USAGE_COLOR_ATTACHMENT;
 	GpuSurface* surface = gpuCreateSurfaceEXT(queue, webgpu.surface, &desc);
 
-	// The gpu pointers shaders receive, taken apart and put back together
 	gpu* pointer = gpuEncodeWebGPUAddressEXT(0, 256);
 	GpuWebGPUAddressEXT decoded = gpuDecodeWebGPUAddressEXT(pointer);
 	gpu* again = gpuEncodeWebGPUAddressEXT(decoded.monobuffer, decoded.address);

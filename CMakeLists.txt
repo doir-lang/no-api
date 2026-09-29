@@ -38,6 +38,46 @@ if(NOT NOAPI_ENABLE_VULKAN AND NOT NOAPI_ENABLE_WEBGPU)
 endif()
 
 # ---------------------------------------------------------------------------
+# Link time optimization
+# ---------------------------------------------------------------------------
+
+# Optimized configurations only: an LTO link is slow enough to be felt on every rebuild, and it
+# inlines away the frames a debugger would otherwise have to step through.
+#
+# Turned on per target rather than through a directory wide CMAKE_INTERPROCEDURAL_OPTIMIZATION,
+# because everything vendored in here -- Slang, Dawn, glslang, vk-bootstrap -- arrives through
+# add_subdirectory and would inherit the setting. They are an order of magnitude more code than
+# this project, so they would dominate the build time, and Slang in particular is not built with
+# it upstream.
+option(NOAPI_ENABLE_LTO "Build the optimized configurations with link time optimization" ${PROJECT_IS_TOP_LEVEL})
+
+if(NOAPI_ENABLE_LTO)
+	include(CheckIPOSupported)
+	check_ipo_supported(RESULT NOAPI_LTO_SUPPORTED OUTPUT NOAPI_LTO_UNSUPPORTED_REASON)
+	if(NOT NOAPI_LTO_SUPPORTED)
+		message(STATUS "LTO was asked for but this toolchain does not support it: ${NOAPI_LTO_UNSUPPORTED_REASON}")
+	endif()
+endif()
+
+# noapi_enable_lto(<target>...)
+#
+# Marks each target for LTO in the optimized configurations, if it was both asked for and
+# supported. The per configuration properties are what makes this work under a multi config
+# generator, where there is no one build type to test against at configure time.
+function(noapi_enable_lto)
+	if(NOT NOAPI_LTO_SUPPORTED)
+		return()
+	endif()
+	foreach(target ${ARGN})
+		set_target_properties(${target} PROPERTIES
+			INTERPROCEDURAL_OPTIMIZATION_RELEASE ON
+			INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON
+			INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL ON
+		)
+	endforeach()
+endfunction()
+
+# ---------------------------------------------------------------------------
 # Slang
 # ---------------------------------------------------------------------------
 

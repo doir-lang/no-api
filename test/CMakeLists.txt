@@ -16,6 +16,7 @@ endif()
 if(NOAPI_DEFAULT_BACKEND STREQUAL "webgpu")
 	add_library(glfw3webgpu STATIC glfw3webgpu.c)
 	target_link_libraries(glfw3webgpu PUBLIC glfw noapi::noapi)
+	noapi_enable_lto(glfw3webgpu)
 
 	if (GLFW_BUILD_COCOA)
 		target_compile_definitions(glfw3webgpu PRIVATE _GLFW_COCOA)
@@ -44,12 +45,14 @@ endif()
 add_library(noapi-c-compat OBJECT c_compat.c)
 target_link_libraries(noapi-c-compat PRIVATE noapi::noapi)
 set_target_properties(noapi-c-compat PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+noapi_enable_lto(noapi-c-compat)
 
 # stb_image and tiny_obj_loader are header only, with their implementation halves behind a macro.
 # One object library turns each on exactly once for whichever tests load assets.
 add_library(noapi-test-loaders OBJECT loaders.cpp)
 target_include_directories(noapi-test-loaders PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(noapi-test-loaders PROPERTIES CXX_STANDARD 26)
+noapi_enable_lto(noapi-test-loaders)
 
 # The files the asset loading tests open at runtime. A native build reads them out of the source
 # tree, so TEST_ASSET_DIR points there; Emscripten has no filesystem to read them from, so they are
@@ -81,6 +84,7 @@ function(noapi_add_test name)
 	target_link_libraries(${name} PUBLIC glfw noapi::noapi)
 	target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 	set_target_properties(${name} PROPERTIES CXX_STANDARD 26)
+	noapi_enable_lto(${name})
 
 	if(TARGET glfw3webgpu)
 		target_link_libraries(${name} PUBLIC glfw3webgpu)
@@ -112,14 +116,16 @@ endfunction()
 
 noapi_add_test(0_basic C_COMPAT)
 noapi_add_test(1_texture ASSETS)
-noapi_add_test(2_pbr ASSETS)
+noapi_add_test(2_compute_texture)
 noapi_add_test(3_meshlet)
+noapi_add_test(4_pbr ASSETS)
+noapi_add_test(5_raytrace)
 
 if(EMSCRIPTEN)
 	add_custom_target(serve
 		COMMAND ${CMAKE_COMMAND} -E chdir ${CMAKE_BINARY_DIR} python3 -m http.server 8080
 		COMMENT "Web server has started on port 8080, press ctrl+c when you are finished"
-		DEPENDS 0_basic 1_texture 2_pbr 3_meshlet
+		DEPENDS 0_basic 1_texture 2_compute_texture 3_meshlet 4_pbr 5_raytrace
 		BYPRODUCTS ${CMAKE_BINARY_DIR}/server_started
 	)
 endif()

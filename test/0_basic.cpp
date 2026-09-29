@@ -31,17 +31,10 @@
 
 static const std::string slang_compute = R"slang(
 import noapi;
-import test_constants; // Registered by the program with gpuAddSlangModuleEXT
+import test_constants;
 
-// As many elements as the C++ side allocated. The dispatch covers a whole workgroup, so the
-// threads past the end have to be sent home rather than left to trample memory that was never
-// theirs.
 static const uint ELEMENT_COUNT = 5;
 
-// The root data struct the dispatch was handed: {float* upload, float* download}. Conforming it
-// to IGpuLoadable is what lets the shader read one in a single `*gpuComputeData<ComputeData>()`
-// -- the layout says how wide it is and how to walk it, and everything underneath is the one 32
-// bit load the backend provides.
 struct ComputeData : IGpuLoadable {
 	GpuPtr<float> upload;
 	GpuPtr<float> download;
@@ -49,7 +42,7 @@ struct ComputeData : IGpuLoadable {
 	static const uint gpuStride = 16;
 
 	static ComputeData gpuLoad(GpuAddress at) {
-		var from = GpuReader(at); // Walks the fields in order, so no offset is written down
+		var from = GpuReader(at);
 		ComputeData out;
 		out.upload = from.next<GpuPtr<float> >();
 		out.download = from.next<GpuPtr<float> >();
@@ -75,10 +68,6 @@ struct Varyings {
 	float3 color : COLOR;
 }
 
-// One entry of the vertex array, matching Vertex on the C++ side: five floats, {x, y, r, g, b}.
-// Nothing writes a vertex, so the layout is read only -- IGpuStorable and a gpuStore beside it
-// would be what a shader that writes one adds, and on a WebGPU graphics stage they could not
-// exist anyway, since the monobuffers are bound read only there.
 struct Vertex : IGpuLoadable {
 	float2 position;
 	float3 color;
@@ -96,7 +85,6 @@ struct Vertex : IGpuLoadable {
 
 [shader("vertex")]
 Varyings vertexMain(uint index : SV_VertexID) {
-	// The root data is one pointer, so the pointer to it is a pointer to a pointer
 	let vertices = *gpuVertexData<GpuPtr<Vertex> >();
 	let vertex = vertices[index];
 
@@ -106,7 +94,6 @@ Varyings vertexMain(uint index : SV_VertexID) {
 	return output;
 }
 
-// The fragment stage never touches the root data it was handed; it just interpolates
 [shader("fragment")]
 float4 fragmentMain(Varyings varyings) : SV_Target {
 	return float4(varyings.color, 1.0);
@@ -225,7 +212,6 @@ static void render_frame(AppState *state) {
 	auto cmd = gpuStartCommandRecording(state->queue);
 	gpuBeginRenderPass(cmd, pass);
 	gpuSetPipeline(cmd, state->pipeline);
-	// The same root data serves both stages; the fragment shader simply never reads it
 	gpuDrawIndexedInstanced(cmd, state->triangle, state->triangle, state->indices, 3, 1);
 	gpuEndRenderPass(cmd, pass);
 
@@ -266,8 +252,6 @@ int real_main() {
 	glfwSetWindowUserPointer(state.window, &state);
 	glfwSetFramebufferSizeCallback(state.window, on_framebuffer_resize);
 
-	// Shaders are compiled inside the pipeline creation calls, so anything they import has to be
-	// registered first. This also routes the compiler's diagnostics somewhere visible.
 	gpuSetShaderDiagnosticCallbackEXT([](GpuStringView message, void*) {
 		std::println("[shader] {}", std::string_view(message.ptr, message.count));
 	}, nullptr);
@@ -294,9 +278,6 @@ int real_main() {
 
 	auto pipe = gpuCreateComputePipeline(state.queue, string_to_bytes(slang_compute));
 
-	// The counter a split barrier pair is built around. Readback memory because the point of the
-	// check below is that the CPU can see what the signal wrote: the counter is ordinary memory,
-	// not an opaque fence, so a program can watch the producer's progress through it.
 	auto counter = gpuMalloc<uint64_t>(state.queue, 1, MEMORY_READBACK);
 	*counter = 0;
 	auto counter_gpu = gpuHostToDevicePointer(state.queue, counter);
@@ -311,8 +292,6 @@ int real_main() {
 		gpuSetPipeline(cmd, pipe);
 		gpuDispatch(cmd, data_gpu, {1, 1, 1});
 
-		// A split barrier around the dispatch above. The pair is what the backend can honor
-		// exactly: same counter, same value, same command buffer, outside any render pass.
 		gpuSignalAfter(cmd, STAGE_COMPUTE, counter_gpu, SIGNALLED, SIGNAL_ATOMIC_MAX);
 		gpuWaitBefore(cmd, STAGE_TRANSFER, counter_gpu, SIGNALLED, OP_GREATER_EQUAL);
 
@@ -324,8 +303,6 @@ int real_main() {
 
 	std::println("upload: {}, download: {}", upload[3], download[3]);
 
-	// Whether the signal wrote anything is a capability, so this checks what was promised rather
-	// than assuming: where the backend says it writes the counter, it has to have written it.
 	std::println("split barrier: signals={} splits={}, counter={} (expected {})",
 		capabilities.split_barrier_signals, capabilities.split_barriers,
 		*counter, capabilities.split_barrier_signals ? SIGNALLED : 0);
@@ -347,7 +324,7 @@ int real_main() {
 			.format = FORMAT_NONE, // Whatever the surface prefers, until the capabilities are known
 			.usage = USAGE_COLOR_ATTACHMENT,
 		},
-		.presentMode = PRESENT_MODE_FIFO,
+		.presentMode = PRESENT_MODE_BEST_AVAILABLE,
 	});
 
 	auto caps = gpuGetSurfaceCapabilitiesEXT(state.queue, state.surface);

@@ -1099,6 +1099,36 @@ namespace GPU::detail {
 	}
 }
 
+/**
+ * storage_sampled_bindings – The group 2 binding each storage monotexture's sampled view takes,
+ * or -1 for one that has none.
+ *
+ * A storage monotexture is bound twice where it can be: once as the storage texture a shader
+ * stores into, and once as an ordinary sampled texture, since a texture a compute shader wrote
+ * is usually a texture something then reads. Two things have to line up for the second one --
+ * the atlas has to have been created able to be sampled (which it was if the texture that opened
+ * it asked for USAGE_SAMPLED), and its format has to be one a sampler will filter, because every
+ * sampler in group 3 filters and WebGPU rejects pairing one with a texture that cannot be.
+ *
+ * The bindings carry on from the sampled monotextures', which take the front of the group. Both
+ * this and the module generated against it walk the lists in this order, which is what keeps the
+ * two agreeing on which binding is which.
+ *
+ * @param queue The queue whose monotextures to number.
+ */
+static std::vector<int> storage_sampled_bindings(GpuQueue* queue) {
+	std::vector<int> out(queue->storage_monotextures.size(), -1);
+	auto binding = static_cast<int>(queue->sampled_monotextures.size());
+
+	for(size_t i = 0; i < queue->storage_monotextures.size(); ++i) {
+		auto const& [_cap, texture, view, desc] = queue->storage_monotextures[i];
+		if(!view || !(wgpuTextureGetUsage(texture) & WGPUTextureUsage_TextureBinding)) continue;
+		if(!gpuFormatIsFilterableEXT(desc.format)) continue;
+		out[i] = binding++;
+	}
+	return out;
+}
+
 void update_pipeline_layouts(GpuQueue* queue) {
 	auto create_layout_and_group = [&](std::vector<WGPUBindGroupLayoutEntry>& layoutEntries, std::vector<WGPUBindGroupEntry>& entries) -> std::pair<WGPUBindGroupLayout, WGPUBindGroup> {
 		WGPUBindGroupLayoutDescriptor layout{
@@ -1123,44 +1153,73 @@ void update_pipeline_layouts(GpuQueue* queue) {
 		queue->current_graphics_bind_group_layout0 = create_buffer_bind_group_layout(queue, false);
 
 	//
-	// Group 1: storage textures
+	// Groups 1 and 2: storage textures, and sampled textures
 	//
-	// Groups 1 and 2 are shared between the compute and graphics pipeline layouts (the bind groups
-	// built from them get bound to both), so their visibility has to name every stage allowed to
-	// touch them. Writable storage textures are illegal in the vertex stage, hence the asymmetry.
+	// Each comes in a compute flavor and a graphics one, because WebGPU will not have a texture
+	// bound as a writable storage texture and as a sampled one in the same pass -- and a texture a
+	// compute shader writes is precisely a texture something else then samples. So the storage
+	// bindings are the compute flavor's group 1, the sampled views of those same monotextures are
+	// the graphics flavor's group 2, and no pass is ever handed both. What that costs is a store
+	// from a fragment shader, which is why GPU_TEXTURE_STORES is off for a graphics shader.
+	//
+	// Both flavors are shared between every pipeline of their kind, so their visibility names
+	// every stage allowed to touch them; writable storage textures are illegal in the vertex
+	// stage, hence the asymmetry.
 	//
 	std::vector<WGPUBindGroupLayoutEntry> group1;
 	std::vector<WGPUBindGroupEntry> group1entries;
 
 	uint32_t binding = 0;
 
+	// Released with the bind group they were made for, since that is what holds them
+	std::vector<WGPUTextureView> storage_views;
+
 	for(auto const& [_cap, texture, view, desc] : queue->storage_monotextures) {
+		// Write only rather than read/write: core WebGPU only lets a storage texture be read and
+		// written in the same shader for the three 32 bit single channel formats, so a read/write
+		// binding of anything else -- rgba8unorm above all -- is rejected outright. gpuStoreTexture
+		// is a store and nothing else for the same reason (see the portable module).
 		group1.push_back({
 			.binding = binding,
-			.visibility = WGPUShaderStage_Compute | WGPUShaderStage_Fragment,
+			.visibility = WGPUShaderStage_Compute,
 			.storageTexture = {
-				.access = WGPUStorageTextureAccess_ReadWrite,
+				.access = WGPUStorageTextureAccess_WriteOnly,
 				.format = GPU::format2wgpu(desc.format),
 				.viewDimension = GPU::texture_view2wgpu(desc.type),
 			}
 		});
+
+		// A storage binding names exactly one mip level, so it cannot take the whole chain view
+		// the monotexture keeps. Level 0 is the level it gets: a view here is the atlas rather
+		// than any one texture in it, so there is nowhere to put a per texture choice, which is
+		// why gpuRWTextureViewDescriptor says so when it is handed a base mip this cannot honor.
+		WGPUTextureViewDescriptor d {
+			.format = GPU::format2wgpu(desc.format),
+			.dimension = GPU::texture_view2wgpu(desc.type),
+			.baseMipLevel = 0,
+			.mipLevelCount = 1,
+			.baseArrayLayer = 0,
+			.arrayLayerCount = desc.type == TEXTURE_3D ? 1 : wgpuTextureGetDepthOrArrayLayers(texture),
+			.aspect = WGPUTextureAspect_All,
+			.usage = WGPUTextureUsage_StorageBinding,
+		};
+		storage_views.push_back(wgpuTextureCreateView(texture, &d));
+
 		group1entries.push_back({
 			.binding = binding++,
-			.textureView = view,
+			.textureView = storage_views.back(),
 		});
 	}
 
-	//
-	// Group 2: sampled textures
-	//
+	// Group 2, which both flavors share the front of: one entry per sampled monotexture
 	std::vector<WGPUBindGroupLayoutEntry> group2;
 	std::vector<WGPUBindGroupEntry> group2entries;
 
 	binding = 0;
 
-	for(auto const& [_cap, texture, view, desc] : queue->sampled_monotextures) {
+	auto sampled_binding = [&](const GpuQueue::TextureHash& desc, WGPUTextureView view, uint32_t at) {
 		group2.push_back({
-			.binding = binding,
+			.binding = at,
 			.visibility = WGPUShaderStage_Compute | WGPUShaderStage_Vertex | WGPUShaderStage_Fragment,
 			.texture = {
 				.sampleType = WGPUTextureSampleType_Float,
@@ -1169,22 +1228,53 @@ void update_pipeline_layouts(GpuQueue* queue) {
 			}
 		});
 		group2entries.push_back({
-			.binding = binding++,
+			.binding = at,
 			.textureView = view,
 		});
+	};
+
+	for(auto const& [_cap, texture, view, desc] : queue->sampled_monotextures)
+		sampled_binding(desc, view, binding++);
+
+	// Everything above is the compute flavor of both groups, whose group 2 stops here
+	auto release_later = [&](WGPUBindGroupLayout layout, WGPUBindGroup group, std::vector<WGPUTextureView> views = {}) {
+		if(!layout) return;
+		queue->code_pending_submission_finished.emplace_back([layout, group, views = std::move(views)](){
+			wgpuBindGroupLayoutRelease(layout);
+			wgpuBindGroupRelease(group);
+			for(auto view: views) wgpuTextureViewRelease(view);
+		}, queue->next_submission_index);
+	};
+
+	release_later(queue->current_compute_bind_group_layout1, queue->current_compute_bind_group1,
+		std::move(queue->current_storage_views));
+	queue->current_storage_views = std::move(storage_views);
+	std::tie(queue->current_compute_bind_group_layout1, queue->current_compute_bind_group1)
+		= create_layout_and_group(group1, group1entries);
+
+	release_later(queue->current_compute_bind_group_layout2, queue->current_compute_bind_group2);
+	std::tie(queue->current_compute_bind_group_layout2, queue->current_compute_bind_group2)
+		= create_layout_and_group(group2, group2entries);
+
+	// And the graphics flavor: no storage textures at all, and the storage monotextures that can
+	// be sampled as well appended to group 2 (see storage_sampled_bindings for the numbering)
+	auto storage_sampled = storage_sampled_bindings(queue);
+	for(size_t i = 0; i < queue->storage_monotextures.size(); ++i) {
+		if(storage_sampled[i] < 0) continue;
+		auto const& [_cap, texture, view, desc] = queue->storage_monotextures[i];
+		sampled_binding(desc, view, static_cast<uint32_t>(storage_sampled[i]));
 	}
 
-	if(queue->current_bind_group_layout1) queue->code_pending_submission_finished.emplace_back([l = queue->current_bind_group_layout1, gp = queue->current_bind_group1](){
-		wgpuBindGroupLayoutRelease(l);
-		wgpuBindGroupRelease(gp);
-	}, queue->next_submission_index);
-	std::tie(queue->current_bind_group_layout1, queue->current_bind_group1) = create_layout_and_group(group1, group1entries);
+	std::vector<WGPUBindGroupLayoutEntry> no_group1;
+	std::vector<WGPUBindGroupEntry> no_group1entries;
 
-	if(queue->current_bind_group_layout2) queue->code_pending_submission_finished.emplace_back([l = queue->current_bind_group_layout2, gp = queue->current_bind_group2](){
-		wgpuBindGroupLayoutRelease(l);
-		wgpuBindGroupRelease(gp);
-	}, queue->next_submission_index);
-	std::tie(queue->current_bind_group_layout2, queue->current_bind_group2) = create_layout_and_group(group2, group2entries);
+	release_later(queue->current_graphics_bind_group_layout1, queue->current_graphics_bind_group1);
+	std::tie(queue->current_graphics_bind_group_layout1, queue->current_graphics_bind_group1)
+		= create_layout_and_group(no_group1, no_group1entries);
+
+	release_later(queue->current_graphics_bind_group_layout2, queue->current_graphics_bind_group2);
+	std::tie(queue->current_graphics_bind_group_layout2, queue->current_graphics_bind_group2)
+		= create_layout_and_group(group2, group2entries);
 
 	//
 	// Group 3: samplers
@@ -1194,13 +1284,8 @@ void update_pipeline_layouts(GpuQueue* queue) {
 	if(!queue->current_bind_group_layout3)
 		queue->current_bind_group_layout3 = create_sampler_bind_group_layout(queue);
 
-	auto create_pipeline_layout = [&](WGPUBindGroupLayout bgl0) {
-		WGPUBindGroupLayout layouts[] = {
-			bgl0,
-			queue->current_bind_group_layout1,
-			queue->current_bind_group_layout2,
-			queue->current_bind_group_layout3
-		};
+	auto create_pipeline_layout = [&](WGPUBindGroupLayout bgl0, WGPUBindGroupLayout bgl1, WGPUBindGroupLayout bgl2) {
+		WGPUBindGroupLayout layouts[] = {bgl0, bgl1, bgl2, queue->current_bind_group_layout3};
 
 		WGPUPipelineLayoutDescriptor pd{
 			.bindGroupLayoutCount = 4,
@@ -1210,10 +1295,12 @@ void update_pipeline_layouts(GpuQueue* queue) {
 	};
 
 	if(queue->current_compute_pipeline_layout) wgpuPipelineLayoutRelease(queue->current_compute_pipeline_layout);
-	queue->current_compute_pipeline_layout = create_pipeline_layout(queue->current_compute_bind_group_layout0);
+	queue->current_compute_pipeline_layout = create_pipeline_layout(queue->current_compute_bind_group_layout0,
+		queue->current_compute_bind_group_layout1, queue->current_compute_bind_group_layout2);
 
 	if(queue->current_graphics_pipeline_layout) wgpuPipelineLayoutRelease(queue->current_graphics_pipeline_layout);
-	queue->current_graphics_pipeline_layout = create_pipeline_layout(queue->current_graphics_bind_group_layout0);
+	queue->current_graphics_pipeline_layout = create_pipeline_layout(queue->current_graphics_bind_group_layout0,
+		queue->current_graphics_bind_group_layout1, queue->current_graphics_bind_group_layout2);
 }
 
 
@@ -1259,14 +1346,26 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 		default: return "Texture2D";
 		}
 	};
+	// Write only (Slang's W prefix) rather than read/write, to match the WriteOnly access the
+	// bind group layout declares; see update_pipeline_layouts for why WebGPU leaves no choice.
 	constexpr static auto storage_type = [](TEXTURE type) {
 		switch (GPU::texture_view2wgpu(type)) {
-		case WGPUTextureViewDimension_1D: return "RWTexture1D";
-		case WGPUTextureViewDimension_3D: return "RWTexture3D";
-		case WGPUTextureViewDimension_Cube: return "RWTextureCube";
-		case WGPUTextureViewDimension_CubeArray: return "RWTextureCubeArray";
-		case WGPUTextureViewDimension_2DArray: return "RWTexture2DArray";
-		default: return "RWTexture2D";
+		case WGPUTextureViewDimension_1D: return "WTexture1D";
+		case WGPUTextureViewDimension_3D: return "WTexture3D";
+		case WGPUTextureViewDimension_2DArray: return "WTexture2DArray";
+		default: return "WTexture2D";
+		}
+	};
+
+	// The coordinate a store is actually given, which is a texel position rather than the
+	// normalized one a sample takes. There is no storage cube texture in WGSL, so the cases the
+	// sampled side has for them have no counterpart here.
+	constexpr static auto store_coordinate = [](TEXTURE type) {
+		switch (GPU::texture_view2wgpu(type)) {
+		case WGPUTextureViewDimension_1D: return "texel.x";
+		case WGPUTextureViewDimension_3D: return "texel";
+		case WGPUTextureViewDimension_2DArray: return "uint3(texel.xy, layer)";
+		default: return "texel.xy";
 		}
 	};
 
@@ -1422,18 +1521,34 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 	//
 	// Textures
 	//
+	// Group 1 is the compute pipeline layout's alone; a graphics one binds an empty group there,
+	// for the reason update_pipeline_layouts gives.
 	binding = 0;
-	for (auto const& [_cap, texture, view, desc] : queue->storage_monotextures) {
-		out += std::format("[[vk::binding({}, 1)]] [format(\"{}\")] public {}<float4> storage_tex_{};\n",
-			binding, slang_format(desc.format), storage_type(desc.type), binding);
-		++binding;
-	}
+	if(compute)
+		for (auto const& [_cap, texture, view, desc] : queue->storage_monotextures) {
+			out += std::format("[[vk::binding({}, 1)]] [format(\"{}\")] public {}<float4> storage_tex_{};\n",
+				binding, slang_format(desc.format), storage_type(desc.type), binding);
+			++binding;
+		}
 
 	binding = 0;
 	for (auto const& [_cap, texture, view, desc] : queue->sampled_monotextures) {
 		out += std::format("[[vk::binding({}, 2)]] public {}<float4> sampled_tex_{};\n",
 			binding, sampled_type(desc.type), binding);
 		++binding;
+	}
+
+	// The same declaration again for each storage monotexture that is bound as a sampled texture
+	// as well, which is what lets a shader read what another one stored. They carry on from the
+	// bindings above, which is the order storage_sampled_bindings numbers them in -- and they are
+	// the graphics module's alone, since only its group 2 has them.
+	auto storage_sampled = storage_sampled_bindings(queue);
+	if(compute) storage_sampled.assign(queue->storage_monotextures.size(), -1);
+	for (size_t i = 0; i < queue->storage_monotextures.size(); ++i) {
+		if(storage_sampled[i] < 0) continue;
+		auto const& [_cap, texture, view, desc] = queue->storage_monotextures[i];
+		out += std::format("[[vk::binding({}, 2)]] public {}<float4> sampled_tex_{};\n",
+			storage_sampled[i], sampled_type(desc.type), storage_sampled[i]);
 	}
 
 	//
@@ -1499,27 +1614,47 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 		gpu_sampler_slot_count, GPU::detail::sampler_lookup_size, storage_count, sampled_count);
 
 	// WGSL can't index an array of samplers or of textures, so the only way to pick either one
-	// at runtime is a switch over every combination the queue currently has.
-	binding = 0;
-	for (auto const& [_cap, texture, view, desc] : queue->sampled_monotextures) {
-		auto coordinate = sample_coordinate(desc.type);
-		out += std::format("float4 gpu_sample_tex_{}(uint slot, float3 scale, float3 limit, float3 uv, uint layer, float mip) {{\n{}"
-			"\tswitch(slot) {{\n", binding, sample_remap(desc.type));
+	// at runtime is a switch over every combination the queue currently has. One of these per
+	// sampled binding, whichever list the texture behind it came from.
+	auto sample_function = [&](int at, TEXTURE type) {
+		auto coordinate = sample_coordinate(type);
+		auto body = std::format("float4 gpu_sample_tex_{}(uint slot, float3 scale, float3 limit, float3 uv, uint layer, float mip) {{\n{}"
+			"\tswitch(slot) {{\n", at, sample_remap(type));
 		for (uint32_t i = 1; i < gpu_sampler_slot_count; ++i)
-			out += std::format("\tcase {}u: return sampled_tex_{}.SampleLevel(gpu_sampler_{}, {}, mip);\n",
-				i, binding, i, coordinate);
-		out += std::format("\tdefault: return sampled_tex_{}.SampleLevel(gpu_sampler_0, {}, mip);\n"
+			body += std::format("\tcase {}u: return sampled_tex_{}.SampleLevel(gpu_sampler_{}, {}, mip);\n",
+				i, at, i, coordinate);
+		return body + std::format("\tdefault: return sampled_tex_{}.SampleLevel(gpu_sampler_0, {}, mip);\n"
 			"\t}}\n"
 			"}}\n"
-			"\n", binding, coordinate);
-		++binding;
+			"\n", at, coordinate);
+	};
+
+	binding = 0;
+	for (auto const& [_cap, texture, view, desc] : queue->sampled_monotextures)
+		out += sample_function(binding++, desc.type);
+
+	for (size_t i = 0; i < queue->storage_monotextures.size(); ++i) {
+		if(storage_sampled[i] < 0) continue;
+		out += sample_function(storage_sampled[i], std::get<3>(queue->storage_monotextures[i]).type);
 	}
 
 	out += "// Samples monotexture `texture` on `layer`, through the sampler in `slot` (see\n"
 		"// gpuBackendSamplerSlot). `uv` runs 0..1 over the texture itself and is scaled by `scale`\n"
 		"// onto whatever part of the monotexture that texture occupies, then held to `limit` so it\n"
-		"// stays inside it. `layer` and `mip` are absolute.\n"
-		"public float4 gpuBackendSampleTexture(uint texture, uint slot, float3 scale, float3 limit, float3 uv, uint layer, float mip) {\n"
+		"// stays inside it. `layer` and `mip` are absolute. `storage` picks which of the two lists\n"
+		"// of monotextures `texture` indexes, since the heap entry's index is relative to its own.\n"
+		"public float4 gpuBackendSampleTexture(uint texture, bool storage, uint slot, float3 scale, float3 limit, float3 uv, uint layer, float mip) {\n"
+		"\tif(storage) {\n"
+		"\t\tswitch(texture) {\n";
+	for (size_t i = 0; i < queue->storage_monotextures.size(); ++i)
+		if(storage_sampled[i] >= 0)
+			out += std::format("\t\tcase {}u: return gpu_sample_tex_{}(slot, scale, limit, uv, layer, mip);\n", i, storage_sampled[i]);
+	out += "\t\t// A storage monotexture that could not be bound as a sampled one as well: either\n"
+		"\t\t// nothing that landed in it asked for USAGE_SAMPLED, or its format is one no sampler\n"
+		"\t\t// will filter. Reads black rather than failing to compile.\n"
+		"\t\tdefault: return float4(0.0);\n"
+		"\t\t}\n"
+		"\t}\n"
 		"\tswitch(texture) {\n";
 	for (uint32_t i = 0; i < sampled_count; ++i)
 		out += std::format("\tcase {}u: return gpu_sample_tex_{}(slot, scale, limit, uv, layer, mip);\n", i, i);
@@ -1534,9 +1669,43 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 		"\tlet descriptor = gpuBackendTextureDescriptor(heap_index);\n"
 		"\tlet level = float(descriptor.base_mip) + clamp(mip, 0.0, max(float(descriptor.mip_count), 1.0) - 1.0);\n"
 		"\tlet at = descriptor.first_layer + min(layer, descriptor.end_layer - descriptor.first_layer - 1u);\n"
-		"\treturn gpuBackendSampleTexture(gpuBackendMonotextureIndex(descriptor), slot,\n"
+		"\treturn gpuBackendSampleTexture(gpuBackendMonotextureIndex(descriptor),\n"
+		"\t\tgpuBackendMonotextureIsStorage(descriptor), slot,\n"
 		"\t\tdescriptor.uv_scale, descriptor.uv_max, uv, at, level);\n"
-		"}\n";
+		"}\n"
+		"\n";
+
+	//
+	// Stores
+	//
+	if(compute) out += "// Stores one texel of monotexture `texture` on absolute layer `layer`. Only mip level 0\n"
+		"// of a monotexture is bound as a storage texture, so unlike the sample above this takes no\n"
+		"// level; see update_pipeline_layouts.\n"
+		"void gpuBackendStoreTextureAt(uint texture, uint3 texel, uint layer, float4 value) {\n"
+		"\tswitch(texture) {\n";
+	if(compute) {
+		binding = 0;
+		for (auto const& [_cap, texture, view, desc] : queue->storage_monotextures) {
+			out += std::format("\tcase {}u: storage_tex_{}.Store({}, value); break;\n",
+				binding, binding, store_coordinate(desc.type));
+			++binding;
+		}
+		out += "\tdefault: break;\n"
+			"\t}\n"
+			"}\n"
+			"\n"
+			"// Stores through a heap entry. `texel` is a texel of the texture itself, so a coordinate\n"
+			"// past its own size is dropped rather than allowed to reach the rest of the monotexture\n"
+			"// it shares, and `layer` is relative to the entry the way a sample's is.\n"
+			"public void gpuBackendStoreTexture(uint heap_index, uint3 texel, uint layer, float4 value) {\n"
+			"\tlet descriptor = gpuBackendTextureDescriptor(heap_index);\n"
+			"\t// A sampled entry names no storage binding, so there is nothing to store through\n"
+			"\tif(!gpuBackendMonotextureIsStorage(descriptor)) return;\n"
+			"\tif(any(texel >= max(descriptor.size, uint3(1u)))) return;\n"
+			"\tlet at = descriptor.first_layer + min(layer, descriptor.end_layer - descriptor.first_layer - 1u);\n"
+			"\tgpuBackendStoreTextureAt(gpuBackendMonotextureIndex(descriptor), texel, at, value);\n"
+			"}\n";
+	}
 
 	return out;
 }
@@ -1772,6 +1941,92 @@ void gpuFree(GpuQueue* queue, void* ptr) {
 	auto device = gpuHostToDevicePointer(queue, ptr);
 	if(device) gpuFree(queue, device);
 }
+/**
+ * collapse_monotexture_if_empty – Give back the atlas behind a monotexture once every texture
+ * packed into it has been freed.
+ *
+ * An atlas is as big as the textures it holds, so the one behind a freed render target is the
+ * whole target: resizing a window walks through a monotexture per power of two size it passes,
+ * and each one left behind is megabytes held for nothing.
+ *
+ * What cannot go away is the slot the monotexture occupies, because its index is both the binding
+ * the shader declares it at and the number gpuTextureViewDescriptor has already written into every
+ * heap entry naming a texture in a *later* monotexture. Dropping the entry out of the list would
+ * renumber those out from under the shader. So the atlas is released, the slot keeps a 1x1 stand in
+ * of the same shape for the bind group to have something to bind, and the slot is recorded as
+ * collapsed for gpuCreateTexture to take over -- for this shape or any other.
+ *
+ * @param queue The queue holding the monotexture.
+ * @param freed The range just returned to the freelist, which names the monotexture to consider.
+ */
+static void collapse_monotexture_if_empty(GpuQueue* queue, const GpuQueue::MonotextureRange& freed) {
+	auto& monotextures = freed.storage() ? queue->storage_monotextures : queue->sampled_monotextures;
+	auto& [size, texture, full_view, desc] = monotextures.at(freed.index());
+
+	// Every layer the monotexture ever handed out is on the freelist, or it is still in use. `size`
+	// only ever grows, so it is exactly the number handed out.
+	uint32_t returned = 0;
+	for(auto const& range: queue->texture_freelist)
+		if(range._index == freed._index) returned += range.end - range.start;
+	if(returned < size) return;
+
+	// The ranges describe layers of an atlas that is about to stop existing, and the stand in has
+	// only the one, so they cannot be handed out again
+	std::erase_if(queue->texture_freelist, [&](const GpuQueue::MonotextureRange& range) {
+		return range._index == freed._index;
+	});
+
+	// Both may still be bound by work in flight, and the bind group holding them is only dropped
+	// once that work retires, the same way the grow path in gpuCreateTexture hands them over
+	queue->code_pending_submission_finished.emplace_back([texture, full_view]() {
+		if(full_view) wgpuTextureViewRelease(full_view);
+		wgpuTextureRelease(texture);
+	}, queue->next_submission_index);
+
+	// The stand in keeps the shape the layout and the generated module declare for this binding
+	// (format, view dimension and sample count all come out of the hash, which stays put), so
+	// neither has to care that the atlas behind it is gone. One layer, one mip, one texel.
+	auto usage = wgpuTextureGetUsage(texture);
+	{
+		WGPUTextureDescriptor d {
+			.label = {"NoAPI Collapsed Monotexture", WGPU_STRLEN},
+			.usage = usage,
+			.dimension = GPU::texture2wgpu(desc.type),
+			.size = {1, 1, 1},
+			.format = GPU::format2wgpu(desc.format),
+			.mipLevelCount = 1,
+			.sampleCount = desc.sampleCount,
+		};
+		texture = wgpuDeviceCreateTexture(queue->device, &d);
+	}{
+		// Same split as the atlas's own view: the storage binding builds its own single level view
+		// in update_pipeline_layouts, so this is the one every other usage takes, and a storage
+		// only monotexture has no other usage and so no view at all
+		auto view_usage = usage & ~WGPUTextureUsage_StorageBinding;
+		WGPUTextureViewDescriptor d {
+			.format = GPU::format2wgpu(desc.format),
+			.dimension = GPU::texture_view2wgpu(desc.type),
+			.baseMipLevel = 0,
+			.mipLevelCount = 1,
+			.baseArrayLayer = 0,
+			.arrayLayerCount = 1,
+			.aspect = WGPUTextureAspect_All,
+			.usage = view_usage,
+		};
+		full_view = view_usage ? wgpuTextureCreateView(texture, &d) : nullptr;
+	}
+
+	size = 0;
+	// No hash may still resolve to a slot whose atlas is gone, or the next texture of that shape
+	// would be handed a layer of the stand in
+	auto& lookup = freed.storage() ? queue->storage_monotextures_lookup : queue->sampled_monotextures_lookup;
+	lookup.erase(desc);
+	queue->collapsed_monotextures.insert(freed._index);
+
+	// The bind groups hold views of the atlas that just went away
+	update_pipeline_layouts(queue);
+}
+
 void gpuFreeDevicePointerEXT(GpuQueue* queue, gpu* ptr) {
 	if(!queue->allocations.contains(ptr)) return;
 
@@ -1779,7 +2034,8 @@ void gpuFreeDevicePointerEXT(GpuQueue* queue, gpu* ptr) {
 	if(queue->gpu2textures.contains(ptr)) {
 		auto texture = queue->gpu2textures[ptr];
 		if(texture->range) {
-			queue->texture_freelist.emplace_back(*texture->range);
+			auto freed = *texture->range; // A copy, so the monotexture is still named below
+			queue->texture_freelist.emplace_back(freed);
 			// Sort the freelist so entries are grouped by monotexture (storage flag + index) and then by start,
 			// mirroring buffer_freelist's sort so gpuCreateTexture's freelist search can merge adjacent free ranges
 			std::sort(queue->texture_freelist.begin(), queue->texture_freelist.end(), [](const GpuQueue::MonotextureRange& a, const GpuQueue::MonotextureRange& b) -> bool {
@@ -1789,11 +2045,18 @@ void gpuFreeDevicePointerEXT(GpuQueue* queue, gpu* ptr) {
 					return a.start < b.start;
 				return a._index < b._index;
 			});
+
+			// That may have been the last texture the monotexture was holding
+			collapse_monotexture_if_empty(queue, freed);
 		} else {
 			wgpuTextureRelease(texture->texture);
 		}
 
 		queue->cpu_allocator(texture, 0);
+		// The address goes back on the freelist below, so a later allocation can land on it again.
+		// Leaving the (now dangling) entry behind would make gpuCreateTexture's one-texture-per-
+		// allocation guard reject that reuse, which is what resizing a render target does.
+		queue->gpu2textures.erase(ptr);
 	}
 
 	auto found = queue->allocations.find(ptr);
@@ -1842,14 +2105,34 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 
 	if(monotextures != nullptr) {
 		if(!monotextures_lookup->contains(hash)) {
-			if(queue->storage_monotextures.size() >= queue->limits.maxStorageTexturesPerShaderStage) {
-				errno = WGPUErrorType_OutOfMemory;
-				return nullptr;
+			// A monotexture every texture has been freed out of kept its slot but gave up its atlas
+			// (see collapse_monotexture_if_empty), and taking that slot back rather than growing the
+			// list is what stops a window resized through a dozen sizes from holding a binding for
+			// each of them. Lowest index first, so the list stays as short as the set in use.
+			auto reused = queue->collapsed_monotextures.end();
+			for(auto at = queue->collapsed_monotextures.begin(); at != queue->collapsed_monotextures.end(); ++at)
+				if(bool(*at & GpuQueue::MonotextureRange::STORAGE_BIT) == is_storage_texture) {
+					reused = at;
+					break;
+				}
+
+			// Only a list that has to grow spends a binding, so only that has a limit to answer to
+			if(reused == queue->collapsed_monotextures.end()) {
+				if(is_storage_texture && queue->storage_monotextures.size() >= queue->limits.maxStorageTexturesPerShaderStage) {
+					errno = WGPUErrorType_OutOfMemory;
+					return nullptr;
+				}
+				// Group 2 holds the sampled monotextures and, after them, every storage one that can
+				// be sampled as well (see storage_sampled_bindings), so both lists share this budget
+				auto sampled_bindings = queue->sampled_monotextures.size();
+				for(auto binding: storage_sampled_bindings(queue))
+					if(binding >= 0) ++sampled_bindings;
+				if(sampled_bindings >= queue->limits.maxSampledTexturesPerShaderStage) {
+					errno = WGPUErrorType_OutOfMemory;
+					return nullptr;
+				}
 			}
-			if(queue->storage_monotextures.size() >= queue->limits.maxSampledTexturesPerShaderStage) {
-				errno = WGPUErrorType_OutOfMemory;
-				return nullptr;
-			}
+
 			// Reported as well as asserted: an assert is compiled out of a release build, and a
 			// caller who asked for something WebGPU does not have should hear about it either way
 			if(desc.type == TEXTURE_1D)
@@ -1858,8 +2141,25 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 			assert(desc.type != TEXTURE_1D && "1D textures aren't supported by WebGPU");
 			assert(desc.type != TEXTURE_3D || desc.layerCount == 1 && "3D textures can't be arrays in WebGPU");
 
-			(*monotextures_lookup)[hash] = monotextures->size();
-			auto& [size, texture, full_view, description] = monotextures->emplace_back();
+			size_t slot;
+			if(reused != queue->collapsed_monotextures.end()) {
+				slot = *reused & GpuQueue::MonotextureRange::INDEX_MASK;
+				queue->collapsed_monotextures.erase(reused);
+
+				// The stand in the slot was holding, on the same terms the atlas it replaced was
+				// released on: work in flight may still have it bound
+				auto [_size, stand_in, stand_in_view, _description] = (*monotextures)[slot];
+				queue->code_pending_submission_finished.emplace_back([stand_in, stand_in_view]() {
+					if(stand_in_view) wgpuTextureViewRelease(stand_in_view);
+					wgpuTextureRelease(stand_in);
+				}, queue->next_submission_index);
+			} else {
+				slot = monotextures->size();
+				monotextures->emplace_back();
+			}
+
+			(*monotextures_lookup)[hash] = slot;
+			auto& [size, texture, full_view, description] = (*monotextures)[slot];
 			description = hash;
 			size = 0;
 			{
@@ -1873,6 +2173,11 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 				};
 				texture = wgpuDeviceCreateTexture(queue->device, &d);
 			}{
+				// Every usage the texture has except the storage one: a view that may be bound
+				// as a storage texture is limited to a single mip level, and this one spans the
+				// whole chain. update_pipeline_layouts makes the single level view a storage
+				// binding needs separately, so this is the view everything else takes.
+				auto view_usage = GPU::usage2wgpu(desc.usage) & ~WGPUTextureUsage_StorageBinding;
 				WGPUTextureViewDescriptor d {
 					.format = GPU::format2wgpu(desc.format),
 					.dimension = GPU::texture_view2wgpu(desc.type),
@@ -1881,9 +2186,11 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 					.baseArrayLayer = 0,
 					.arrayLayerCount = desc.type == TEXTURE_3D ? 1 : desc.layerCount * 2,
 					.aspect = WGPUTextureAspect_All, // TODO: Do we need to deal with depthonly or stencilonly?
-					.usage = GPU::usage2wgpu(desc.usage),
+					.usage = view_usage,
 				};
-				full_view = wgpuTextureCreateView(texture, &d);
+				// A texture created for storage and nothing else has no other usage to view it
+				// through, and nothing that takes this view would have anything to do with it
+				full_view = view_usage ? wgpuTextureCreateView(texture, &d) : nullptr;
 			}
 
 			// We have a new monotexture the pipeline layouts should be aware of
@@ -2043,6 +2350,13 @@ GpuTextureDescriptor gpuTextureViewDescriptor(GpuQueue* queue, const GpuTexture*
 	return (GpuTextureDescriptor&)out;
 }
 GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue* queue, const GpuTexture* texture, const GpuViewDesc& desc) {
+	// A storage binding is a view of the whole monotexture rather than of any one texture in it,
+	// and a view that may be bound as one names a single mip level (see update_pipeline_layouts),
+	// so the level is the atlas's and not this entry's: level 0, for every texture sharing it.
+	if(desc.baseMip != 0)
+		GPU::report(queue, GPU_DIAGNOSTIC_UNSUPPORTED,
+			"gpuRWTextureViewDescriptor: WebGPU binds mip level 0 of a monotexture as its storage texture, so a store through this entry writes level 0 rather than the base mip it names");
+
 	return gpuTextureViewDescriptor(queue, texture, desc);
 }
 
@@ -2066,6 +2380,9 @@ WGPUShaderModule create_shader_module(GpuQueue* queue, std::string_view IR, GPU:
 		// The rasterizer only gets the monobuffers read only (see create_buffer_bind_group_layout),
 		// so the portable module only offers stores to a compute shader
 		{"GPU_STORES", compute ? "1" : "0"},
+		// A storage texture is bound for a compute pass and not for a render one, so a store from
+		// a graphics shader has nothing to reach; see update_pipeline_layouts
+		{"GPU_TEXTURE_STORES", compute ? "1" : "0"},
 	}, error);
 
 	if(!wgsl) {
@@ -2637,6 +2954,7 @@ void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes) {
 
 // TODO: Untested!
 void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* texture) {
+	endCurrentPass(cmd); // A copy is not something a pass can hold, and a dispatch may have opened one
 	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_);
 	auto [dest_range, dest_offset, dest_addr] = dest; auto [src_range, src_offset, src_addr] = src;
 
@@ -2675,6 +2993,7 @@ void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* 
 
 // TODO: Untested!
 void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuTexture* texture) {
+	endCurrentPass(cmd); // A copy is not something a pass can hold, and a dispatch may have opened one
 	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_);
 	auto [dest_range, dest_offset, dest_addr] = dest; auto [src_range, src_offset, src_addr] = src;
 
@@ -2933,13 +3252,13 @@ void bindGroups(GpuCommandBuffer* cmd, const void* shader_data, size_t shader_da
 
 	if(compute) {
 		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 0, group0, 0, nullptr);
-		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 1, cmd->queue->current_bind_group1, 0, nullptr);
-		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 2, cmd->queue->current_bind_group2, 0, nullptr);
+		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 1, cmd->queue->current_compute_bind_group1, 0, nullptr);
+		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 2, cmd->queue->current_compute_bind_group2, 0, nullptr);
 		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 3, group3, 0, nullptr);
 	} else {
 		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 0, group0, 0, nullptr);
-		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 1, cmd->queue->current_bind_group1, 0, nullptr);
-		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 2, cmd->queue->current_bind_group2, 0, nullptr);
+		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 1, cmd->queue->current_graphics_bind_group1, 0, nullptr);
+		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 2, cmd->queue->current_graphics_bind_group2, 0, nullptr);
 		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 3, group3, 0, nullptr);
 	}
 }

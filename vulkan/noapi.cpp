@@ -406,6 +406,18 @@ public float4 gpuBackendSample(uint heap_index, uint slot, float3 uv, uint layer
 	SamplerState sampler = SamplerDescriptorHeap[slot];
 	return texture.SampleLevel(sampler, uv.xy, mip);
 }
+
+// NOTE: 2D only, and `layer` ignored, for the same reason gpuBackendSample is; see there.
+//
+// The image type names no format, so one entry point can write a heap entry of any of them and
+// the format the descriptor was made with is the one the hardware converts to. That is what the
+// shaderStorageImageWriteWithoutFormat this backend requires buys (see
+// gpuEnableRequiredVulkanFeaturesEXT); a formatted declaration here would instead have to match
+// every texture a shader might be handed.
+public void gpuBackendStoreTexture(uint heap_index, uint3 texel, uint layer, float4 value) {
+	RWTexture2D<float4> texture = ResourceDescriptorHeap[heap_index * GPU_HEAP_STRIDE_RATIO];
+	texture[texel.xy] = value;
+}
 )";
 
 /**
@@ -426,6 +438,9 @@ static std::optional<std::string> compile_shader(GpuQueue* queue, GpuByteSpan ir
 			{"GPU_COMPUTE", graphics ? "0" : "1"},
 			{"GPU_GRAPHICS", graphics ? "1" : "0"},
 			{"GPU_STORES", "1"},
+			// Both kinds of store, from every stage: a storage image is reached through the same
+			// descriptor heap as a sampled one, so there is no stage here that cannot write one
+			{"GPU_TEXTURE_STORES", "1"},
 			// Device dependent, so it is a macro rather than a constant in the module source. The
 			// compiler's session cache keys on the macros, so two devices disagreeing about it get
 			// their own sessions rather than one another's code.
@@ -843,6 +858,15 @@ namespace GPU::detail {
 	void apply_depth_stencil_state(GpuCommandBuffer* cmd, const GpuDepthStencilDesc& descriptor);
 }
 
+namespace GPU::detail {
+	// Defined further down, next to the rest of the layout tracking. Declared here because the
+	// command buffer below is the first thing in the file that has to move an image into GENERAL.
+	inline void transition_texture(VkCommandBuffer cmd, const GpuTexture* texture, VkImageLayout new_layout,
+		VkAccessFlags source_access_mask, VkAccessFlags destination_access_mask,
+		VkPipelineStageFlags source_stage, VkPipelineStageFlags destination_stage,
+		uint32_t mip, uint32_t slice, bool discard);
+}
+
 GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
 	if(!queue->command_pool) {
 		VkCommandPoolCreateInfo info{
@@ -901,6 +925,20 @@ GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
 	// not allowed to proceed without. The default description is no test, no write and no stencil,
 	// which is what the static state said before any of this was dynamic.
 	GPU::detail::apply_depth_stencil_state(out, GpuDepthStencilDesc{});
+
+	// And with the transitions that move every texture created since the last command buffer into
+	// the layout this backend keeps textures in, which is the layout their heap descriptors are
+	// written against. A new image is VK_IMAGE_LAYOUT_UNDEFINED and nothing else here would move
+	// it: a copy, a blit or an attachment transitions the texture it was handed, but a shader
+	// reaches a texture through the descriptor heap, which names none. Without this a compute
+	// shader storing into a brand new texture writes an image in a layout its descriptor does not
+	// claim, and the next transition -- still coming out of UNDEFINED -- is free to throw the
+	// result away. Discarding, because a texture nothing has written yet has nothing to keep.
+	for(auto texture: queue->textures_pending_initial_layout)
+		GPU::detail::transition_texture(out->command_buffer, texture, VK_IMAGE_LAYOUT_GENERAL,
+			0, 0, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+			0, 0, true);
+	queue->textures_pending_initial_layout.clear();
 
 	return out;
 }
@@ -1122,6 +1160,11 @@ void gpuFreeDevicePointerEXT(GpuQueue* queue, gpu* ptr) {
 
 	if(queue->gpu2image.contains(gpu_ptr)) {
 		auto image = queue->gpu2image[gpu_ptr];
+		// Before the image goes: a texture freed without a command buffer having been started
+		// since it was created is still waiting for its initial transition, and that list would
+		// otherwise be left pointing at an image that no longer exists
+		std::erase_if(queue->textures_pending_initial_layout,
+			[image](const GpuTexture* pending) { return pending->image == image; });
 		vkDestroyImage(queue->device, image, queue->callbacks);
 		queue->gpu2image.erase(gpu_ptr);
 	}
@@ -1229,6 +1272,7 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 	VK_CHECK(vmaBindImageMemory(queue->gpu_allocator, backing->second.allocation, out->image), nullptr);
 
 	queue->gpu2image[(VkDeviceAddress)memory] = out->image;
+	queue->textures_pending_initial_layout.push_back(out);
 	return out;
 }
 
@@ -1374,15 +1418,6 @@ void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes) {
 		.size = bytes
 	};
 	vkCmdCopyBuffer(cmd->command_buffer, src.buffer, dest.buffer, 1, &region);
-}
-
-namespace GPU::detail {
-	// Defined further down, next to the rest of the layout tracking. Declared here because the
-	// copies below are the first thing in the file that has to move an image into GENERAL.
-	inline void transition_texture(VkCommandBuffer cmd, const GpuTexture* texture, VkImageLayout new_layout,
-		VkAccessFlags source_access_mask, VkAccessFlags destination_access_mask,
-		VkPipelineStageFlags source_stage, VkPipelineStageFlags destination_stage,
-		uint32_t mip, uint32_t slice, bool discard);
 }
 
 void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* texture) {

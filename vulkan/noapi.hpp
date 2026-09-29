@@ -123,6 +123,10 @@ struct GpuQueue {
 	std::unordered_map<VkDeviceAddress, void*> gpu2host;
 	// Mapping from gpu* (Device Addresses) to an associated image
 	std::unordered_map<VkDeviceAddress, VkImage> gpu2image;
+	// Textures created since the last command buffer was started, which are still in
+	// VK_IMAGE_LAYOUT_UNDEFINED. The next command buffer to be recorded moves them into the
+	// GENERAL their descriptors are written against; see gpuStartCommandRecording.
+	std::vector<GpuTexture*> textures_pending_initial_layout;
 
 	std::unordered_map<std::vector<GpuSamplerDesc>, VkDeviceAddress, GpuSamplerDescListHash> sampler_cache;
 
