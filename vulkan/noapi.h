@@ -17,6 +17,7 @@
 
 #include "../allocator.h"
 #include "../samplers.h"
+#include "../shaders.h"
 #include "../surface.h"
 #include "../sync.h"
 
@@ -40,14 +41,6 @@ typedef void (*GpuErrorCallbackEXT)(void* queue, int type, GpuStringView message
  */
 void gpuDefaultErrorCallbackEXT(void* queue, int type, GpuStringView message);
 
-/**
- * COMPUTE_SHADER_PROLOGUE / GRAPHICS_SHADER_PROLOGUE – GLSL this backend expects to be
- * prepended to a shader: the version and extension declarations, the push constant block
- * holding whatever root pointers the dispatch or draw was given, and the sampler lookup
- * helpers.
- */
-extern const char* const COMPUTE_SHADER_PROLOGUE;
-extern const char* const GRAPHICS_SHADER_PROLOGUE;
 
 /**
  * GpuVulkanDefault – The Vulkan objects gpuSetupDefaultVulkanEXT creates. The caller owns
@@ -109,6 +102,19 @@ bool gpuSetupDefaultVulkanEXT(GpuVulkanSurfaceLoaderEXT surface_loader, void* su
  */
 NOAPI_INLINE VkPhysicalDeviceFeatures gpuEnableRequiredVulkanFeaturesEXT(VkPhysicalDeviceFeatures features) {
 	features.shaderInt64 = true;
+	return features;
+}
+
+/**
+ * gpuEnableRequiredVulkan11FeaturesEXT – The Vulkan 1.1 features this backend needs.
+ *
+ * shaderDrawParameters is what SV_VertexID costs: Slang gives it the HLSL meaning, the index
+ * of the vertex within the draw, which on Vulkan is gl_VertexIndex less the draw's base
+ * vertex. Reading that base needs this feature.
+ */
+NOAPI_INLINE VkPhysicalDeviceVulkan11Features gpuEnableRequiredVulkan11FeaturesEXT(VkPhysicalDeviceVulkan11Features features) {
+	features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+	features.shaderDrawParameters = true;
 	return features;
 }
 

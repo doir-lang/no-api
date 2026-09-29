@@ -6,6 +6,7 @@
 #include <vk_mem_alloc.h>
 
 #include "noapi.hpp"
+#include "../slang_compiler.hpp"
 
 #include <VkBootstrap.h>
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added
@@ -298,107 +299,102 @@ namespace GPU::detail {
 
 
 
-extern const char* const COMPUTE_SHADER_PROLOGUE = R"(
-#version 460
-#extension GL_EXT_shader_explicit_arithmetic_types : require
-#extension GL_EXT_buffer_reference : require
+/**
+ * NOAPI_BACKEND_MODULE – This backend's half of the shader ABI, as the Slang module the
+ * portable `noapi` module (see slang_compiler.hpp) is written against.
+ *
+ * Vulkan is the easy half: the raw bits the portable module carries a pointer as really are
+ * a device address, so a load is an ordinary dereference, which Slang lowers to the
+ * PhysicalStorageBuffer64 addressing model. The root pointers arrive as push data
+ * (vkCmdPushDataEXT), laid out to match ComputePipelinePushConstants and
+ * GraphicsPipelinePushConstants below, and textures and samplers are indexed straight out
+ * of the hardware descriptor heaps VK_EXT_descriptor_heap provides.
+ *
+ * One source rather than the two prologues this replaced: GPU_COMPUTE picks which set of
+ * root pointers was pushed, and is set by compile_shader.
+ */
+static const char* const NOAPI_BACKEND_MODULE = R"(
+module noapi_backend;
 
-const uint ADDRESS_MODE_CLAMP = 0;
-const uint ADDRESS_MODE_MIRROR_REPEAT = 1;
-const uint ADDRESS_MODE_REPEAT = 2;
+#if GPU_COMPUTE
+// Matches ComputePipelinePushConstants
+public struct GpuPushConstants {
+	public uint64_t compute_data;
+	public uint64_t sampler_map;
+}
+#else
+// Matches GraphicsPipelinePushConstants
+public struct GpuPushConstants {
+	public uint64_t vertex_data;
+	public uint64_t fragment_data;
+	public uint64_t index_data;
+	public uint64_t sampler_map;
+}
+#endif
 
-const uint FILTER_NEAREST = 0;
-const uint FILTER_LINEAR = 1;
+[[vk::push_constant]] public ConstantBuffer<GpuPushConstants> gpu_pc;
 
-struct GpuSamplerDesc {
-	uint address_mode_u; // CLAMP, REPEAT, MIRROR_REPEAT
-	uint address_mode_v; // CLAMP, REPEAT, MIRROR_REPEAT
-	uint address_mode_w; // CLAMP, REPEAT, MIRROR_REPEAT
-	uint mag_filter; // NEAREST, LINEAR
-	uint min_filter; // NEAREST, LINEAR
-	uint mip_filter; // NEAREST, LINEAR
-};
+// An address arrives as the portable module carries it -- the 64 bits of it, low word first --
+// and here those bits are a device address, so the whole memory ABI is a pack and a
+// dereference. Everything wider than a word is GpuPtr<T>'s business, not this module's.
+static uint64_t gpuBackendAddress(uint2 address) { return (uint64_t(address.y) << 32) | uint64_t(address.x); }
+static uint2 gpuBackendWords(uint64_t address) { return uint2(uint(address), uint(address >> 32)); }
 
-uint gpuPackSamplerDesc(const GpuSamplerDesc d) {
-	return (d.address_mode_u)
-	| (d.address_mode_v << 2)
-	| (d.address_mode_w << 4)
-	| (d.mag_filter << 6)
-	| (d.min_filter << 7)
-	| (d.mip_filter << 8);
+public uint gpuBackendLoadU32(uint2 address) { return *((uint*)gpuBackendAddress(address)); }
+public void gpuBackendStoreU32(uint2 address, uint value) { *((uint*)gpuBackendAddress(address)) = value; }
+
+#if GPU_COMPUTE
+public uint2 gpuBackendRootCompute() { return gpuBackendWords(gpu_pc.compute_data); }
+#else
+public uint2 gpuBackendRootVertex() { return gpuBackendWords(gpu_pc.vertex_data); }
+public uint2 gpuBackendRootFragment() { return gpuBackendWords(gpu_pc.fragment_data); }
+public uint2 gpuBackendRootIndex() { return gpuBackendWords(gpu_pc.index_data); }
+#endif
+
+// The lookup table ensure_sampler_set built: one word per packed GpuSamplerDesc, holding
+// the slot that description landed in, or 0 (the default sampler) when it was never enabled
+public uint gpuBackendSamplerSlot(uint packed) {
+	if(gpu_pc.sampler_map == 0) return 0u;
+	if(packed > 0x1ffu) return 0u;
+	return *((uint*)(gpu_pc.sampler_map + uint64_t(packed) * 4u));
 }
 
-GpuSamplerDesc gpuDefaultSampler() {
-	return GpuSamplerDesc(ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, FILTER_LINEAR, FILTER_LINEAR, FILTER_LINEAR);
+// NOTE: Only 2D textures can be sampled through here. The descriptor at a heap index is
+// opaque hardware bits, so unlike WebGPU (where the heap entry is a struct the shader can
+// read a dimensionality out of) there is nothing to switch on, and the view type has to be
+// named statically. `layer` is therefore ignored. Layered, 3D and cube sampling needs
+// typed entry points this backend does not offer yet.
+public float4 gpuBackendSample(uint heap_index, uint slot, float3 uv, uint layer, float mip) {
+	Texture2D<float4> texture = ResourceDescriptorHeap[heap_index];
+	SamplerState sampler = SamplerDescriptorHeap[slot];
+	return texture.SampleLevel(sampler, uv.xy, mip);
 }
-
-layout(buffer_reference, std430) buffer GpuSamplerMap {
-	uint data[];
-};
-
-layout(push_constant) uniform PushConstants {
-	uint64_t compute_data;
-	GpuSamplerMap sampler_map;
-} pc;
-
-uint gpuGetSamplerIndex(const GpuSamplerDesc desc) {
-	return pc.sampler_map.data[gpuPackSamplerDesc(desc)];
-}
-
-// End prologue
 )";
 
-extern const char* const GRAPHICS_SHADER_PROLOGUE = R"(
-#version 460
-#extension GL_EXT_shader_explicit_arithmetic_types : require
-#extension GL_EXT_buffer_reference : require
+/**
+ * compile_shader – Turn the Slang source a pipeline was handed into SPIR-V for one stage.
+ *
+ * Stores are always reachable here: unlike WebGPU, Vulkan is happy to have a shader write
+ * through a pointer from any stage.
+ *
+ * @return The SPIR-V words, or nothing (having reported why) if the shader did not compile.
+ */
+static std::optional<std::string> compile_shader(GpuByteSpan ir, GPU::shaders::SHADER_STAGE stage) {
+	auto compute = stage == GPU::shaders::SHADER_STAGE::COMPUTE;
+	std::string error;
+	auto code = GPU::shaders::compile(SLANG_SPIRV, NOAPI_BACKEND_MODULE,
+		std::string_view((const char*)ir.data(), ir.size()), stage, {
+			{"GPU_COMPUTE", compute ? "1" : "0"},
+			{"GPU_GRAPHICS", compute ? "0" : "1"},
+			{"GPU_STORES", "1"},
+		}, error);
 
-const uint ADDRESS_MODE_CLAMP = 0;
-const uint ADDRESS_MODE_MIRROR_REPEAT = 1;
-const uint ADDRESS_MODE_REPEAT = 2;
-
-const uint FILTER_NEAREST = 0;
-const uint FILTER_LINEAR = 1;
-
-struct GpuSamplerDesc {
-	uint address_mode_u; // CLAMP, REPEAT, MIRROR_REPEAT
-	uint address_mode_v; // CLAMP, REPEAT, MIRROR_REPEAT
-	uint address_mode_w; // CLAMP, REPEAT, MIRROR_REPEAT
-	uint mag_filter; // NEAREST, LINEAR
-	uint min_filter; // NEAREST, LINEAR
-	uint mip_filter; // NEAREST, LINEAR
-};
-
-uint gpuPackSamplerDesc(const GpuSamplerDesc d) {
-	return (d.address_mode_u)
-	| (d.address_mode_v << 2)
-	| (d.address_mode_w << 4)
-	| (d.mag_filter << 6)
-	| (d.min_filter << 7)
-	| (d.mip_filter << 8);
+	if(!code) {
+		GPU::shaders::report_diagnostic(error);
+		errno = VK_ERROR_INITIALIZATION_FAILED;
+	}
+	return code;
 }
-
-GpuSamplerDesc gpuDefaultSampler() {
-	return GpuSamplerDesc(ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, ADDRESS_MODE_REPEAT, FILTER_LINEAR, FILTER_LINEAR, FILTER_LINEAR);
-}
-
-layout(buffer_reference, std430) buffer GpuSamplerMap {
-	uint data[];
-};
-
-layout(push_constant) uniform PushConstants {
-	uint64_t vertex_data;
-	uint64_t fragment_data;
-	uint64_t index_data;
-	GpuSamplerMap sampler_map;
-} pc;
-
-uint gpuGetSamplerIndex(const GpuSamplerDesc desc) {
-	return pc.sampler_map.data[gpuPackSamplerDesc(desc)];
-}
-
-// End prologue
-)";
 
 
 thread_local static VkDebugUtilsMessageSeverityFlagBitsEXT severity_filter;
@@ -459,6 +455,7 @@ bool gpuSetupDefaultVulkanEXT(GpuVulkanSurfaceLoaderEXT surface_loader, void* su
 	vkb::PhysicalDeviceSelector gpu_selector{instance};
 	auto phys = gpu_selector
 		.set_required_features(gpuEnableRequiredVulkanFeaturesEXT({}))
+		.set_required_features_11(gpuEnableRequiredVulkan11FeaturesEXT({}))
 		.set_required_features_12(gpuEnableRequiredVulkan12FeaturesEXT({}))
 		.set_required_features_13(gpuEnableRequiredVulkan13FeaturesEXT({}))
 		.set_required_features_14(gpuEnableRequiredVulkan14FeaturesEXT({}))
@@ -1015,6 +1012,9 @@ struct ComputePipelinePushConstants {
 };
 
 GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, GpuByteSpan computeIR) {
+	auto spirv = compile_shader(computeIR, GPU::shaders::SHADER_STAGE::COMPUTE);
+	if(!spirv) return nullptr;
+
 	auto out = (GpuPipeline*)queue->cpu_allocator(nullptr, sizeof(GpuPipeline));
 	out->color_target_count = {}; // Null indicating compute pipeline
 
@@ -1022,8 +1022,8 @@ GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, GpuByteSpan computeIR) {
 	{
 		VkShaderModuleCreateInfo info {
 			.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-			.codeSize = computeIR.size(),
-			.pCode = (uint32_t*)computeIR.data(),
+			.codeSize = spirv->size(),
+			.pCode = (const uint32_t*)spirv->data(),
 		};
 		VK_CHECK(vkCreateShaderModule(queue->device, &info, queue->callbacks, &compute_module), nullptr);
 	}{
@@ -1561,6 +1561,14 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
 		std::unreachable();
 	};
 
+	// Both stages are compiled before anything is created, so a shader that does not build
+	// leaves no half made pipeline behind. Handing the same source in as both is normal: the
+	// entry points are told apart by stage, not by which argument they arrived in.
+	auto vertex_spirv = compile_shader(vertexIR, GPU::shaders::SHADER_STAGE::VERTEX);
+	if(!vertex_spirv) return nullptr;
+	auto fragment_spirv = compile_shader(fragmentIR, GPU::shaders::SHADER_STAGE::FRAGMENT);
+	if(!fragment_spirv) return nullptr;
+
 	auto out = (GpuPipeline*)queue->cpu_allocator(nullptr, sizeof(GpuPipeline));
 	out->color_target_count = desc.colorTargets.size();
 
@@ -1568,15 +1576,15 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
 	{
 		VkShaderModuleCreateInfo info {
 			.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-			.codeSize = vertexIR.size(),
-			.pCode = (uint32_t*)vertexIR.data(),
+			.codeSize = vertex_spirv->size(),
+			.pCode = (const uint32_t*)vertex_spirv->data(),
 		};
 		VK_CHECK(vkCreateShaderModule(queue->device, &info, queue->callbacks, &shader_modules[0]), nullptr);
 	}{
 		VkShaderModuleCreateInfo info {
 			.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-			.codeSize = fragmentIR.size(),
-			.pCode = (uint32_t*)fragmentIR.data(),
+			.codeSize = fragment_spirv->size(),
+			.pCode = (const uint32_t*)fragment_spirv->data(),
 		};
 		VK_CHECK(vkCreateShaderModule(queue->device, &info, queue->callbacks, &shader_modules[1]), nullptr);
 	}

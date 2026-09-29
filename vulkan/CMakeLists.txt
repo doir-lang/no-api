@@ -46,6 +46,7 @@ endif()
 
 add_library(noapi-vulkan STATIC noapi.cpp)
 target_link_libraries(noapi-vulkan PUBLIC
+	noapi-slang
 	Vulkan::Vulkan
 	volk::volk
 	vk-bootstrap::vk-bootstrap

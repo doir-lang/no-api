@@ -16,6 +16,7 @@
 
 #include "../allocator.h"
 #include "../samplers.h"
+#include "../shaders.h"
 #include "../surface.h"
 #include "../sync.h"
 

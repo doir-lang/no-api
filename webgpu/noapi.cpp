@@ -1,4 +1,5 @@
 #include "noapi.hpp"
+#include "../slang_compiler.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -1209,192 +1210,212 @@ constexpr static uint64_t gpu_address_max = 0x1FFFFFFFFFFFFFFF; // (2^61 - 1) ak
 constexpr static uint32_t gpu_address_max_hi = static_cast<uint32_t>(gpu_address_max >> 32);
 constexpr static uint32_t gpu_address_tag_shift = std::countr_one(gpu_address_max_hi); // 61 - 32
 
-std::string generate_binding_prologue(GpuQueue* queue, bool compute) {
-	// Has to name the same view dimension GPU::texture_view2wgpu puts in the bind group layouts, or
-	// the declaration won't match the view that gets bound. A plain 2D texture is still an array
-	// view, since that is how several of them get packed into one monotexture.
-	constexpr static auto texture_dimension_suffix = [](TEXTURE type) {
+/**
+ * generate_backend_module – This backend's half of the shader ABI, as the Slang module
+ * that the portable `noapi` module (see slang_compiler.hpp) is written against.
+ *
+ * Unlike Vulkan's, this cannot be a fixed string. WGSL has no pointers, so a gpu pointer is
+ * the tagged {offset, monobuffer} pair gpuEncodeWebGPUAddressEXT produces and reaching one
+ * means switching over every monobuffer the queue has. WGSL also cannot index an array of
+ * textures or of samplers, so sampling means switching over every monotexture and every
+ * sampler slot. All of those counts are queue state, which is why this is regenerated — and
+ * the shaders built against it recompiled — whenever that state changes.
+ *
+ * The bindings it declares have to match what create_buffer_bind_group_layout and
+ * create_sampler_bind_group_layout put in the layouts; Slang maps [[vk::binding(b, s)]]
+ * onto WGSL's @binding(b) @group(s), so they are spelled here in the same order.
+ */
+std::string generate_backend_module(GpuQueue* queue, bool compute) {
+	// Has to name the same view dimension GPU::texture_view2wgpu puts in the bind group
+	// layouts, or the declaration won't match the view that gets bound. A plain 2D texture is
+	// still an array view, since that is how several of them get packed into one monotexture.
+	constexpr static auto sampled_type = [](TEXTURE type) {
 		switch (GPU::texture_view2wgpu(type)) {
-		case WGPUTextureViewDimension_1D: return "1d";
-		case WGPUTextureViewDimension_3D: return "3d";
-		case WGPUTextureViewDimension_Cube: return "cube";
-		case WGPUTextureViewDimension_CubeArray: return "cube_array";
-		case WGPUTextureViewDimension_2DArray: return "2d_array";
-		default: return "2d";
+		case WGPUTextureViewDimension_1D: return "Texture1D";
+		case WGPUTextureViewDimension_3D: return "Texture3D";
+		case WGPUTextureViewDimension_Cube: return "TextureCube";
+		case WGPUTextureViewDimension_CubeArray: return "TextureCubeArray";
+		case WGPUTextureViewDimension_2DArray: return "Texture2DArray";
+		default: return "Texture2D";
 		}
 	};
-	constexpr static auto wgsl_format = [](FORMAT f) {
+	constexpr static auto storage_type = [](TEXTURE type) {
+		switch (GPU::texture_view2wgpu(type)) {
+		case WGPUTextureViewDimension_1D: return "RWTexture1D";
+		case WGPUTextureViewDimension_3D: return "RWTexture3D";
+		case WGPUTextureViewDimension_Cube: return "RWTextureCube";
+		case WGPUTextureViewDimension_CubeArray: return "RWTextureCubeArray";
+		case WGPUTextureViewDimension_2DArray: return "RWTexture2DArray";
+		default: return "RWTexture2D";
+		}
+	};
+
+	// Slang spells storage texture formats the GLSL way and lowers them to the WGSL ones. The
+	// set below is exactly the set WGSL can name; everything left out is unreachable as a
+	// storage texture whatever the device supports (see the note in wgsl_format's predecessor:
+	// no sRGB storage format exists, bgra8unorm needs bgra8unorm-storage, and the narrow and
+	// packed formats need texture-formats-tier1, which this backend never asks for).
+	constexpr static auto slang_format = [](FORMAT f) {
 		switch (f) {
-		case FORMAT_R32_UINT: return "r32uint";
-		case FORMAT_R32_SINT: return "r32sint";
-		case FORMAT_R32_FLOAT: return "r32float";
-		case FORMAT_RGBA8_UNORM: return "rgba8unorm";
-		case FORMAT_RGBA8_SNORM: return "rgba8snorm";
-		case FORMAT_RGBA8_UINT: return "rgba8uint";
-		case FORMAT_RGBA8_SINT: return "rgba8sint";
-		case FORMAT_RG32_UINT: return "rg32uint";
-		case FORMAT_RG32_SINT: return "rg32sint";
-		case FORMAT_RG32_FLOAT: return "rg32float";
-		case FORMAT_RGBA16_UINT: return "rgba16uint";
-		case FORMAT_RGBA16_SINT: return "rgba16sint";
-		case FORMAT_RGBA16_FLOAT: return "rgba16float";
-		case FORMAT_RGBA32_UINT: return "rgba32uint";
-		case FORMAT_RGBA32_SINT: return "rgba32sint";
-		case FORMAT_RGBA32_FLOAT: return "rgba32float";
-		// Everything below is a format WGSL can't name as a storage texture, whatever the device
-		// supports. WGSL has no sRGB storage format at all, and bgra8unorm needs bgra8unorm-storage:
-		// case FORMAT_RGBA8_SRGB:
-		// case FORMAT_BGRA8_UNORM:
-		// case FORMAT_BGRA8_SRGB:
-		// The one and two component narrow formats, plus the packed ones, are only spellable with
-		// the texture-formats-tier1 feature, which we never ask for:
-		// case FORMAT_R8_*: case FORMAT_RG8_*: case FORMAT_R16_*: case FORMAT_RG16_*:
-		// case FORMAT_RGBA16_UNORM: case FORMAT_RGBA16_SNORM:
-		// case FORMAT_RG11B10_UFLOAT: case FORMAT_RGB10_A2_UINT: case FORMAT_RGB10_A2_UNORM:
-		// rgb9e5ufloat is read only even under tier2, and a depth/stencil format is never storage:
-		// case FORMAT_RGB9E5_UFLOAT:
-		// case FORMAT_S8_UINT: case FORMAT_D16_UNORM: case FORMAT_D24_PLUS:
-		// case FORMAT_D24_PLUS_S8_UINT: case FORMAT_D32_FLOAT: case FORMAT_D32_FLOAT_S8_UINT:
+		case FORMAT_R32_UINT: return "r32ui";
+		case FORMAT_R32_SINT: return "r32i";
+		case FORMAT_R32_FLOAT: return "r32f";
+		case FORMAT_RGBA8_UNORM: return "rgba8";
+		case FORMAT_RGBA8_SNORM: return "rgba8_snorm";
+		case FORMAT_RGBA8_UINT: return "rgba8ui";
+		case FORMAT_RGBA8_SINT: return "rgba8i";
+		case FORMAT_RG32_UINT: return "rg32ui";
+		case FORMAT_RG32_SINT: return "rg32i";
+		case FORMAT_RG32_FLOAT: return "rg32f";
+		case FORMAT_RGBA16_UINT: return "rgba16ui";
+		case FORMAT_RGBA16_SINT: return "rgba16i";
+		case FORMAT_RGBA16_FLOAT: return "rgba16f";
+		case FORMAT_RGBA32_UINT: return "rgba32ui";
+		case FORMAT_RGBA32_SINT: return "rgba32i";
+		case FORMAT_RGBA32_FLOAT: return "rgba32f";
 		default:
-			// The fallback is only reached by a texture the validation layer would reject anyway;
-			// naming the most common storage format keeps the generated WGSL parseable
+			// Only reached by a texture the validation layer would reject anyway; naming the
+			// most common storage format keeps the generated module parseable
 			assert(false && "Unsupported storage texture format");
-			return "rgba8unorm";
+			return "rgba8";
 		}
 	};
 
-	// A texture only owns part of the monotexture holding it, so its [0, 1] coordinates have to be
-	// scaled down by its share of the atlas before they are sampled. Cube coordinates are a direction
+	// A texture only owns part of the monotexture holding it, so its [0, 1] coordinates are
+	// scaled down by its share of the atlas before they are sampled. Each of these declares
+	// `at`, in whatever type the sample call below wants. Cube coordinates are a direction
 	// rather than a position, so they pass through untouched.
-	constexpr static auto texture_sample_remap = [](TEXTURE type) {
+	constexpr static auto sample_remap = [](TEXTURE type) {
 		switch (GPU::texture_view2wgpu(type)) {
-		case WGPUTextureViewDimension_1D: return "uv.x * f32(size.x) / f32(textureDimensions(sampled_tex_{0}, 0))";
-		case WGPUTextureViewDimension_3D: return "uv * vec3<f32>(size) / vec3<f32>(textureDimensions(sampled_tex_{0}, 0))";
+		case WGPUTextureViewDimension_1D:
+			return "\t\tuint dw; sampled_tex_{0}.GetDimensions(dw);\n"
+				"\t\tlet at = uv.x * float(size.x) / float(dw);\n";
+		case WGPUTextureViewDimension_3D:
+			return "\t\tuint dw, dh, dd; sampled_tex_{0}.GetDimensions(dw, dh, dd);\n"
+				"\t\tlet at = uv * float3(size) / float3(float(dw), float(dh), float(dd));\n";
 		case WGPUTextureViewDimension_Cube:
-		case WGPUTextureViewDimension_CubeArray: return "uv";
-		default: return "uv.xy * vec2<f32>(size.xy) / vec2<f32>(textureDimensions(sampled_tex_{0}, 0))";
-		}
-	};
-
-	// textureSampleLevel's argument list depends on the view dimension too, so every per slot wrapper
-	// spells its own call out. The dimensions that have no array index simply drop it.
-	constexpr static auto texture_sample_arguments = [](TEXTURE type) {
-		switch (GPU::texture_view2wgpu(type)) {
+			return "\t\tlet at = uv;\n";
+		case WGPUTextureViewDimension_CubeArray:
+			return "\t\tlet at = uv;\n";
 		case WGPUTextureViewDimension_2DArray:
-		case WGPUTextureViewDimension_CubeArray: return "at, layer, mip";
-		default: return "at, mip";
+			return "\t\tuint dw, dh, dl; sampled_tex_{0}.GetDimensions(dw, dh, dl);\n"
+				"\t\tlet at = uv.xy * float2(float(size.x), float(size.y)) / float2(float(dw), float(dh));\n";
+		default:
+			return "\t\tuint dw, dh; sampled_tex_{0}.GetDimensions(dw, dh);\n"
+				"\t\tlet at = uv.xy * float2(float(size.x), float(size.y)) / float2(float(dw), float(dh));\n";
 		}
 	};
 
-	// WebGPU forbids writable storage buffers in the vertex stage, so the rasterizer only ever gets
-	// read only access to the monobuffers (matching what create_buffer_bind_group_layout declares)
-	std::string out;
-	uint32_t binding = 0;
-	for(uint32_t i = 0; i < queue->monobuffers.size(); ++i)
-		out += std::format("@group(0) @binding({}) var<storage, {}> mono{} : array<u32>;\n", binding++, compute ? "read_write" : "read", i);
+	// The coordinate SampleLevel is actually given. The dimensions that have no array index
+	// simply drop it.
+	constexpr static auto sample_coordinate = [](TEXTURE type) {
+		switch (GPU::texture_view2wgpu(type)) {
+		case WGPUTextureViewDimension_2DArray: return "float3(at, float(layer))";
+		case WGPUTextureViewDimension_CubeArray: return "float4(at, float(layer))";
+		default: return "at";
+		}
+	};
 
-	out += std::format("\n"
-		"@group(0) @binding({}) var<storage> texture_heap : array<u32>;\n"
-		"@group(0) @binding({}) var<storage> noapi_sampler_map : array<u32>;\n"
-		"\n", binding, binding + 1);
-	binding += 2;
-
-	out += std::string(compute ?
-		"struct GPUShaderData {\n"
-		"	compute: vec2<u32>,\n"
-		"}\n"
-		: "struct GPUShaderData {\n"
-		"	vertex: vec2<u32>,\n"
-		"	fragment: vec2<u32>,\n"
-		"	indicies: vec2<u32>,\n"
-		"}\n")
-	+ std::format("@group(0) @binding({}) var<uniform> shader_data : GPUShaderData;\n\n", binding++);
+	std::string out = "module noapi_backend;\n\n";
 
 	//
-	// Pointers. A gpu pointer arrives as a vec2<u32> holding the 64 bits gpuEncodeWebGPUAddressEXT
-	// produced: an offset into a monobuffer, tagged in the top bits with which monobuffer that is.
-	// WGSL can't index an array of storage buffers, so reaching one means switching over every
-	// monobuffer the queue has, which is why these are generated rather than written by hand.
+	// Buffers. WebGPU forbids writable storage buffers in the vertex stage, so the rasterizer
+	// only ever gets the monobuffers read only (matching create_buffer_bind_group_layout).
+	//
+	uint32_t binding = 0;
+	for(uint32_t i = 0; i < queue->monobuffers.size(); ++i)
+		out += std::format("[[vk::binding({}, 0)]] public {}<uint> mono{};\n",
+			binding++, compute ? "RWStructuredBuffer" : "StructuredBuffer", i);
+
+	out += std::format("\n"
+		"[[vk::binding({}, 0)]] public StructuredBuffer<uint> texture_heap;\n"
+		"[[vk::binding({}, 0)]] public StructuredBuffer<uint> gpu_sampler_map;\n\n", binding, binding + 1);
+	binding += 2;
+
+	out += std::string(compute
+		? "public struct GpuShaderData {\n\tpublic uint2 compute;\n}\n"
+		: "public struct GpuShaderData {\n\tpublic uint2 vertex;\n\tpublic uint2 fragment;\n\tpublic uint2 index;\n}\n")
+		+ std::format("[[vk::binding({}, 0)]] public ConstantBuffer<GpuShaderData> shader_data;\n\n", binding++);
+
+	//
+	// Pointers. A gpu pointer arrives as the uint2 holding the 64 bits gpuEncodeWebGPUAddressEXT
+	// produced: an offset into a monobuffer, tagged in the top bits with which monobuffer that
+	// is. Slang has no pointers on this target either, so reaching one is the same switch the
+	// hand written WGSL used to spell out -- and, because the portable module builds every
+	// wider access out of the one word load, it is the only switch that has to be generated.
 	//
 	std::string load_cases, store_cases;
 	for(uint32_t i = 1; i < queue->monobuffers.size(); ++i) {
-		load_cases += std::format("		case {}u: {{ return mono{}[index]; }}\n", i, i);
-		store_cases += std::format("		case {}u: {{ mono{}[index] = value; }}\n", i, i);
+		load_cases += std::format("\tcase {}u: return mono{}[index];\n", i, i);
+		store_cases += std::format("\tcase {}u: mono{}[index] = value; break;\n", i, i);
 	}
 
 	out += std::format(
-		"const GPU_ADDRESS_MAX_HI : u32 = {:#x}u; // The bits of the high word that are still address\n"
-		"const GPU_ADDRESS_TAG_SHIFT : u32 = {}u; // Where the monobuffer tag starts in that word\n"
+		"static const uint GPU_ADDRESS_MAX_HI = {:#x}u; // The bits of the high word that are still address\n"
+		"static const uint GPU_ADDRESS_TAG_SHIFT = {}u; // Where the monobuffer tag starts in that word\n"
 		"\n"
-		"struct GPUAddress {{\n"
-		"	monobuffer : u32,\n"
-		"	address : vec2<u32>,\n"
+		"public uint2 gpuBackendEncodeAddress(uint monobuffer, uint2 address) {{\n"
+		"\tlet tag = monobuffer + 1u; // Zero is left meaning \"no pointer\"\n"
+		"\treturn uint2(address.x, (address.y & GPU_ADDRESS_MAX_HI) | (tag << GPU_ADDRESS_TAG_SHIFT));\n"
 		"}}\n"
 		"\n"
-		"// Steps a pointer forward by `offset` bytes. Only the low word moves: no allocation reaches\n"
-		"// far enough into a monobuffer to carry into the high one.\n"
-		"fn gpuPtrOffset(address : vec2<u32>, offset : u32) -> vec2<u32> {{\n"
-		"	return vec2<u32>(address.x + offset, address.y);\n"
+		"// Which monobuffer an address names. The tag is the index plus one, so that a zeroed\n"
+		"// pointer (tag 0) is \"no pointer\" rather than a valid address into the first one; it\n"
+		"// wraps to a tag no case matches and lands on monobuffer 0, which is the empty buffer.\n"
+		"public uint gpuBackendMonobuffer(uint2 address) {{\n"
+		"\treturn (address.y >> GPU_ADDRESS_TAG_SHIFT) - 1u;\n"
 		"}}\n"
 		"\n"
-		"fn gpuEncodeAddress(monobuffer : u32, address : vec2<u32>) -> vec2<u32> {{\n"
-		"	let tag = monobuffer + 1u; // Zero is left meaning \"no pointer\"\n"
-		"	return vec2<u32>(address.x, (address.y & GPU_ADDRESS_MAX_HI) | (tag << GPU_ADDRESS_TAG_SHIFT));\n"
-		"}}\n"
-		"\n"
-		"fn gpuDecodeAddress(encoded : vec2<u32>) -> GPUAddress {{\n"
-		"	let tag = encoded.y >> GPU_ADDRESS_TAG_SHIFT;\n"
-		"	return GPUAddress(tag - 1u, vec2<u32>(encoded.x, encoded.y & GPU_ADDRESS_MAX_HI));\n"
-		"}}\n"
-		"\n"
-		"fn gpuLoadU32(address : vec2<u32>) -> u32 {{\n"
-		"	let at = gpuDecodeAddress(address);\n"
-		"	let index = at.address.x / 4u;\n"
-		"	switch at.monobuffer {{\n"
+		"// The load half of the memory ABI: one word at the address the portable module hands\n"
+		"// over as the 64 bits of the pointer, low word first. Everything wider than a word --\n"
+		"// pointers, vectors, matrices, a shader's own structs -- is built out of this one call\n"
+		"// by the portable module, so this switch is the whole of what the emulation costs.\n"
+		"public uint gpuBackendLoadU32(uint2 address) {{\n"
+		"\tlet index = address.x / 4u;\n"
+		"\tswitch(gpuBackendMonobuffer(address)) {{\n"
 		"{}"
-		"		default: {{ return mono0[index]; }}\n"
-		"	}}\n"
-		"}}\n"
-		"\n"
-		"fn gpuLoadF32(address : vec2<u32>) -> f32 {{\n"
-		"	return bitcast<f32>(gpuLoadU32(address));\n"
-		"}}\n"
-		"\n"
-		"// Loads the pointer sitting at `address`, for stepping through a root data struct\n"
-		"fn gpuLoadPtr(address : vec2<u32>) -> vec2<u32> {{\n"
-		"	return vec2<u32>(gpuLoadU32(address), gpuLoadU32(gpuPtrOffset(address, 4u)));\n"
+		"\tdefault: return mono0[index];\n"
+		"\t}}\n"
 		"}}\n"
 		"\n", gpu_address_max_hi, gpu_address_tag_shift, load_cases);
 
-	// The rasterizer only gets the monobuffers read only (see create_buffer_bind_group_layout), so a
-	// store is compute only and declaring one in a graphics shader wouldn't even compile
+	// The rasterizer only gets the monobuffers read only, so a store is compute only. The
+	// portable module hides this behind GPU_STORES, so a graphics shader that tries to write
+	// gets a compile error rather than a store that quietly goes nowhere.
 	if(compute)
 		out += std::format(
-			"fn gpuStoreU32(address : vec2<u32>, value : u32) {{\n"
-			"	let at = gpuDecodeAddress(address);\n"
-			"	let index = at.address.x / 4u;\n"
-			"	switch at.monobuffer {{\n"
+			"public void gpuBackendStoreU32(uint2 address, uint value) {{\n"
+			"\tlet index = address.x / 4u;\n"
+			"\tswitch(gpuBackendMonobuffer(address)) {{\n"
 			"{}"
-			"		default: {{ mono0[index] = value; }}\n"
-			"	}}\n"
-			"}}\n"
-			"\n"
-			"fn gpuStoreF32(address : vec2<u32>, value : f32) {{\n"
-			"	gpuStoreU32(address, bitcast<u32>(value));\n"
+			"\tdefault: mono0[index] = value; break;\n"
+			"\t}}\n"
 			"}}\n"
 			"\n", store_cases);
 
-	binding = 0;
+	//
+	// Root data
+	//
+	out += compute
+		? "public uint2 gpuBackendRootCompute() { return shader_data.compute; }\n\n"
+		: "public uint2 gpuBackendRootVertex() { return shader_data.vertex; }\n"
+			"public uint2 gpuBackendRootFragment() { return shader_data.fragment; }\n"
+			"public uint2 gpuBackendRootIndex() { return shader_data.index; }\n\n";
 
+	//
+	// Textures
+	//
+	binding = 0;
 	for (auto const& [_cap, texture, view, desc] : queue->storage_monotextures) {
-		out += std::format("@group(1) @binding({}) var storage_tex_{} : texture_storage_{}<{}, read_write>;\n", binding, binding, texture_dimension_suffix(desc.type), wgsl_format(desc.format));
+		out += std::format("[[vk::binding({}, 1)]] [format(\"{}\")] public {}<float4> storage_tex_{};\n",
+			binding, slang_format(desc.format), storage_type(desc.type), binding);
 		++binding;
 	}
 
 	binding = 0;
-
 	for (auto const& [_cap, texture, view, desc] : queue->sampled_monotextures) {
-		out += std::format("@group(2) @binding({}) var sampled_tex_{} : texture_{}<f32>;\n", binding, binding, texture_dimension_suffix(desc.type));
+		out += std::format("[[vk::binding({}, 2)]] public {}<float4> sampled_tex_{};\n",
+			binding, sampled_type(desc.type), binding);
 		++binding;
 	}
 
@@ -1403,94 +1424,96 @@ std::string generate_binding_prologue(GpuQueue* queue, bool compute) {
 	//
 	out += "\n";
 	for (uint32_t i = 0; i < gpu_sampler_slot_count; ++i)
-		out += std::format("@group(3) @binding({}) var noapi_sampler_{} : sampler;\n", i, i);
+		out += std::format("[[vk::binding({}, 3)]] public SamplerState gpu_sampler_{};\n", i, i);
 
 	auto storage_count = static_cast<uint32_t>(queue->storage_monotextures.size());
 	auto sampled_count = static_cast<uint32_t>(queue->sampled_monotextures.size());
 
 	out += std::format("\n"
-		"const NOAPI_SAMPLER_SLOT_COUNT : u32 = {}u;\n"
-		"const NOAPI_SAMPLER_LOOKUP_SIZE : u32 = {}u;\n"
-		"const NOAPI_STORAGE_TEXTURE_COUNT : u32 = {}u;\n"
-		"const NOAPI_SAMPLED_TEXTURE_COUNT : u32 = {}u;\n"
+		"public static const uint GPU_SAMPLER_SLOT_COUNT = {}u;\n"
+		"public static const uint GPU_SAMPLER_LOOKUP_SIZE = {}u;\n"
+		"public static const uint GPU_STORAGE_TEXTURE_COUNT = {}u;\n"
+		"public static const uint GPU_SAMPLED_TEXTURE_COUNT = {}u;\n"
 		"\n"
-		"// Turns a packed GpuSamplerDesc into the slot holding it, or slot 0 (the default sampler)\n"
-		"// when that description was never handed to gpuSetEnabledSamplersEXT\n"
-		"fn noapi_sampler_slot(packed : u32) -> u32 {{\n"
-		"	if (packed >= NOAPI_SAMPLER_LOOKUP_SIZE) {{ return 0u; }}\n"
-		"	return noapi_sampler_map[packed];\n"
+		"// Turns a packed GpuSamplerDesc into the slot holding it, or slot 0 (the default\n"
+		"// sampler) when that description was never handed to gpuSetEnabledSamplersEXT\n"
+		"public uint gpuBackendSamplerSlot(uint packed) {{\n"
+		"\tif(packed >= GPU_SAMPLER_LOOKUP_SIZE) return 0u;\n"
+		"\treturn gpu_sampler_map[packed];\n"
 		"}}\n"
 		"\n"
-		"const NOAPI_MONOTEXTURE_STORAGE_BIT : u32 = 0x80000000u;\n"
-		"const NOAPI_MONOTEXTURE_INDEX_MASK : u32 = 0x7FFFFFFFu;\n"
+		"static const uint GPU_MONOTEXTURE_STORAGE_BIT = 0x80000000u;\n"
+		"static const uint GPU_MONOTEXTURE_INDEX_MASK = 0x7FFFFFFFu;\n"
 		"\n"
-		"// One entry of the texture heap, as gpuTextureViewDescriptor lays it out: eight words, the\n"
-		"// first of which packs three bytes. `size` is the texture's own, not the monotexture's --\n"
-		"// WGSL can report the monotexture's itself, but not how much of it this texture owns.\n"
-		"struct GPUTextureDescriptor {{\n"
-		"	texture_type : u32,\n"
-		"	base_mip : u32,\n"
-		"	mip_count : u32,\n"
-		"	size : vec3<u32>, // width, height, depth\n"
-		"	monotexture : u32, // Top bit set means a storage monotexture, the rest is the index\n"
-		"	first_layer : u32, // Absolute layer within that monotexture\n"
-		"	end_layer : u32,\n"
+		"// One entry of the texture heap, as gpuTextureViewDescriptor lays it out: eight words,\n"
+		"// the first of which packs three bytes. `size` is the texture's own, not the\n"
+		"// monotexture's -- WGSL can report the monotexture's itself, but not how much of it\n"
+		"// this texture owns.\n"
+		"public struct GpuTextureDescriptor {{\n"
+		"\tpublic uint texture_type;\n"
+		"\tpublic uint base_mip;\n"
+		"\tpublic uint mip_count;\n"
+		"\tpublic uint3 size; // width, height, depth\n"
+		"\tpublic uint monotexture; // Top bit set means a storage monotexture, the rest is the index\n"
+		"\tpublic uint first_layer; // Absolute layer within that monotexture\n"
+		"\tpublic uint end_layer;\n"
 		"}}\n"
 		"\n"
-		"fn noapi_texture_descriptor(heap_index : u32) -> GPUTextureDescriptor {{\n"
-		"	let at = heap_index * 8u;\n"
-		"	let packed = texture_heap[at];\n"
-		"	return GPUTextureDescriptor(packed & 0xFFu, (packed >> 8u) & 0xFFu, (packed >> 16u) & 0xFFu,\n"
-		"		vec3<u32>(texture_heap[at + 1u], texture_heap[at + 2u], texture_heap[at + 3u]),\n"
-		"		texture_heap[at + 4u], texture_heap[at + 5u], texture_heap[at + 6u]);\n"
+		"public GpuTextureDescriptor gpuBackendTextureDescriptor(uint heap_index) {{\n"
+		"\tlet at = heap_index * 8u;\n"
+		"\tlet packed = texture_heap[at];\n"
+		"\treturn GpuTextureDescriptor(packed & 0xFFu, (packed >> 8u) & 0xFFu, (packed >> 16u) & 0xFFu,\n"
+		"\t\tuint3(texture_heap[at + 1u], texture_heap[at + 2u], texture_heap[at + 3u]),\n"
+		"\t\ttexture_heap[at + 4u], texture_heap[at + 5u], texture_heap[at + 6u]);\n"
 		"}}\n"
 		"\n"
-		"fn noapi_monotexture_index(descriptor : GPUTextureDescriptor) -> u32 {{\n"
-		"	return descriptor.monotexture & NOAPI_MONOTEXTURE_INDEX_MASK;\n"
+		"public uint gpuBackendMonotextureIndex(GpuTextureDescriptor descriptor) {{\n"
+		"\treturn descriptor.monotexture & GPU_MONOTEXTURE_INDEX_MASK;\n"
 		"}}\n"
 		"\n"
-		"fn noapi_monotexture_is_storage(descriptor : GPUTextureDescriptor) -> bool {{\n"
-		"	return (descriptor.monotexture & NOAPI_MONOTEXTURE_STORAGE_BIT) != 0u;\n"
+		"public bool gpuBackendMonotextureIsStorage(GpuTextureDescriptor descriptor) {{\n"
+		"\treturn (descriptor.monotexture & GPU_MONOTEXTURE_STORAGE_BIT) != 0u;\n"
 		"}}\n"
 		"\n",
 		gpu_sampler_slot_count, GPU::detail::sampler_lookup_size, storage_count, sampled_count);
 
-	// WGSL can't index an array of samplers or of textures, so the only way to pick either one at
-	// runtime is a switch over every combination the queue currently has
+	// WGSL can't index an array of samplers or of textures, so the only way to pick either one
+	// at runtime is a switch over every combination the queue currently has.
 	binding = 0;
 	for (auto const& [_cap, texture, view, desc] : queue->sampled_monotextures) {
-		auto arguments = texture_sample_arguments(desc.type);
-		auto remap = std::vformat(texture_sample_remap(desc.type), std::make_format_args(binding));
-		out += std::format("fn noapi_sample_tex_{}(slot : u32, size : vec3<u32>, uv : vec3<f32>, layer : u32, mip : f32) -> vec4<f32> {{\n"
-			"	let at = {};\n"
-			"	switch slot {{\n", binding, remap);
+		auto coordinate = sample_coordinate(desc.type);
+		auto remap = std::vformat(sample_remap(desc.type), std::make_format_args(binding));
+		out += std::format("float4 gpu_sample_tex_{}(uint slot, uint3 size, float3 uv, uint layer, float mip) {{\n{}"
+			"\tswitch(slot) {{\n", binding, remap);
 		for (uint32_t i = 1; i < gpu_sampler_slot_count; ++i)
-			out += std::format("		case {}u: {{ return textureSampleLevel(sampled_tex_{}, noapi_sampler_{}, {}); }}\n", i, binding, i, arguments);
-		out += std::format("		default: {{ return textureSampleLevel(sampled_tex_{}, noapi_sampler_0, {}); }}\n"
-			"	}}\n"
+			out += std::format("\tcase {}u: return sampled_tex_{}.SampleLevel(gpu_sampler_{}, {}, mip);\n",
+				i, binding, i, coordinate);
+		out += std::format("\tdefault: return sampled_tex_{}.SampleLevel(gpu_sampler_0, {}, mip);\n"
+			"\t}}\n"
 			"}}\n"
-			"\n", binding, arguments);
+			"\n", binding, coordinate);
 		++binding;
 	}
 
 	out += "// Samples monotexture `texture` on `layer`, through the sampler in `slot` (see\n"
-		"// noapi_sampler_slot). `uv` runs 0..1 over a texture of `size`, which is scaled down onto\n"
+		"// gpuBackendSamplerSlot). `uv` runs 0..1 over a texture of `size`, which is scaled down onto\n"
 		"// whatever part of the monotexture that texture occupies. `layer` and `mip` are absolute.\n"
-		"fn noapi_sample_texture(texture : u32, slot : u32, size : vec3<u32>, uv : vec3<f32>, layer : u32, mip : f32) -> vec4<f32> {\n"
-		"	switch texture {\n";
+		"public float4 gpuBackendSampleTexture(uint texture, uint slot, uint3 size, float3 uv, uint layer, float mip) {\n"
+		"\tswitch(texture) {\n";
 	for (uint32_t i = 0; i < sampled_count; ++i)
-		out += std::format("		case {}u: {{ return noapi_sample_tex_{}(slot, size, uv, layer, mip); }}\n", i, i);
-	out += "		default: { return vec4<f32>(0.0); }\n"
-		"	}\n"
+		out += std::format("\tcase {}u: return gpu_sample_tex_{}(slot, size, uv, layer, mip);\n", i, i);
+	out += "\tdefault: return float4(0.0);\n"
+		"\t}\n"
 		"}\n"
 		"\n"
-		"// Samples a texture straight out of the heap. `uv` runs 0..1 over the texture, and `layer`\n"
-		"// and `mip` are relative to the view the descriptor describes rather than to the monotexture.\n"
-		"fn noapi_sample(heap_index : u32, slot : u32, uv : vec3<f32>, layer : u32, mip : f32) -> vec4<f32> {\n"
-		"	let descriptor = noapi_texture_descriptor(heap_index);\n"
-		"	let level = f32(descriptor.base_mip) + clamp(mip, 0.0, max(f32(descriptor.mip_count), 1.0) - 1.0);\n"
-		"	let at = descriptor.first_layer + min(layer, descriptor.end_layer - descriptor.first_layer - 1u);\n"
-		"	return noapi_sample_texture(noapi_monotexture_index(descriptor), slot, descriptor.size, uv, at, level);\n"
+		"// Samples a texture straight out of the heap. `uv` runs 0..1 over the texture, and\n"
+		"// `layer` and `mip` are relative to the view the descriptor describes rather than to the\n"
+		"// monotexture.\n"
+		"public float4 gpuBackendSample(uint heap_index, uint slot, float3 uv, uint layer, float mip) {\n"
+		"\tlet descriptor = gpuBackendTextureDescriptor(heap_index);\n"
+		"\tlet level = float(descriptor.base_mip) + clamp(mip, 0.0, max(float(descriptor.mip_count), 1.0) - 1.0);\n"
+		"\tlet at = descriptor.first_layer + min(layer, descriptor.end_layer - descriptor.first_layer - 1u);\n"
+		"\treturn gpuBackendSampleTexture(gpuBackendMonotextureIndex(descriptor), slot, descriptor.size, uv, at, level);\n"
 		"}\n";
 
 	return out;
@@ -1935,21 +1958,37 @@ GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue* queue, const GpuTextur
 	return gpuTextureViewDescriptor(queue, texture, desc);
 }
 
-// Splices the bindings generated for the queue's current monobuffer/monotexture set into the
-// provided IR (replacing every @generated_noapi_bindings marker) and compiles the result
-WGPUShaderModule create_shader_module(GpuQueue* queue, std::string_view IR, bool compute) {
-	constexpr std::string_view marker = "@generated_noapi_bindings";
-	std::string wgsl_source = {IR.begin(), IR.end()};
-	auto generated_bindings = generate_binding_prologue(queue, compute);
-	std::size_t pos = 0;
-	while ((pos = wgsl_source.find(marker, pos)) != std::string::npos) {
-		wgsl_source.replace(pos, marker.size(), generated_bindings);
-		pos += generated_bindings.size();
+/**
+ * create_shader_module – Compile the Slang source a pipeline was handed into WGSL for one
+ * stage and wrap the result as a shader module.
+ *
+ * The module it is linked against is the one generated for the queue's *current* bindings,
+ * which is why this is called again (rather than the pipeline being reused) whenever the
+ * monobuffer or monotexture set moves underneath it.
+ *
+ * @return The shader module, or null, having reported why, if it did not compile.
+ */
+WGPUShaderModule create_shader_module(GpuQueue* queue, std::string_view IR, GPU::shaders::SHADER_STAGE stage) {
+	auto compute = stage == GPU::shaders::SHADER_STAGE::COMPUTE;
+
+	std::string error;
+	auto wgsl = GPU::shaders::compile(SLANG_WGSL, generate_backend_module(queue, compute), IR, stage, {
+		{"GPU_COMPUTE", compute ? "1" : "0"},
+		{"GPU_GRAPHICS", compute ? "0" : "1"},
+		// The rasterizer only gets the monobuffers read only (see create_buffer_bind_group_layout),
+		// so the portable module only offers stores to a compute shader
+		{"GPU_STORES", compute ? "1" : "0"},
+	}, error);
+
+	if(!wgsl) {
+		GPU::shaders::report_diagnostic(error);
+		errno = WGPUErrorType_Validation;
+		return nullptr;
 	}
 
 	WGPUShaderSourceWGSL source {
 		.chain {.sType = WGPUSType_ShaderSourceWGSL },
-		.code = {wgsl_source.data(), wgsl_source.size()}
+		.code = {wgsl->data(), wgsl->size()}
 	};
 	WGPUShaderModuleDescriptor module {
 		.nextInChain = &source.chain
@@ -1964,8 +2003,10 @@ void update_compute_pipeline(GpuQueue* queue, const GpuPipeline* pipeline) {
 	WGPUComputePipelineDescriptor d {
 		.layout = queue->current_compute_pipeline_layout,
 		.compute = {
-			.module = create_shader_module(queue, cache.IR, true),
-			.entryPoint = {"main", WGPU_STRLEN},
+			.module = create_shader_module(queue, cache.IR, GPU::shaders::SHADER_STAGE::COMPUTE),
+			// Leaving the entry point undefined picks the module's only one, which is all Slang
+			// emitted for this stage
+			.entryPoint = WGPU_STRING_VIEW_INIT,
 		}
 	};
 	cache.pipeline = wgpuDeviceCreateComputePipeline(queue->device, &d);
@@ -2043,8 +2084,9 @@ void update_render_pipeline(GpuQueue* queue, const GpuPipeline* pipeline, const 
 		.depthBiasClamp = state.depthBiasClamp,
 	};
 
-	auto vertex_module = create_shader_module(queue, cache.vertexIR, false);
-	auto fragment_module = cache.fragmentIR.empty() ? nullptr : create_shader_module(queue, cache.fragmentIR, false);
+	auto vertex_module = create_shader_module(queue, cache.vertexIR, GPU::shaders::SHADER_STAGE::VERTEX);
+	auto fragment_module = cache.fragmentIR.empty() ? nullptr
+		: create_shader_module(queue, cache.fragmentIR, GPU::shaders::SHADER_STAGE::FRAGMENT);
 
 	WGPUFragmentState fragment {
 		.module = fragment_module,
@@ -2781,14 +2823,21 @@ void bindRenderPipeline(GpuCommandBuffer* cmd) {
 		wgpuRenderPassEncoderSetStencilReference(cmd->render_pass, cmd->depth_stencil->stencilFront.reference);
 }
 
+// The field offsets here are the ones the generated GpuShaderData lands on (0, 8 and 16 --
+// Slang lays a uniform block out std140 style, where a uint2 sits on an 8 byte boundary). The
+// trailing padding is not: a WGSL uniform block's *size* is rounded up to a multiple of 16, and
+// the binding is rejected outright if the buffer behind it is smaller than that rounded size,
+// so each of these is padded out to what the shader side actually binds as.
 struct ComputeShaderData {
 	gpu* compute;
+	uint64_t _padding = 0;
 };
 
 struct GraphicsShaderData {
 	gpu* vertex;
 	gpu* fragment;
 	gpu* indices;
+	uint64_t _padding = 0;
 };
 
 // Builds group 0: every monobuffer, the active texture heap, and a throwaway uniform holding the

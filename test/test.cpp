@@ -9,8 +9,6 @@
 #include <stdexcept>
 #include <string>
 
-// Which backend noapi::noapi resolved to is published by the CMake target, so an application only has
-// to pick a shading language and a way of handing the backend its window.
 #ifdef NOAPI_BACKEND_VULKAN
 	#include <volk.h>
 	#define GLFW_INCLUDE_VULKAN
@@ -20,12 +18,6 @@
 
 #ifdef NOAPI_BACKEND_VULKAN
 	#include <vulkan/noapi.hpp>
-
-	// The Vulkan backend takes SPIR-V, so the test brings its own GLSL compiler
-	#include <glslang/Public/ShaderLang.h>
-	#include <glslang/Public/ResourceLimits.h>
-	#include <glslang/SPIRV/GlslangToSpv.h>
-	#include <vector>
 #else
 	#include <webgpu/noapi.hpp>
 	#include "glfw3webgpu.h"
@@ -36,125 +28,100 @@
 #endif
 
 
+
+static const std::string slang_compute = R"slang(
+import noapi;
+import test_constants; // Registered by the program with gpuAddSlangModuleEXT
+
+// As many elements as the C++ side allocated. The dispatch covers a whole workgroup, so the
+// threads past the end have to be sent home rather than left to trample memory that was never
+// theirs.
+static const uint ELEMENT_COUNT = 5;
+
+// The root data struct the dispatch was handed: {float* upload, float* download}. Conforming it
+// to IGpuLoadable is what lets the shader read one in a single `*gpuComputeData<ComputeData>()`
+// -- the layout says how wide it is and how to walk it, and everything underneath is the one 32
+// bit load the backend provides.
+struct ComputeData : IGpuLoadable {
+	GpuPtr<float> upload;
+	GpuPtr<float> download;
+
+	static const uint gpuStride = 16;
+
+	static ComputeData gpuLoad(GpuAddress at) {
+		var from = GpuReader(at); // Walks the fields in order, so no offset is written down
+		ComputeData out;
+		out.upload = from.next<GpuPtr<float> >();
+		out.download = from.next<GpuPtr<float> >();
+		return out;
+	}
+}
+
+[shader("compute")]
+[numthreads(16, 1, 1)]
+void computeMain(uint3 thread : SV_DispatchThreadID) {
+	if(thread.x >= ELEMENT_COUNT) return;
+
+	let data = *gpuComputeData<ComputeData>();
+	data.download[thread.x] = data.upload[thread.x] * gpuTestScaleFactor();
+}
+)slang";
+
+static const std::string slang_triangle = R"slang(
+import noapi;
+
+struct Varyings {
+	float4 position : SV_Position;
+	float3 color : COLOR;
+}
+
+// One entry of the vertex array, matching Vertex on the C++ side: five floats, {x, y, r, g, b}.
+// Nothing writes a vertex, so the layout is read only -- IGpuStorable and a gpuStore beside it
+// would be what a shader that writes one adds, and on a WebGPU graphics stage they could not
+// exist anyway, since the monobuffers are bound read only there.
+struct Vertex : IGpuLoadable {
+	float2 position;
+	float3 color;
+
+	static const uint gpuStride = 20;
+
+	static Vertex gpuLoad(GpuAddress at) {
+		var from = GpuReader(at);
+		Vertex out;
+		out.position = from.next<float2>();
+		out.color = from.next<float3>();
+		return out;
+	}
+}
+
+[shader("vertex")]
+Varyings vertexMain(uint index : SV_VertexID) {
+	// The root data is one pointer, so the pointer to it is a pointer to a pointer
+	let vertices = *gpuVertexData<GpuPtr<Vertex> >();
+	let vertex = vertices[index];
+
+	Varyings output;
+	output.position = float4(vertex.position, 0.0, 1.0);
+	output.color = vertex.color;
+	return output;
+}
+
+// The fragment stage never touches the root data it was handed; it just interpolates
+[shader("fragment")]
+float4 fragmentMain(Varyings varyings) : SV_Target {
+	return float4(varyings.color, 1.0);
+}
+)slang";
+
+static const std::string slang_user_module = R"slang(
+module test_constants;
+
+public float gpuTestScaleFactor() { return 6.0; }
+)slang";
+
 #ifdef NOAPI_BACKEND_VULKAN
 
-	// The prologues the backend exports declare the push constant block holding whatever root pointers
-	// the dispatch or draw was given — pc.compute_data for a dispatch, pc.vertex_data/fragment_data/
-	// index_data for a draw — along with the sampler lookup helpers. A pointer is a plain device address
-	// here, so walking one is an ordinary buffer reference cast rather than a generated helper.
-
-	// Multiplies an array of floats by six, through the two pointers its root data struct holds
-	static const std::string glsl_compute = R"glsl(
-layout(buffer_reference, std430, buffer_reference_align = 4) buffer Floats {
-	float data[];
-};
-
-layout(buffer_reference, std430, buffer_reference_align = 8) buffer ComputeData {
-	Floats upload;
-	Floats download;
-};
-
-// As many elements as the C++ side allocated. The dispatch covers a whole workgroup, so the threads
-// past the end have to be sent home rather than left to trample memory that was never theirs.
-const uint ELEMENT_COUNT = 5;
-
-layout(local_size_x = 16) in;
-
-void main() {
-	if(gl_GlobalInvocationID.x >= ELEMENT_COUNT) return;
-
-	ComputeData data = ComputeData(pc.compute_data);
-	Floats u = data.upload;
-	Floats d = data.download;
-
-	d.data[gl_GlobalInvocationID.x] = u.data[gl_GlobalInvocationID.x] * 6;
-}
-	)glsl";
-
-	// There are no vertex buffers — the vertex shader loads each vertex out of the array its root data
-	// points at.
-	static const std::string glsl_vertex = R"glsl(
-layout(buffer_reference, std430, buffer_reference_align = 4) buffer Vertices {
-	float data[];
-};
-
-layout(buffer_reference, std430, buffer_reference_align = 8) buffer TriangleData {
-	Vertices vertices;
-};
-
-// One entry of that array is {x, y, r, g, b}: five floats, matching Vertex on the C++ side
-const uint VERTEX_STRIDE = 5;
-
-layout(location = 0) out vec3 frag_color;
-
-void main() {
-	Vertices verts = TriangleData(pc.vertex_data).vertices;
-	uint at = gl_VertexIndex * VERTEX_STRIDE;
-
-	// Vulkan's clip space points the opposite way down the Y axis to WebGPU's, so the same vertices
-	// have to be flipped to land the triangle the same way up
-	gl_Position = vec4(verts.data[at], -verts.data[at + 1], 0.0, 1.0);
-	frag_color = vec3(verts.data[at + 2], verts.data[at + 3], verts.data[at + 4]);
-}
-	)glsl";
-
-	// The fragment stage never touches the root data it was handed; it just interpolates
-	static const std::string glsl_fragment = R"glsl(
-layout(location = 0) in vec3 frag_color;
-layout(location = 0) out vec4 out_color;
-
-void main() {
-	out_color = vec4(frag_color, 1.0);
-}
-	)glsl";
-
 	using GpuBackendDefault = GpuVulkanDefault;
-
-	// Prepends the prologue the backend expects and hands the result to glslang. The pipeline is built
-	// from the words rather than the source, so each blob outlives the call it was passed to.
-	static std::vector<uint32_t> compile_glsl(EShLanguage stage, const std::string& body) {
-		static const bool initialized = glslang::InitializeProcess();
-		assert(initialized && "glslang initialization failed");
-
-		auto source = std::string(stage == EShLangCompute ? COMPUTE_SHADER_PROLOGUE : GRAPHICS_SHADER_PROLOGUE) + body;
-		const char* source_array = source.c_str();
-
-		glslang::TShader shader(stage);
-		shader.setStrings(&source_array, 1);
-		shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 460);
-		shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_4);
-		shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_6);
-
-		auto messages = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules | EShMsgDefault);
-		if(!shader.parse(GetDefaultResources(), 460, false, messages))
-			throw std::runtime_error(std::string("glslang parse error:\n") + shader.getInfoLog() + shader.getInfoDebugLog());
-
-		glslang::TProgram program;
-		program.addShader(&shader);
-		if(!program.link(messages))
-			throw std::runtime_error(std::string("glslang link error:\n") + program.getInfoLog() + program.getInfoDebugLog());
-
-		std::vector<uint32_t> spirv;
-		glslang::SpvOptions options;
-		options.validate = true;
-		glslang::GlslangToSpv(*program.getIntermediate(stage), spirv, &options);
-		return spirv;
-	}
-
-	static std::span<const std::byte> compute_shader() {
-		static const auto spirv = compile_glsl(EShLangCompute, glsl_compute);
-		return byte_span<uint32_t>(spirv);
-	}
-
-	static std::span<const std::byte> vertex_shader() {
-		static const auto spirv = compile_glsl(EShLangVertex, glsl_vertex);
-		return byte_span<uint32_t>(spirv);
-	}
-
-	static std::span<const std::byte> fragment_shader() {
-		static const auto spirv = compile_glsl(EShLangFragment, glsl_fragment);
-		return byte_span<uint32_t>(spirv);
-	}
 
 	static GpuBackendDefault setup_backend(GLFWwindow* window) {
 		auto vk = gpuSetupDefaultVulkanEXT([window](VkInstance instance) -> VkSurfaceKHR {
@@ -167,7 +134,6 @@ void main() {
 		return *vk;
 	}
 
-	// Everything gpuSetupDefaultVulkanEXT created, destroyed once the queue built on top of it is gone
 	static void shutdown_backend(GpuBackendDefault& vulkan) {
 		vkDestroyDevice(vulkan.device, nullptr);
 		vkDestroySurfaceKHR(vulkan.instance, vulkan.surface, nullptr);
@@ -178,73 +144,7 @@ void main() {
 
 #else
 
-	// @generated_noapi_bindings expands into the monobuffer, texture and sampler declarations, the
-	// shader_data uniform holding whatever root pointers the dispatch or draw was given, and the helpers
-	// for walking one of those pointers: gpuPtrOffset, gpuLoadU32/F32/Ptr, and (compute only, since the
-	// rasterizer never gets the monobuffers writable) gpuStoreU32/F32.
-
-	// Multiplies an array of floats by six, through the two pointers its root data struct holds
-	static const std::string wgsl_compute = R"wgsl(
-	@generated_noapi_bindings
-
-	// As many elements as the C++ side allocated. The dispatch covers a whole workgroup, so the threads
-	// past the end have to be sent home rather than left to trample the rest of the monobuffer.
-	const ELEMENT_COUNT : u32 = 5u;
-
-	@compute @workgroup_size(16)
-	fn main(@builtin(global_invocation_id) global_id : vec3u) {
-		if (global_id.x >= ELEMENT_COUNT) { return; }
-
-		let sizeof_f32 : u32 = 4;
-		let data = shader_data.compute;
-		let u = gpuPtrOffset(gpuLoadPtr(data), global_id.x * sizeof_f32);
-		let d = gpuPtrOffset(gpuLoadPtr(gpuPtrOffset(data, 8u)), global_id.x * sizeof_f32);
-
-		gpuStoreF32(d, gpuLoadF32(u) * 6);
-	}
-	)wgsl";
-
-	// Both stages live in one blob: the pipeline leaves the entry point undefined, so each stage picks the
-	// only one it finds. There are no vertex buffers — the vertex shader loads each vertex out of the array
-	// its root data points at.
-	static const std::string wgsl_triangle = R"wgsl(
-	@generated_noapi_bindings
-
-	struct Varyings {
-		@builtin(position) position : vec4<f32>,
-		@location(0) color : vec3<f32>,
-	}
-
-	// One entry of that array is {x, y, r, g, b}: five floats, matching Vertex on the C++ side
-	const VERTEX_STRIDE : u32 = 20u;
-
-	@vertex
-	fn vertex(@builtin(vertex_index) index : u32) -> Varyings {
-		let sizeof_f32 : u32 = 4;
-		let vertices = gpuLoadPtr(shader_data.vertex);
-		let at = gpuPtrOffset(vertices, index * VERTEX_STRIDE);
-
-		return Varyings(
-			vec4<f32>(gpuLoadF32(at), gpuLoadF32(gpuPtrOffset(at, 1 * sizeof_f32)), 0.0, 1.0),
-			vec3<f32>(
-				gpuLoadF32(gpuPtrOffset(at, 2 * sizeof_f32)),
-				gpuLoadF32(gpuPtrOffset(at, 3 * sizeof_f32)),
-				gpuLoadF32(gpuPtrOffset(at, 4 * sizeof_f32))
-			)
-		);
-	}
-
-	@fragment
-	fn fragment(varyings : Varyings) -> @location(0) vec4<f32> {
-		return vec4<f32>(varyings.color, 1.0);
-	}
-	)wgsl";
-
 	using GpuBackendDefault = GpuWebGPUDefault;
-
-	static std::span<const std::byte> compute_shader() { return string_to_bytes(wgsl_compute); }
-	static std::span<const std::byte> vertex_shader() { return string_to_bytes(wgsl_triangle); }
-	static std::span<const std::byte> fragment_shader() { return string_to_bytes(wgsl_triangle); }
 
 	static GpuBackendDefault setup_backend(GLFWwindow* window) {
 		auto wg = gpuSetupDefaultWebGPUEXT([window](WGPUInstance instance) -> WGPUSurface {
@@ -256,7 +156,6 @@ void main() {
 		return *wg;
 	}
 
-	// Everything gpuSetupDefaultWebGPUEXT created, released once the queue built on top of it is gone
 	static void shutdown_backend(GpuBackendDefault& wgpu) {
 		wgpuSurfaceRelease(wgpu.surface);
 		wgpuDeviceRelease(wgpu.device);
@@ -267,8 +166,6 @@ void main() {
 #endif
 
 
-// c_compat.c is the same API driven from C; this is its half of a check that the two faces of
-// the headers agree on how a sampler description is laid out and packed
 extern "C" uint16_t noapi_c_compat_packed_default_sampler(void);
 
 typedef struct AppState {
@@ -283,8 +180,6 @@ typedef struct AppState {
 	uint32_t height;
 } AppState;
 
-// What the vertex shader walks. None of this layout is declared to the API; the shader loads the
-// fields it wants out of the pointer it was handed.
 struct Vertex {
 	float x, y;
 	float r, g, b;
@@ -308,8 +203,6 @@ static void render_frame(AppState *state) {
 	// A minimized window has nothing to present, and a surface can't be configured for a zero extent
 	if (state->width == 0 || state->height == 0) return;
 
-	// An acquired texture keeps the size it was configured with, so a resize has to be answered before
-	// the frame rather than after it
 	auto configured = gpuSurfaceGetConfigurationEXT(state->surface).texture.dimensions;
 	if (configured.x != state->width || configured.y != state->height)
 		resize_surface(state);
@@ -361,18 +254,28 @@ int real_main() {
 	}
 
 	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-	state.window = glfwCreateWindow(initial_width, initial_height, "NoAPI Triangle", NULL, NULL);
+#ifdef NOAPI_BACKEND_VULKAN
+	state.window = glfwCreateWindow(initial_width, initial_height, "NoAPI Triangle (vulkan)", NULL, NULL);
+#elifdef NOAPI_BACKEND_WEBGPU
+	state.window = glfwCreateWindow(initial_width, initial_height, "NoAPI Triangle (webgpu)", NULL, NULL);
+#else
+	state.window = glfwCreateWindow(initial_width, initial_height, "NoAPI Triangle (unknown)", NULL, NULL);
+#endif
 	assert(state.window && "Failed to create glfw window");
 
 	glfwSetWindowUserPointer(state.window, &state);
 	glfwSetFramebufferSizeCallback(state.window, on_framebuffer_resize);
 
+	// Shaders are compiled inside the pipeline creation calls, so anything they import has to be
+	// registered first. This also routes the compiler's diagnostics somewhere visible.
+	gpuSetShaderDiagnosticCallbackEXT([](GpuStringView message, void*) {
+		std::println("[shader] {}", std::string_view(message.ptr, message.count));
+	}, nullptr);
+	gpuAddShaderModuleEXT("test_constants", GpuStringView{slang_user_module.data(), slang_user_module.size()});
+
 	state.backend = setup_backend(state.window);
 	state.queue = gpuCreateQueue(state.backend);
 
-	//
-	// Compute: multiply five floats by six on the GPU and read them back
-	//
 	auto upload = gpuMalloc<float>(state.queue, 5, MEMORY_DEFAULT);
 	for(size_t i = 0; i < 5; ++i)
 		upload[i] = i;
@@ -389,7 +292,7 @@ int real_main() {
 	auto data_gpu = gpuHostToDevicePointer(state.queue, data);
 	gpuSyncMemoryEXT(state.queue, data_gpu);
 
-	auto pipe = gpuCreateComputePipeline(state.queue, compute_shader());
+	auto pipe = gpuCreateComputePipeline(state.queue, string_to_bytes(slang_compute));
 
 	{
 		auto cmd = gpuStartCommandRecording(state.queue);
@@ -405,9 +308,6 @@ int real_main() {
 
 	gpuFreePipeline(state.queue, pipe);
 
-	//
-	// The presentation surface
-	//
 	{
 		int fb_width, fb_height;
 		glfwGetFramebufferSize(state.window, &fb_width, &fb_height);
@@ -442,12 +342,8 @@ int real_main() {
 			break;
 		}
 
-	// What the surface settled on, which is not necessarily what was asked for
 	std::println("surface: {}x{}, format {}, present mode {}", config.texture.dimensions.x, config.texture.dimensions.y, (int)config.texture.format, (int)config.presentMode);
 
-	//
-	// Graphics: the triangle's vertices and indices, and a pipeline targeting the surface's format
-	//
 	auto vertices = gpuMalloc<Vertex>(state.queue, 3);
 	vertices[0] = {-0.5f, -0.5f, 0.0f, 0.0f, 1.0f};
 	vertices[1] = { 0.5f, -0.5f, 0.0f, 1.0f, 0.0f};
@@ -464,17 +360,13 @@ int real_main() {
 	state.triangle = gpuHostToDevicePointer(state.queue, triangle);
 	state.indices = gpuHostToDevicePointer(state.queue, indices);
 
-	// None of it ever changes, so one push into the monobuffers is enough
 	gpuSyncMemoryEXT(state.queue, triangle->vertices);
 	gpuSyncMemoryEXT(state.queue, state.indices);
 	gpuSyncMemoryEXT(state.queue, state.triangle);
 
 	GpuColorTarget target { .format = config.texture.format };
-	state.pipeline = gpuCreateGraphicsPipeline(state.queue, vertex_shader(), fragment_shader(), GpuRasterDesc{
-		// .topology = TOPOLOGY_TRIANGLE_LIST,
-		// .cull = CULL_NONE,
+	state.pipeline = gpuCreateGraphicsPipeline(state.queue, string_to_bytes(slang_triangle), string_to_bytes(slang_triangle), GpuRasterDesc{
 		.colorTargets = {&target, 1},
-		// Baked in rather than applied dynamically, so the pipeline never gets rebuilt for it
 		.blendstate = GpuBlendDesc{
 			.srcColorFactor = FACTOR_SRC_ALPHA,
 			.dstColorFactor = FACTOR_ONE_MINUS_SRC_ALPHA,

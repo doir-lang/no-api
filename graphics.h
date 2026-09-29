@@ -524,8 +524,9 @@ NOAPI_EXTERN_C_BEGIN
  * dynamically via gpuSetBlendState.
  *
  * @param queue The GPU queue (device) on which the pipeline will be created.
- * @param vertexIR Vertex shader IR blob (SPIRV on Vulkan, WGSL on WebGPU)
- * @param fragmentIR Pixel shader IR blob (SPIRV on Vulkan, WGSL on WebGPU)
+ * @param vertexIR Vertex shader source (Slang; see shaders.h). May be the same module as
+ * \p fragmentIR, since entry points are found by stage.
+ * @param fragmentIR Pixel shader source (Slang; see shaders.h).
  * @param desc Rasterizer, format, and optional embedded blend state.
  */
 GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, GpuByteSpan fragmentIR, NOAPI_CONST_REF(GpuRasterDesc) desc);
@@ -539,8 +540,8 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
  * binning requires a vertex-shader-granularity primitive stream.
  *
  * @param queue The GPU queue (device) on which the pipeline will be created.
- * @param meshletIR Mesh shader IR blob (SPIRV on Vulkan, WGSL on WebGPU)
- * @param fragmentIR Pixel shader IR blob (SPIRV on Vulkan, WGSL on WebGPU)
+ * @param meshletIR Mesh shader source (Slang; see shaders.h).
+ * @param fragmentIR Pixel shader source (Slang; see shaders.h).
  * @param desc Rasterizer, format, and optional embedded blend state.
  */
 // GpuPipeline gpuCreateGraphicsMeshletPipeline(GpuQueue* queue, std::span<const std::byte> meshletIR, std::span<const std::byte> fragmentIR, GpuRasterDesc desc);

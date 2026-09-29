@@ -737,15 +737,15 @@ GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue* queue, const GpuTextur
 // ---------------------------------------------------------------------------
 
 /**
- * gpuCreateComputePipeline – Compile a compute shader from its intermediate
- * representation (IR) into a hardware-specific GpuPipeline.
+ * gpuCreateComputePipeline – Compile a compute shader into a hardware-specific
+ * GpuPipeline.
  *
  * No root signature, descriptor set layout, or push-constant layout is needed.
  * The shader receives its data as a single 64-bit GPU pointer that the user passes
  * to gpuDispatch / gpuDispatchIndirect.
  *
  * @param queue The GPU queue (device) on which the pipeline will be created.
- * @param computeIR Platform IR blob (SPIRV on Vulkan, WGSL on WebGPU).
+ * @param computeIR Compute shader source (Slang; see shaders.h).
  */
 GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, GpuByteSpan computeIR);
 

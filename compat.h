@@ -137,8 +137,9 @@
 #endif
 
 /**
- * GpuByteSpan – A read only view of raw bytes, used for the shader IR blobs handed to the
- * pipeline creation functions. Stands in for std::span<const std::byte>.
+ * GpuByteSpan – A read only view of raw bytes, used for the shader source handed to the
+ * pipeline creation functions (Slang text; see shaders.h). Stands in for
+ * std::span<const std::byte>.
  */
 #ifdef __cplusplus
 	struct GpuByteSpan {
