@@ -39,7 +39,11 @@ typedef struct GpuDepthStencilState GpuDepthStencilState;
  * recompiling the PSO, significantly cutting blend-mode permutations.
  * On mobile TBDR GPUs blending is burned into the pixel shader microcode; users
  * may instead use framebuffer-fetch intrinsics and author a parametrised formula.
- * Created by gpuCreateBlendState; requires a device feature flag.
+ * Created by gpuCreateBlendState.
+ *
+ * @note Dynamic blending is something the device has to provide (on Vulkan it is
+ * VK_EXT_extended_dynamic_state3, which the backend requires), rather than something a
+ * program asks about and branches on -- a device without it cannot run this API at all.
  */
 typedef struct GpuBlendState GpuBlendState;
 
@@ -701,14 +705,12 @@ void gpuEndRenderPass(GpuCommandBuffer* cmd, GpuOptionalRenderPassDesc desc NOAP
  * @param index_count Number of indices to draw.
  * @param instance_count Number of instances (1 for non-instanced geometry).
  * @param index_type expected type of the bound indices
- * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
- * @param no_index_buffer_changes When true reuses the last value in interal index buffer (skips copying any changed indices)
  *
  */
 void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd,
  gpu* vertex_data, gpu* fragment_data,
  gpu* indices, uint32_t index_count, uint32_t instance_count,
- INDEX_TYPE_EXT index_type NOAPI_DEFAULT(INDEX_TYPE_UINT32), bool no_offsets NOAPI_DEFAULT(false), bool no_index_buffer_changes NOAPI_DEFAULT(false));
+ INDEX_TYPE_EXT index_type NOAPI_DEFAULT(INDEX_TYPE_UINT32));
 
 /**
  * gpuDrawIndexedInstancedIndirect – GPU-driven indexed instanced draw. Reads the
@@ -725,13 +727,11 @@ void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd,
  * @param indices GPU pointer to the index buffer.
  * @param args GPU pointer to an indirect draw argument struct
  * @param index_type expected type of the bound indices
- * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
- * @param no_index_buffer_changes When true reuses the last value in interal index buffer (skips copying any changed indices)
  */
 void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd,
  gpu* vertex_data, gpu* fragment_data,
  gpu* indices, gpu* args,
- INDEX_TYPE_EXT index_type NOAPI_DEFAULT(INDEX_TYPE_UINT32), bool no_offsets NOAPI_DEFAULT(false), bool no_index_buffer_changes NOAPI_DEFAULT(false));
+ INDEX_TYPE_EXT index_type NOAPI_DEFAULT(INDEX_TYPE_UINT32));
 
 // TODO: Why does this one not take an index buffer?
 // /**
@@ -753,14 +753,12 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd,
 //  * @param argsGpu GPU pointer to an array of indirect draw argument structs.
 //  * @param drawCountGpu GPU pointer to a uint32 holding the actual draw count.
 //  * @param index_type expected type of the bound indices
-//  * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
-//  * @param no_index_buffer_changes When true reuses the last value in interal index buffer (skips copying any changed indices)
 //  */
 // void gpuDrawIndexedInstancedIndirectMulti(GpuCommandBuffer* cmd,
 //  gpu* dataVxGpu, uint32_t vxStride,
 //  gpu* dataPxGpu, uint32_t pxStride,
 //  gpu* argsGpu, gpu* drawCountGpu,
-//  INDEX_TYPE_EXT index_type = INDEX_TYPE_UINT32, bool no_offsets = false, bool no_index_buffer_changes = false);
+//  INDEX_TYPE_EXT index_type = INDEX_TYPE_UINT32);
 
 /**
  * gpuDrawMeshlets – Launch a mesh shader pass, dispatching a 3D grid of mesh
@@ -789,8 +787,7 @@ void gpuDrawMeshlets(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_dat
  * @param meshlet_data GPU pointer to the mesh shader root data struct.
  * @param fragment_data GPU pointer to the pixel shader root data struct.
  * @param dim GPU pointer to a uvec3 containing group dimensions.
- * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, gpu* dim, bool no_offsets NOAPI_DEFAULT(false));
+void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, gpu* dim);
 
 NOAPI_EXTERN_C_END

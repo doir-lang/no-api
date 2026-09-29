@@ -30,10 +30,27 @@ uint16_t noapi_c_compat_packed_default_sampler(void) {
 	return gpuSamplerDescPackEXT(desc);
 }
 
+// The diagnostic hook, as a C function pointer, so its signature is checked too
+static void noapi_c_compat_diagnostic(GpuQueue* queue, GPU_DIAGNOSTIC kind, GpuStringView message, void* userdata) {
+	(void)queue; (void)kind; (void)message; (void)userdata;
+}
+
 void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data);
 void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data) {
+	// Capabilities and diagnostics
+	GpuCapabilities capabilities = gpuGetCapabilitiesEXT(queue);
+	(void)capabilities.mesh_shaders;
+	(void)capabilities.split_barrier_signals;
+	(void)capabilities.split_barriers;
+	(void)capabilities.gpu_writable_texture_heap;
+	(void)capabilities.descriptor_heap_in_any_memory;
+	(void)capabilities.texture_descriptor_stride_ratio;
+	gpuSetDiagnosticCallbackEXT(queue, noapi_c_compat_diagnostic, NULL);
+
 	// Memory
 	void* host = gpuMalloc(queue, 1024, 16, MEMORY_DEFAULT);
+	void* heap_memory = gpuMalloc(queue, 1024, 64, MEMORY_DESCRIPTOR_HEAP);
+	(void)heap_memory;
 	gpu* device = gpuHostToDevicePointer(queue, host);
 	void* mapped = gpuDeviceToHostPointerEXT(queue, device);
 
@@ -86,18 +103,18 @@ void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data) {
 	uvec2 extent = {256, 256};
 	ivec2 origin = {0, 0};
 
-	gpuSetActiveTextureHeapPtr(cmd, data, false);
+	gpuSetActiveTextureHeapPtr(cmd, data);
 	gpuBarrier(cmd, STAGE_COMPUTE, STAGE_PIXEL_SHADER, HAZARD_DESCRIPTORS);
 	gpuSignalAfter(cmd, STAGE_COMPUTE, data, 1, SIGNAL_ATOMIC_MAX);
 	gpuWaitBefore(cmd, STAGE_PIXEL_SHADER, data, 1, OP_GREATER_EQUAL, HAZARD_DRAW_ARGUMENTS, ~(uint64_t)0);
 
 	gpuSetPipeline(cmd, compute);
-	gpuDispatch(cmd, data, grid, false);
-	gpuDispatchIndirect(cmd, data, data, false);
+	gpuDispatch(cmd, data, grid);
+	gpuDispatchIndirect(cmd, data, data);
 
-	gpuMemCpy(cmd, data, data, 64, false);
-	gpuCopyToTexture(cmd, data, data, texture, false);
-	gpuCopyFromTexture(cmd, data, data, texture, false);
+	gpuMemCpy(cmd, data, data, 64);
+	gpuCopyToTexture(cmd, data, data, texture);
+	gpuCopyFromTexture(cmd, data, data, texture);
 	gpuBlitTextureEXT(cmd, texture, texture, true, 0, 0, 0, 0);
 	gpuSyncMemoryEXT(cmd, data);
 
@@ -130,10 +147,10 @@ void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data) {
 	gpuSetDepthStencilState(cmd, depth);
 	gpuSetBlendState(cmd, blend);
 	gpuSetPipeline(cmd, graphics);
-	gpuDrawIndexedInstanced(cmd, data, data, data, 3, 1, INDEX_TYPE_UINT32, false, false);
-	gpuDrawIndexedInstancedIndirect(cmd, data, data, data, data, INDEX_TYPE_UINT32, false, false);
+	gpuDrawIndexedInstanced(cmd, data, data, data, 3, 1, INDEX_TYPE_UINT32);
+	gpuDrawIndexedInstancedIndirect(cmd, data, data, data, data, INDEX_TYPE_UINT32);
 	gpuDrawMeshlets(cmd, data, data, grid);
-	gpuDrawMeshletsIndirect(cmd, data, data, data, false);
+	gpuDrawMeshletsIndirect(cmd, data, data, data);
 	gpuEndRenderPass(cmd, presented);
 
 	// Submission and synchronization

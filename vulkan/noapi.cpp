@@ -257,7 +257,7 @@ namespace GPU::detail {
 
 	// Where a GPU address lives: which buffer backs it, how far into that buffer it sits, and the
 	// base of the allocation holding it. The base is what the queue's other maps (allocations,
-	// gpu2image, gpu2index, descriptor_heaps) are keyed by, so it is what a caller looks up with.
+	// gpu2image, descriptor_heaps) are keyed by, so it is what a caller looks up with.
 	struct BufferLocation {
 		VkBuffer buffer = VK_NULL_HANDLE; // Null when the address landed outside every allocation
 		VkDeviceSize offset = 0; // Byte offset of the address within `buffer`
@@ -266,33 +266,27 @@ namespace GPU::detail {
 	};
 
 	// The allocation holding `addr` is the one whose base is the greatest at or below it and whose
-	// size actually reaches it. no_offsets promises the address is already an allocation base,
-	// which skips the search.
+	// size actually reaches it. `allocations` is ordered by base address, so upper_bound lands one
+	// past that allocation and stepping back once names it -- no candidate before it can be closer.
 	//
 	// Nothing here inserts into `allocations`: an address that belongs to no allocation comes back
 	// with a null buffer rather than silently adding a null entry the next search would then find.
-	inline BufferLocation closest_buffer(GpuQueue* queue, gpu* addr, bool no_offsets) {
+	inline BufferLocation closest_buffer(GpuQueue* queue, gpu* addr, const GpuQueue::Allocation** out_allocation = nullptr) {
 		auto address = (VkDeviceAddress)addr;
 
-		if(no_offsets) {
-			auto found = queue->allocations.find(address);
-			if(found == queue->allocations.end()) return {};
-			return {std::get<VkBuffer>(found->second), 0, address, std::get<VkDeviceSize>(found->second)};
-		}
+		auto after = queue->allocations.upper_bound(address);
+		if(after == queue->allocations.begin()) return {}; // Below every allocation
+		auto found = std::prev(after);
 
-		BufferLocation out;
-		for(const auto& [key, allocation]: queue->allocations) {
-			if(key > address) continue; // Starts past the address, so it can't be holding it
-			if(address - key >= std::get<VkDeviceSize>(allocation)) continue; // Ends before it
-			if(out.buffer && key < out.base) continue; // Something tighter was already found
+		const auto& [base, allocation] = *found;
+		if(address - base >= allocation.size) return {}; // The nearest one ends before the address
 
-			out = {std::get<VkBuffer>(allocation), address - key, key, std::get<VkDeviceSize>(allocation)};
-		}
-		return out;
+		if(out_allocation) *out_allocation = &allocation;
+		return {allocation.buffer, address - base, base, allocation.size};
 	}
 
-	inline std::array<BufferLocation, 2> closest_buffer(GpuQueue* queue, gpu* addrA, gpu* addrB, bool no_offsets) {
-		return {closest_buffer(queue, addrA, no_offsets), closest_buffer(queue, addrB, no_offsets)};
+	inline std::array<BufferLocation, 2> closest_buffer(GpuQueue* queue, gpu* addrA, gpu* addrB) {
+		return {closest_buffer(queue, addrA), closest_buffer(queue, addrB)};
 	}
 }
 
@@ -438,6 +432,19 @@ bool gpuSetupDefaultVulkanEXT(GpuVulkanSurfaceLoaderEXT surface_loader, void* su
 		.enable_extensions(instance_extensions.size(), instance_extensions.data())
 		.request_validation_layers(debug)
 		.require_api_version(1, 4, 0);
+	// What VK_KHR_swapchain_maintenance1 is built on; without it that device extension cannot be
+	// enabled. Asked for rather than required, and the availability check goes through
+	// vkb::SystemInfo rather than vkEnumerateInstanceExtensionProperties because volk has not
+	// loaded the instance entry points yet -- that happens in gpuCreateQueue, after this returns.
+	// Naming an absent extension to the instance builder would fail instance creation outright.
+	if(auto system = vkb::SystemInfo::get_system_info(); system)
+		// Both, and only together: VK_KHR_surface_maintenance1 depends on the capabilities query,
+		// and naming it without that dependency is what an instance is rejected for
+		if(system->is_extension_available("VK_KHR_surface_maintenance1")
+				&& system->is_extension_available("VK_KHR_get_surface_capabilities2")) {
+			instance_builder.enable_extension("VK_KHR_get_surface_capabilities2");
+			instance_builder.enable_extension("VK_KHR_surface_maintenance1");
+		}
 	for(auto layer: extra_layers)
 		instance_builder.enable_layer(layer);
 	if(debug) instance_builder.set_debug_callback(+[](VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity, VkDebugUtilsMessageTypeFlagsEXT messageTypes, const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData, void* pUserData) -> VkBool32 {
@@ -474,6 +481,16 @@ bool gpuSetupDefaultVulkanEXT(GpuVulkanSurfaceLoaderEXT surface_loader, void* su
 	if (!phys) return setup_failed(out_error, out_error_capacity, phys.error().message());
 	auto gpu = phys.value();
 	out.gpu = gpu.physical_device;
+
+	// The extensions the backend uses if they are there. Enabled through the feature check rather
+	// than by name alone, so an extension whose feature bit is missing isn't turned on half way.
+	VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_maintenance {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR,
+		.swapchainMaintenance1 = true
+	};
+	if(gpu.enable_extension_features_if_present(swapchain_maintenance))
+		gpu.enable_extension_if_present("VK_KHR_swapchain_maintenance1");
+
 
 	// Logical Device
 	vkb::DeviceBuilder device_builder{gpu};
@@ -539,12 +556,10 @@ GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice dev
 		.pAllocationCallbacks = out->callbacks,
 		.pVulkanFunctions = &functions,
 		.instance = instance,
-		.vulkanApiVersion = VK_API_VERSION_1_3,
+		.vulkanApiVersion = VK_API_VERSION_1_4,
 	};
 	if(vmaCreateAllocator(&vma_info, &out->gpu_allocator) != VK_SUCCESS)
 		return {};
-
-	out->command_submission_timeline_semaphore = gpuCreateSemaphoreImpl(out, 0)->semaphore;
 
 	VkPhysicalDeviceDescriptorHeapPropertiesEXT heap_properties {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT,
@@ -557,6 +572,75 @@ GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice dev
 	out->minimum_descriptor_heap_size = heap_properties.minResourceHeapReservedRange;
 	out->sampler_size = heap_properties.samplerDescriptorSize;
 	out->image_size = heap_properties.imageDescriptorSize;
+	out->descriptor_heap_alignment = heap_properties.resourceHeapAlignment;
+
+	// Can any allocation be a descriptor heap on this device, or only one that asked to be?
+	//
+	// Asked rather than assumed, because the answer is a driver's choice and it decides whether
+	// MEMORY_DESCRIPTOR_HEAP means anything. Adding the usage bit can move a buffer to a different
+	// set of memory types -- on Intel/Mesa it does, from {0,1,2} to a disjoint {4,5,6} -- and
+	// forcing every allocation into those would be paying a real cost for a bit almost nothing
+	// uses. Where the bit changes neither the alignment nor the permitted types it is free, and
+	// then every allocation may as well carry it, which spares the caller having to know in advance
+	// which of its memory will end up holding descriptors.
+	{
+		constexpr static VkBufferUsageFlags base = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+			| VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+			| VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+
+		constexpr static auto requirements_for = [](VkDevice device, VkBufferUsageFlags usage) {
+			VkBufferCreateInfo buffer_info {
+				.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+				.size = 64 * 1024, // Any size works; the answer is about usage, not extent
+				.usage = usage
+			};
+			VkDeviceBufferMemoryRequirements query {
+				.sType = VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS,
+				.pCreateInfo = &buffer_info
+			};
+			VkMemoryRequirements2 out { .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+			vkGetDeviceBufferMemoryRequirements(device, &query, &out);
+			return out.memoryRequirements;
+		};
+
+		auto without = requirements_for(out->device, base);
+		auto with = requirements_for(out->device, base | VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT);
+		out->capabilities.descriptor_heap_in_any_memory =
+			with.memoryTypeBits == without.memoryTypeBits && with.alignment == without.alignment;
+	}
+
+	// Int64 atomics are what SIGNAL_ATOMIC_MAX and SIGNAL_ATOMIC_OR are made of. Only physical
+	// device support can be checked here -- whether the VkDevice actually enabled the feature is
+	// not queryable -- so this trusts that a device was built with
+	// gpuEnableRequiredVulkan12FeaturesEXT, the same way the rest of the backend trusts it for
+	// descriptorHeap and bufferDeviceAddress.
+	{
+		VkPhysicalDeviceVulkan12Features features12 { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+		VkPhysicalDeviceFeatures2 features { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &features12 };
+		vkGetPhysicalDeviceFeatures2(gpu, &features);
+		out->capabilities.split_barrier_signals = features12.shaderBufferInt64Atomics;
+	}
+
+	// Whether a present can carry a fence. Like the feature check above this reads the physical
+	// device, so it assumes the VkDevice was built with gpuOptionalVulkanDeviceExtensionsEXT
+	// enabled (which gpuSetupDefaultVulkanEXT does).
+	{
+		VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenance {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR
+		};
+		VkPhysicalDeviceFeatures2 features { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &maintenance };
+		vkGetPhysicalDeviceFeatures2(gpu, &features);
+		out->present_fences_supported = maintenance.swapchainMaintenance1;
+	}
+
+	// Events give Vulkan a real split barrier, so a paired wait need not stall the work between the
+	// halves. Mesh shading is reported off regardless of VK_EXT_mesh_shader, because there is still
+	// no way to create a pipeline that could be drawn with it.
+	out->capabilities.split_barriers = true;
+	out->capabilities.gpu_writable_texture_heap = true;
+	out->capabilities.mesh_shaders = false;
+
+	out->command_submission_timeline_semaphore = gpuCreateSemaphoreImpl(out, 0)->semaphore;
 
 	// A GpuTextureDescriptor is 64 bytes because that is the widest image descriptor in
 	// circulation (Intel's), so a driver's own is either that or a divisor of it -- 32 on AMD and
@@ -573,11 +657,49 @@ GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice dev
 		|| sizeof(GpuTextureDescriptor) % heap_properties.imageDescriptorSize != 0) return {};
 
 	out->heap_stride_ratio = static_cast<uint32_t>(sizeof(GpuTextureDescriptor) / heap_properties.imageDescriptorSize);
+	out->capabilities.texture_descriptor_stride_ratio = out->heap_stride_ratio;
 
 	return out;
 }
 
+GpuCapabilities gpuGetCapabilitiesEXT(const GpuQueue* queue) {
+	return queue->capabilities;
+}
+
+void gpuSetDiagnosticCallbackEXT(GpuQueue* queue, GpuDiagnosticCallbackEXT callback, void* userdata) {
+	queue->diagnostic_callback = callback;
+	queue->diagnostic_userdata = userdata;
+	// A new destination has not been told any of this yet, so let it hear each cause once too
+	queue->reported_diagnostics.clear();
+}
+
+namespace GPU::detail {
+	// Report a call that could not be honored, or could only be honored conservatively.
+	//
+	// Once per distinct message per queue: every caller of this sits in a function a program calls
+	// per draw or per dispatch, so reporting every occurrence would push the first one -- the only
+	// one that says anything new -- out of any log worth reading.
+	void report(GpuQueue* queue, GPU_DIAGNOSTIC kind, std::string message) {
+		if(!queue) return;
+		if(!queue->reported_diagnostics.insert(message).second) return;
+
+		if(queue->diagnostic_callback)
+			queue->diagnostic_callback(queue, kind, {message.data(), message.size()}, queue->diagnostic_userdata);
+		else
+			fprintf(stderr, "[noapi] %s: %s\n",
+				kind == GPU_DIAGNOSTIC_UNSUPPORTED ? "unsupported" : "emulated", message.c_str());
+	}
+
+	inline void report(GpuCommandBuffer* cmd, GPU_DIAGNOSTIC kind, std::string message) {
+		report(cmd ? cmd->queue : nullptr, kind, std::move(message));
+	}
+}
+
 void gpuFreeQueue(GpuQueue* queue) {
+	// Everything below destroys objects the GPU may still be reading. Nothing else is going to be
+	// submitted, so waiting here once costs nothing and makes every destruction that follows legal.
+	vkDeviceWaitIdle(queue->device);
+
 	if(queue->command_pool)
 		vkDestroyCommandPool(queue->device, queue->command_pool, queue->callbacks);
 	if(queue->command_submission_timeline_semaphore)
@@ -601,6 +723,39 @@ void gpuFreeQueue(GpuQueue* queue) {
 	if(queue->blit_descriptor_set_layout)
 		vkDestroyDescriptorSetLayout(queue->device, queue->blit_descriptor_set_layout, queue->callbacks);
 
+	if(queue->signal_pipeline)
+		vkDestroyPipeline(queue->device, queue->signal_pipeline, queue->callbacks);
+	if(queue->signal_pipeline_layout)
+		vkDestroyPipelineLayout(queue->device, queue->signal_pipeline_layout, queue->callbacks);
+	if(queue->signal_shader_module)
+		vkDestroyShaderModule(queue->device, queue->signal_shader_module, queue->callbacks);
+	for(auto event: queue->events_free)
+		vkDestroyEvent(queue->device, event, queue->callbacks);
+	for(auto [event, _submit]: queue->events_in_flight)
+		vkDestroyEvent(queue->device, event, queue->callbacks);
+
+	// Whatever the program did not free itself. The allocator asserts on destruction if anything is
+	// still live in one of its blocks, and freeing a queue is the point past which nothing could be
+	// freed anyway, so this is the last chance to give the memory back rather than trip that assert.
+	//
+	// Images first: one is bound into the memory of the allocation it was created against, so
+	// destroying that allocation while the image still exists would leave the image dangling.
+	for(auto [address, image]: queue->gpu2image)
+		vkDestroyImage(queue->device, image, queue->callbacks);
+	queue->gpu2image.clear();
+
+	for(auto& [address, heap]: queue->descriptor_heaps) {
+		auto [buffer, allocation, _size, _heap_address] = heap;
+		vmaDestroyBuffer(queue->gpu_allocator, buffer, allocation);
+	}
+	queue->descriptor_heaps.clear();
+
+	for(auto& [address, allocation]: queue->allocations)
+		vmaDestroyBuffer(queue->gpu_allocator, allocation.buffer, allocation.allocation);
+	queue->allocations.clear();
+	queue->host2gpu.clear();
+	queue->gpu2host.clear();
+
 	if(queue->gpu_allocator)
 		vmaDestroyAllocator(queue->gpu_allocator);
 
@@ -615,6 +770,7 @@ void gpuFreeQueue(GpuQueue* queue) {
 namespace GPU::detail {
 	static VkDeviceAddress ensure_sampler_set(GpuQueue* queue, std::span<const GpuSamplerDesc> requested);
 	static void bind_sampler_set(GpuCommandBuffer* cmd, VkDeviceAddress sampler_map);
+	void apply_depth_stencil_state(GpuCommandBuffer* cmd, const GpuDepthStencilDesc& descriptor);
 }
 
 GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
@@ -671,6 +827,11 @@ GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
 	// buffer the same default set for the same reason.
 	GPU::detail::bind_sampler_set(out, GPU::detail::ensure_sampler_set(queue, {}));
 
+	// And with depth and stencil state, which the pipelines declare dynamic and a draw is therefore
+	// not allowed to proceed without. The default description is no test, no write and no stencil,
+	// which is what the static state said before any of this was dynamic.
+	GPU::detail::apply_depth_stencil_state(out, GpuDepthStencilDesc{});
+
 	return out;
 }
 
@@ -702,6 +863,21 @@ uint64_t gpuSubmitNoFreeEXT(GpuQueue* queue, GpuCommandBufferSpan commandBuffers
 				.semaphore = sema,
 				.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
 			});
+
+		// Events this recording set become reusable once this submission has run, and not before:
+		// resetting one earlier could release a wait still queued behind it
+		for(auto event: cmd->events_used)
+			queue->events_in_flight.emplace_back(event, queue->command_submission_timeline_semaphore_next_value);
+		cmd->events_used.clear();
+
+		// A signal whose wait never arrived leaves an event set and nothing looking at it. That is
+		// harmless -- the counter was still written, and the event is recycled with the rest -- but
+		// it means the pair the caller wrote was never a pair.
+		if(!cmd->pending_signals.empty()) {
+			GPU::detail::report(queue, GPU_DIAGNOSTIC_EMULATED,
+				"gpuSignalAfter: this command buffer was submitted with a signal no gpuWaitBefore ever paired with, so the signal ordered nothing");
+			cmd->pending_signals.clear();
+		}
 	}
 
 	std::array<VkSemaphoreSubmitInfo, 2> signals {
@@ -797,21 +973,45 @@ void gpuFreeSemaphore(GpuQueue* queue, GpuSemaphore* semaphore) {
 
 
 void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY memory /* = MEMORY_DEFAULT */) {
+	// Index and indirect usage go on every allocation rather than being asked for, because memory
+	// here has no declared purpose: a gpu* is just an address, and which of them ends up holding
+	// indices or draw arguments is the program's business, discovered when it records a draw
+	// rather than when it allocates. Both bits are free to add -- neither changes the alignment or
+	// the set of memory types the buffer may live in, on any driver checked -- which is what makes
+	// blanket usage affordable instead of a flag the caller has to predict.
+	//
+	// (Indirect was previously missing entirely, so gpuDispatchIndirect and the indirect draws were
+	// reading arguments out of buffers that never declared they could be.)
+	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+		| VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+		| VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+
+	// Descriptor heap usage is not free in the same way: on this driver it moves the buffer to a
+	// disjoint set of memory types (see the probe in gpuCreateQueue), so it goes on only what asked
+	// for it -- unless the device turns out not to care, in which case every allocation gets it and
+	// MEMORY_DESCRIPTOR_HEAP stops meaning anything in particular.
+	const bool descriptor_heap = memory == MEMORY_DESCRIPTOR_HEAP || queue->capabilities.descriptor_heap_in_any_memory;
+	if(descriptor_heap) usage |= VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT;
+
 	VkBufferCreateInfo buffer_info {
 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
 		.size = bytes,
-		.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+		.usage = usage,
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE // TODO: Should be concurrent?
 	};
 	VmaAllocationCreateInfo alloc_info {
 		.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
 	};
 	if( !(memory == MEMORY_GPU || memory == MEMORY_TEXTURE) ) alloc_info.flags |= VMA_ALLOCATION_CREATE_MAPPED_BIT;
-	if(memory == MEMORY_DEFAULT) alloc_info.flags |= VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+	// A descriptor heap is written by the CPU the same way MEMORY_DEFAULT is
+	if(memory == MEMORY_DEFAULT || memory == MEMORY_DESCRIPTOR_HEAP) alloc_info.flags |= VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
 	if(memory == MEMORY_READBACK || memory == MEMORY_TEXTURE_READBACK) alloc_info.flags |= VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
 	if(memory == MEMORY_TEXTURE || memory == MEMORY_TEXTURE_READBACK) alloc_info.flags |= VMA_ALLOCATION_CREATE_CAN_ALIAS_BIT; // We can create a texture that is aliased with the buffer
 	VkBuffer buffer;
 	VmaAllocation allocation;
+	// A heap has to start where the hardware can address one from, which is a stricter alignment
+	// than a caller would think to ask for
+	if(descriptor_heap) align = std::max<size_t>(align, queue->descriptor_heap_alignment);
 	VK_CHECK(vmaCreateBufferWithAlignment(queue->gpu_allocator, &buffer_info, &alloc_info, align, &buffer, &allocation, nullptr), nullptr);
 
 	VkBufferDeviceAddressInfo address_info {
@@ -820,7 +1020,7 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align /* = 16 */, MEMORY m
 	};
 	auto gpu_ptr = vkGetBufferDeviceAddress(queue->device, &address_info);
 
-	queue->allocations[gpu_ptr] = {buffer, allocation, bytes};
+	queue->allocations[gpu_ptr] = {buffer, allocation, bytes, descriptor_heap};
 
 	if(memory == MEMORY_GPU || memory == MEMORY_TEXTURE)
 		return (void*)gpu_ptr;
@@ -840,8 +1040,9 @@ void gpuFreeDevicePointerEXT(GpuQueue* queue, gpu* ptr) {
 	auto gpu_ptr = (VkDeviceAddress)ptr;
 	if(!queue->allocations.contains(gpu_ptr)) return;
 
-	auto [buffer, allocation, _size] = queue->allocations[gpu_ptr];
-	queue->allocations.erase(gpu_ptr);
+	auto found = queue->allocations.find(gpu_ptr);
+	auto [buffer, allocation, _size, _heap] = found->second;
+	queue->allocations.erase(found);
 
 	if(queue->gpu2host.contains(gpu_ptr)) {
 		auto host = queue->gpu2host[gpu_ptr];
@@ -862,12 +1063,6 @@ void gpuFreeDevicePointerEXT(GpuQueue* queue, gpu* ptr) {
 		auto [buffer, allocation, _size, _address] = found->second;
 		vmaDestroyBuffer(queue->gpu_allocator, buffer, allocation);
 		queue->descriptor_heaps.erase(found);
-	}
-
-	if(auto found = queue->gpu2index.find(gpu_ptr); found != queue->gpu2index.end()) {
-		auto [buffer, allocation, _size] = found->second;
-		vmaDestroyBuffer(queue->gpu_allocator, buffer, allocation);
-		queue->gpu2index.erase(found);
 	}
 
 	vmaDestroyBuffer(queue->gpu_allocator, buffer, allocation);
@@ -916,7 +1111,13 @@ namespace GPU::detail {
 			.mipLevels = descriptor.mipCount,
 			.arrayLayers = descriptor.layerCount,
 			.samples = GPU::detail::samples2vulkan(descriptor.sampleCount),
-			.tiling = VK_IMAGE_TILING_LINEAR,
+			// Optimal, not linear. Nothing reads these images as linear memory -- a shader reaches
+			// them through a heap descriptor and the CPU reaches them through gpuCopyToTexture,
+			// whose vkCmdCopyBufferToImage swizzles on the driver's side whatever the tiling is --
+			// so linear bought nothing and cost a great deal: it is the reason a depth format could
+			// not be created at all (no driver offers a linear depth/stencil attachment), and it
+			// rules out exactly the compression and tile swizzling MEMORY_TEXTURE advertises.
+			.tiling = VK_IMAGE_TILING_OPTIMAL,
 			.usage = GPU::detail::usage2vulkan(descriptor.usage),
 			.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 		};
@@ -955,19 +1156,20 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 	// Bound through VMA rather than with vkBindImageMemory directly: an allocation is normally a
 	// suballocation of a larger VkDeviceMemory block, so binding at offset 0 of that block would
 	// alias whatever sits at its start instead of the memory that was actually allocated here.
-	VK_CHECK(vmaBindImageMemory(queue->gpu_allocator, std::get<VmaAllocation>(backing->second), out->image), nullptr);
+	VK_CHECK(vmaBindImageMemory(queue->gpu_allocator, backing->second.allocation, out->image), nullptr);
 
 	queue->gpu2image[(VkDeviceAddress)memory] = out->image;
 	return out;
 }
 
 static GpuTextureDescriptor gpuTextureViewDescriptorImpl(GpuQueue* queue, const GpuTexture* texture, const GpuViewDesc& desc, bool read_only) {
-	// GpuTextureDescriptor is a fixed 256 bits, which is how wide AMD and Nvidia lay an image
-	// descriptor out. Intel's is 512. vkWriteResourceDescriptorsEXT writes the driver's size
-	// regardless of the range it is handed, so on a driver like that this would overrun `out` --
-	// and the heap the caller builds out of these would have half the stride the shader indexes it
-	// by, so widening the write alone would not save it. The descriptor's width is part of this
-	// API's ABI, so there is nothing to do here but say so.
+	// GpuTextureDescriptor is a fixed 512 bits, which is the widest image descriptor in
+	// circulation (Intel's); AMD's and Nvidia's are 256. vkWriteResourceDescriptorsEXT writes the
+	// driver's own size regardless of the range it is handed, so a driver wider still than this
+	// would overrun `out` -- and the heap the caller builds out of these would have a smaller
+	// stride than the shader indexes it by, so widening the write alone would not save it. The
+	// width is part of this API's ABI, so gpuCreateQueue refuses such a device outright rather
+	// than letting it get here.
 	// The whole 64 byte slot is offered even though the driver only fills image_size of it: the
 	// write is rejected outright if the range is narrower than the driver's descriptor, and it
 	// writes that many bytes whatever the range says, so the range has to be the larger of the two.
@@ -1050,7 +1252,7 @@ GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, GpuByteSpan computeIR) {
 	auto spirv = compile_shader(queue, computeIR, GPU::shaders::SHADER_STAGE::COMPUTE);
 	if(!spirv) return nullptr;
 
-	auto out = (GpuPipeline*)queue->cpu_allocator(nullptr, sizeof(GpuPipeline));
+	auto out = new(queue->cpu_allocator(nullptr, sizeof(GpuPipeline))) GpuPipeline{};
 	out->color_target_count = {}; // Null indicating compute pipeline
 
 	VkShaderModule compute_module;
@@ -1085,14 +1287,15 @@ GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, GpuByteSpan computeIR) {
 
 void gpuFreePipeline(GpuQueue* queue, GpuPipeline* pipeline) {
 	vkDestroyPipeline(queue->device, pipeline->pipeline, queue->callbacks);
+	pipeline->~GpuPipeline(); // Its vectors own memory of their own
 	queue->cpu_allocator(pipeline, 0);
 }
 
 
 
 
-void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes, bool no_offsets /* = false*/) {
-	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_, no_offsets);
+void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes) {
+	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_);
 	assert(dest.buffer && src.buffer && "Neither end of a copy may be an address outside every allocation");
 
 	VkBufferCopy region {
@@ -1112,8 +1315,8 @@ namespace GPU::detail {
 		uint32_t mip, uint32_t slice, bool discard);
 }
 
-void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* texture, bool no_offsets /* = false */) {
-	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_, no_offsets);
+void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* texture) {
+	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_);
 	assert(dest.buffer && src.buffer && "Neither end of a copy may be an address outside every allocation");
 
 	assert(cmd->queue->gpu2image.contains(dest.base) && cmd->queue->gpu2image[dest.base] == texture->image);
@@ -1150,8 +1353,8 @@ void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* 
 	vkCmdCopyBufferToImage(cmd->command_buffer, src.buffer, texture->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
 }
 
-void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuTexture* texture, bool no_offsets /* = false */) {
-	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_, no_offsets);
+void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuTexture* texture) {
+	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_);
 	assert(dest.buffer && src.buffer && "Neither end of a copy may be an address outside every allocation");
 
 	assert(cmd->queue->gpu2image.contains(src.base) && cmd->queue->gpu2image[src.base] == texture->image);
@@ -1185,10 +1388,38 @@ void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuT
 	vkCmdCopyImageToBuffer(cmd->command_buffer, texture->image, VK_IMAGE_LAYOUT_GENERAL, dest.buffer, 1, &copy);
 }
 
-void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap, bool no_offsets /* = false */) {
-	auto heap = GPU::detail::closest_buffer(cmd->queue, texture_heap, no_offsets);
+void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap) {
+	const GpuQueue::Allocation* holding = nullptr;
+	auto heap = GPU::detail::closest_buffer(cmd->queue, texture_heap, &holding);
 	assert(heap.buffer && "The texture heap pointer doesn't lie inside any allocation");
 	if(!heap.buffer) return;
+
+	// The caller's own memory is bound when it was allocated able to be bound (MEMORY_DESCRIPTOR_HEAP,
+	// or any allocation at all on a device where the usage costs nothing) and it is long enough to
+	// cover the range the hardware reserves at the front of a heap. Nothing is copied, and a
+	// descriptor a shader writes into it is seen by whatever samples the heap after the next
+	// HAZARD_DESCRIPTORS barrier -- which is what GpuTextureDescriptor says the heap does.
+	if(holding && holding->descriptor_heap && heap.size - heap.offset >= cmd->queue->minimum_descriptor_heap_size) {
+		VkBindHeapInfoEXT heap_info {
+			.sType = VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT,
+			.heapRange = {
+				.address = (VkDeviceAddress)texture_heap,
+				.size = heap.size - heap.offset
+			},
+			.reservedRangeSize = cmd->queue->minimum_descriptor_heap_size
+		};
+		vkCmdBindResourceHeapEXT(cmd->command_buffer, &heap_info);
+		return;
+	}
+
+	// Otherwise the heap sits in memory that cannot be bound as one, so what gets bound is a
+	// snapshot copied into memory that can. Two things follow, and both are the reason the
+	// allocation above is worth asking for: the copy happens on every call, and a descriptor a
+	// shader writes into the caller's memory is invisible until the heap is set again.
+	GPU::detail::report(cmd, GPU_DIAGNOSTIC_EMULATED,
+		holding && !holding->descriptor_heap
+			? "gpuSetActiveTextureHeapPtr: the heap was not allocated as MEMORY_DESCRIPTOR_HEAP, so it is copied into a bindable heap on every call and writes a shader makes to it are not seen"
+			: "gpuSetActiveTextureHeapPtr: the heap is shorter than this device's reserved descriptor heap range, so it is copied into a padded heap on every call");
 
 	if(!cmd->queue->descriptor_heaps.contains(heap.base)) {
 		auto size = std::max<VkDeviceSize>(heap.size, cmd->queue->minimum_descriptor_heap_size);
@@ -1221,7 +1452,22 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap, bool n
 	};
 	vkCmdCopyBuffer(cmd->command_buffer, heap.buffer, heap_buffer, 1, &copy);
 
-	// TODO: Do we need a barrier here?
+	// The copy has to be visible to descriptor reads before anything samples through the heap.
+	// Without this the bind below, and every draw after it, races the transfer that filled the
+	// heap they read from.
+	const VkMemoryBarrier2 barrier {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+		.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+		.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+		.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+		.dstAccessMask = VK_ACCESS_2_RESOURCE_HEAP_READ_BIT_EXT | VK_ACCESS_2_SHADER_READ_BIT,
+	};
+	const VkDependencyInfo dependency {
+		.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+		.memoryBarrierCount = 1,
+		.pMemoryBarriers = &barrier,
+	};
+	vkCmdPipelineBarrier2(cmd->command_buffer, &dependency);
 
 	VkBindHeapInfoEXT heap_info {
 		.sType = VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT,
@@ -1289,7 +1535,12 @@ namespace GPU::detail {
 		//
 		if (hazards & HAZARD_DESCRIPTORS) {
 			src_access |= VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
-			dst_access |= VK_ACCESS_2_DESCRIPTOR_BUFFER_READ_BIT_EXT | VK_ACCESS_2_UNIFORM_READ_BIT_KHR | VK_ACCESS_2_SHADER_READ_BIT_KHR;
+			// The heap read bits come from VK_EXT_descriptor_heap, which is what this backend binds
+			// heaps with. VK_ACCESS_2_DESCRIPTOR_BUFFER_READ_BIT_EXT belongs to
+			// VK_EXT_descriptor_buffer, a different extension that is not enabled here, so naming it
+			// made this barrier invalid -- which every use of HAZARD_DESCRIPTORS would have hit.
+			dst_access |= VK_ACCESS_2_RESOURCE_HEAP_READ_BIT_EXT | VK_ACCESS_2_SAMPLER_HEAP_READ_BIT_EXT
+				| VK_ACCESS_2_UNIFORM_READ_BIT_KHR | VK_ACCESS_2_SHADER_READ_BIT_KHR;
 		}
 
 		// HAZARD_DEPTH_STENCIL
@@ -1307,12 +1558,62 @@ namespace GPU::detail {
 
 		return {src_access, dst_access};
 	}
+
+	// Drop the access bits a stage mask cannot carry.
+	//
+	// Vulkan ties most access flags to particular stages -- a shader read is only meaningful where
+	// a shader runs, an indirect command read only at the draw-indirect stage -- and names a
+	// barrier invalid, rather than merely pessimistic, if it pairs one with a stage that cannot
+	// perform it. The hazard flags above describe what kind of cache to invalidate without knowing
+	// which stage will be asked to consume it, so the two have to be reconciled here. What survives
+	// for a stage that carries none of these is VK_ACCESS_2_MEMORY_READ/WRITE, which every stage
+	// accepts and which is a superset of the rest, so filtering costs correctness nothing.
+	inline VkAccessFlags2 access_for_stages(VkAccessFlags2 access, VkPipelineStageFlags2 stages) {
+		constexpr VkPipelineStageFlags2 everything = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+		constexpr VkPipelineStageFlags2 shader_stages = everything | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT
+			| VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+			| VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT
+			| VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
+		if(!(stages & shader_stages))
+			access &= ~(VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT
+				| VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+				| VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+				| VK_ACCESS_2_RESOURCE_HEAP_READ_BIT_EXT | VK_ACCESS_2_SAMPLER_HEAP_READ_BIT_EXT);
+
+		constexpr VkPipelineStageFlags2 indirect_stages = everything | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT
+			| VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+		if(!(stages & indirect_stages))
+			access &= ~VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+
+		constexpr VkPipelineStageFlags2 depth_stages = everything | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT
+			| VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+		if(!(stages & depth_stages))
+			access &= ~(VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+
+		constexpr VkPipelineStageFlags2 color_stages = everything | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT
+			| VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+		if(!(stages & color_stages))
+			access &= ~(VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+		constexpr VkPipelineStageFlags2 transfer_stages = everything | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT
+			| VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT
+			| VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT;
+		if(!(stages & transfer_stages))
+			access &= ~(VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+		return access;
+	}
 }
 
 void gpuBarrier(GpuCommandBuffer* cmd, STAGE before, STAGE after, HAZARD_FLAGS hazards) {
 	VkPipelineStageFlags2KHR src_stage = GPU::detail::stage2vulkan(before);
 	VkPipelineStageFlags2KHR dst_stage = GPU::detail::stage2vulkan(after);
 	auto [src_access, dst_access] = GPU::detail::hazard2access(hazards);
+	// The hazard flags don't know which stages they will be paired with, and Vulkan rejects a
+	// barrier that names an access a stage cannot perform
+	src_access = GPU::detail::access_for_stages(src_access, src_stage);
+	dst_access = GPU::detail::access_for_stages(dst_access, dst_stage);
 
 	const VkMemoryBarrier2KHR barrier {
 		.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR,
@@ -1339,27 +1640,303 @@ void gpuBarrier(GpuCommandBuffer* cmd, STAGE before, STAGE after, HAZARD_FLAGS h
 	vkCmdPipelineBarrier2(cmd->command_buffer, &dependency);
 }
 
-// The split barrier pair is conservative here rather than exact. Vulkan has no command that stalls
-// the GPU on a value in memory, so the counter, the comparison against it and the mask can't be
-// honored; instead the consuming half turns into a plain barrier from every stage, which is a
-// superset of the dependency the pair describes as long as producer and consumer sit on the same
-// queue. That gives up what a split barrier is for — letting independent work slot in between the
-// two halves — but it keeps portable code correct instead of aborting, and it lands in the same
-// place as the WebGPU backend, where a pass boundary is already a full barrier.
+namespace GPU::detail {
+	std::vector<uint32_t> compile_glsl(EShLanguage stage, std::string_view source); // With the blit shaders, below
+
+	// gpuSignalAfter's atomic, for the two SIGNAL values that are read-modify-writes rather than
+	// plain stores. One thread, because the counter is one 64 bit word; the address arrives as a
+	// buffer reference in a push constant, so this needs no descriptor of any kind.
+	constexpr static std::string_view SIGNAL_SHADER = R"(
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Counter {
+	uint64_t value;
+};
+
+layout(push_constant) uniform Push {
+	Counter counter;
+	uint64_t value;
+	uint use_max; // 1 for SIGNAL_ATOMIC_MAX, 0 for SIGNAL_ATOMIC_OR
+} push;
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+	if(push.use_max != 0) atomicMax(push.counter.value, push.value);
+	else atomicOr(push.counter.value, push.value);
+}
+)";
+
+	struct SignalPushConstants {
+		VkDeviceAddress counter;
+		uint64_t value;
+		uint32_t use_max;
+	};
+
+	// Built on the first signal that needs it rather than at queue creation, since a program that
+	// never splits a barrier should not pay for a pipeline it never dispatches. One pipeline covers
+	// both operations: which one runs is a push constant, so there is nothing to specialize.
+	inline VkPipeline signal_pipeline(GpuQueue* queue) {
+		if(queue->signal_pipeline) return queue->signal_pipeline;
+
+		{
+			auto spirv = compile_glsl(EShLangCompute, SIGNAL_SHADER);
+			if(spirv.empty()) return VK_NULL_HANDLE;
+
+			VkShaderModuleCreateInfo module_info {
+				.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+				.codeSize = spirv.size() * sizeof(uint32_t),
+				.pCode = spirv.data(),
+			};
+			VK_CHECK(vkCreateShaderModule(queue->device, &module_info, queue->callbacks, &queue->signal_shader_module), VK_NULL_HANDLE);
+
+			VkPushConstantRange range {
+				.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+				.offset = 0,
+				.size = sizeof(SignalPushConstants),
+			};
+			VkPipelineLayoutCreateInfo layout_info {
+				.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+				.pushConstantRangeCount = 1,
+				.pPushConstantRanges = &range,
+			};
+			VK_CHECK(vkCreatePipelineLayout(queue->device, &layout_info, queue->callbacks, &queue->signal_pipeline_layout), VK_NULL_HANDLE);
+		}
+
+		VkComputePipelineCreateInfo info {
+			.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+			.stage = {
+				.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+				.stage = VK_SHADER_STAGE_COMPUTE_BIT,
+				.module = queue->signal_shader_module,
+				.pName = "main",
+			},
+			.layout = queue->signal_pipeline_layout,
+		};
+		VK_CHECK(vkCreateComputePipelines(queue->device, VK_NULL_HANDLE, 1, &info, queue->callbacks, &queue->signal_pipeline), VK_NULL_HANDLE);
+		return queue->signal_pipeline;
+	}
+
+	// Events are recycled only once the submission that used one has finished: an event has to be
+	// unsignalled before it can be set again, and resetting one that a command buffer still in
+	// flight might be waiting on would let that wait through early.
+	inline VkEvent acquire_event(GpuQueue* queue) {
+		if(!queue->events_in_flight.empty()) {
+			uint64_t finished;
+			vkGetSemaphoreCounterValue(queue->device, queue->command_submission_timeline_semaphore, &finished);
+
+			for(size_t i = queue->events_in_flight.size(); i--; ) {
+				auto [event, submit] = queue->events_in_flight[i];
+				if(submit > finished) continue;
+
+				vkResetEvent(queue->device, event);
+				queue->events_free.push_back(event);
+				queue->events_in_flight.erase(queue->events_in_flight.begin() + i);
+			}
+		}
+
+		if(!queue->events_free.empty()) {
+			auto event = queue->events_free.back();
+			queue->events_free.pop_back();
+			return event;
+		}
+
+		// Not VK_EVENT_CREATE_DEVICE_ONLY_BIT: reuse above resets these from the host
+		VkEventCreateInfo info { .sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO };
+		VkEvent event = VK_NULL_HANDLE;
+		VK_CHECK(vkCreateEvent(queue->device, &info, queue->callbacks, &event), VK_NULL_HANDLE);
+		return event;
+	}
+}
+
 void gpuSignalAfter(GpuCommandBuffer* cmd, STAGE before, gpu* ptr, uint64_t value, SIGNAL signal) {
-	// Nothing to record: the paired gpuWaitBefore carries the whole dependency
+	auto queue = cmd->queue;
+	auto producer_stage = GPU::detail::stage2vulkan(before);
+
+	// Every way of writing the counter is a command a render pass forbids -- a transfer for
+	// SIGNAL_ATOMIC_SET, a dispatch for the other two -- and so is the event that would pair this
+	// with a wait. So a signal recorded inside a pass can do nothing at all, and says so rather
+	// than recording something illegal.
+	if(cmd->state != GpuCommandBuffer::Recording) {
+		GPU::detail::report(cmd, GPU_DIAGNOSTIC_UNSUPPORTED,
+			"gpuSignalAfter: writing the counter needs a transfer or a dispatch, and neither can be recorded inside a render pass, so nothing is signalled; split the pass or signal around it");
+		return;
+	}
+
+	// The counter is ordinary memory in an ordinary allocation, so writing it needs to be ordered
+	// after the work whose completion it is reporting
+	{
+		const VkMemoryBarrier2 barrier {
+			.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+			.srcStageMask = producer_stage,
+			.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+			.dstStageMask = signal == SIGNAL_ATOMIC_SET ? VK_PIPELINE_STAGE_2_COPY_BIT : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+			.dstAccessMask = signal == SIGNAL_ATOMIC_SET ? VK_ACCESS_2_TRANSFER_WRITE_BIT : VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+		};
+		const VkDependencyInfo dependency {
+			.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+			.memoryBarrierCount = 1,
+			.pMemoryBarriers = &barrier,
+		};
+		vkCmdPipelineBarrier2(cmd->command_buffer, &dependency);
+	}
+
+	VkPipelineStageFlags2 wrote_at = VK_PIPELINE_STAGE_2_COPY_BIT;
+	if(signal == SIGNAL_ATOMIC_SET) {
+		// A store needs no atomic: vkCmdUpdateBuffer writes the 8 bytes straight into the counter
+		auto counter = GPU::detail::closest_buffer(queue, ptr);
+		assert(counter.buffer && "The split barrier counter doesn't lie inside any allocation");
+		if(!counter.buffer) return;
+
+		// vkCmdUpdateBuffer writes at a 4 byte granularity, and a 64 bit counter wants 8 anyway
+		assert(counter.offset % sizeof(value) == 0 && "The split barrier counter isn't 8 byte aligned");
+
+		vkCmdUpdateBuffer(cmd->command_buffer, counter.buffer, counter.offset, sizeof(value), &value);
+	} else if(!queue->capabilities.split_barrier_signals) {
+		GPU::detail::report(cmd, GPU_DIAGNOSTIC_UNSUPPORTED,
+			"gpuSignalAfter: SIGNAL_ATOMIC_MAX and SIGNAL_ATOMIC_OR need 64 bit buffer atomics, which this device does not support, so the counter is left alone");
+	} else if(auto pipeline = GPU::detail::signal_pipeline(queue); pipeline != VK_NULL_HANDLE) {
+		GPU::detail::SignalPushConstants push {
+			.counter = (VkDeviceAddress)ptr,
+			.value = value,
+			.use_max = signal == SIGNAL_ATOMIC_MAX,
+		};
+		vkCmdBindPipeline(cmd->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+		vkCmdPushConstants(cmd->command_buffer, queue->signal_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+		vkCmdDispatch(cmd->command_buffer, 1, 1, 1);
+		wrote_at = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+
+		// Put back whatever the caller had bound, the way a blit does: this borrowed the compute
+		// binding point, and the next draw or dispatch would otherwise run this shader
+		if(cmd->bound_pipeline)
+			vkCmdBindPipeline(cmd->command_buffer,
+				cmd->bound_pipeline->color_target_count.has_value() ? VK_PIPELINE_BIND_POINT_GRAPHICS : VK_PIPELINE_BIND_POINT_COMPUTE,
+				cmd->bound_pipeline->pipeline);
+	}
+
+	// The second half of a split barrier: an event set here, for a later gpuWaitBefore to wait on
+	// without stalling what sits between them.
+	auto event = GPU::detail::acquire_event(queue);
+	if(event == VK_NULL_HANDLE) return;
+
+	GpuCommandBuffer::PendingSignal pending {
+		.ptr = (VkDeviceAddress)ptr,
+		.value = value,
+		.event = event,
+		.barrier = {
+			.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+			.srcStageMask = producer_stage | wrote_at,
+			.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+			// The consumer is unknown until the wait is recorded, and Vulkan wants both halves to
+			// name the same dependency, so this end stays open
+			.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+			.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT,
+		},
+	};
+
+	const VkDependencyInfo dependency {
+		.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+		.memoryBarrierCount = 1,
+		.pMemoryBarriers = &pending.barrier,
+	};
+	vkCmdSetEvent2(cmd->command_buffer, event, &dependency);
+
+	cmd->pending_signals.push_back(pending);
+	cmd->events_used.push_back(event);
 }
 
 void gpuWaitBefore(GpuCommandBuffer* cmd, STAGE after, gpu* ptr, uint64_t value, OP op, HAZARD_FLAGS hazards /* = (HAZARD_FLAGS)0 */, uint64_t mask /* = ~uint64_t(0) */) {
+	// A counter comparison is not something any Vulkan command does, so what can be honored is the
+	// ordering a pair expresses, not the condition itself. That is exactly the pairing case: a
+	// signal recorded earlier in this command buffer on this counter and this value, with a
+	// comparison that pair satisfies by construction. Everything else -- a mask over the counter, a
+	// comparison that can fail after the signal, a counter some shader wrote instead, a signal in
+	// another command buffer -- has no expressible form, and becomes the barrier below.
+	const bool comparison_is_satisfied_by_the_pair = (op == OP_GREATER_EQUAL || op == OP_EQUAL || op == OP_ALWAYS)
+		&& mask == ~(uint64_t)0;
+
+	if(comparison_is_satisfied_by_the_pair && cmd->state == GpuCommandBuffer::Recording) {
+		auto match = std::find_if(cmd->pending_signals.begin(), cmd->pending_signals.end(),
+			[&](const GpuCommandBuffer::PendingSignal& pending) {
+				return pending.ptr == (VkDeviceAddress)ptr && pending.value == value;
+			});
+
+		if(match != cmd->pending_signals.end()) {
+			const VkDependencyInfo dependency {
+				.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+				.memoryBarrierCount = 1,
+				.pMemoryBarriers = &match->barrier,
+			};
+			auto producer_stage = match->barrier.srcStageMask;
+			vkCmdWaitEvents2(cmd->command_buffer, 1, &match->event, &dependency);
+			cmd->pending_signals.erase(match);
+
+			// The event's dependency had to name the one its signal named, which could not know
+			// these hazards yet, so the cache invalidation they ask for is a second barrier. It
+			// names the producer's stage rather than every stage: going through gpuBarrier with
+			// STAGE_ALL here would stall on everything recorded between the two halves and undo
+			// the split the event just bought.
+			if(hazards) {
+				auto consumer_stage = GPU::detail::stage2vulkan(after);
+				auto [src_access, dst_access] = GPU::detail::hazard2access(hazards);
+				const VkMemoryBarrier2 barrier {
+					.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+					.srcStageMask = producer_stage,
+					.srcAccessMask = GPU::detail::access_for_stages(src_access, producer_stage),
+					.dstStageMask = consumer_stage,
+					.dstAccessMask = GPU::detail::access_for_stages(dst_access, consumer_stage),
+				};
+				const VkDependencyInfo hazard_dependency {
+					.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+					.memoryBarrierCount = 1,
+					.pMemoryBarriers = &barrier,
+				};
+				vkCmdPipelineBarrier2(cmd->command_buffer, &hazard_dependency);
+			}
+			return;
+		}
+	}
+
+	GPU::detail::report(cmd, GPU_DIAGNOSTIC_EMULATED,
+		!comparison_is_satisfied_by_the_pair
+			? "gpuWaitBefore: a masked or non-monotonic comparison has no equivalent Vulkan command, so this waits on every stage instead of splitting the barrier"
+			: cmd->state != GpuCommandBuffer::Recording
+				? "gpuWaitBefore: Vulkan has no event commands inside a render pass, so a wait recorded in one waits on every stage instead of splitting the barrier"
+				: "gpuWaitBefore: no gpuSignalAfter earlier in this command buffer matches this counter and value, so this waits on every stage instead of splitting the barrier");
 	gpuBarrier(cmd, STAGE_ALL, after, hazards);
+}
+
+namespace GPU::detail {
+	VkColorComponentFlags mask2vulkan(uint8_t mask); // Defined with the other blend conversions, below
 }
 
 void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline) {
 	vkCmdBindPipeline(cmd->command_buffer, pipeline->color_target_count.has_value() ? VK_PIPELINE_BIND_POINT_GRAPHICS : VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
 	cmd->bound_pipeline = pipeline;
+
+	// Blending is dynamic state, so a pipeline's own blend description only takes effect if
+	// something applies it. Doing that here means a program that never touches gpuSetBlendState
+	// gets what its pipeline asked for, and one that does gets the override for as long as it
+	// keeps setting it -- a draw is otherwise not allowed to proceed at all with these unset.
+	if(cmd->bound_blend_state) {
+		// An explicit state outranks the pipeline's own description, and has to be re-applied
+		// because the masks it produces are relative to the pipeline now bound
+		gpuSetBlendState(cmd, cmd->bound_blend_state);
+	} else if(auto count = static_cast<uint32_t>(pipeline->blend_enables.size()); count > 0) {
+		vkCmdSetColorBlendEnableEXT(cmd->command_buffer, 0, count, pipeline->blend_enables.data());
+		vkCmdSetColorBlendEquationEXT(cmd->command_buffer, 0, count, pipeline->blend_equations.data());
+
+		std::vector<VkColorComponentFlags> masks; masks.reserve(count);
+		for(auto mask: pipeline->color_write_masks)
+			masks.push_back(GPU::detail::mask2vulkan(mask));
+		vkCmdSetColorWriteMaskEXT(cmd->command_buffer, 0, count, masks.data());
+	}
 }
 
-void gpuDispatch(GpuCommandBuffer* cmd, gpu* dataGpu, uvec3 gridDimensions, bool /*no_offsets = false */) {
+void gpuDispatch(GpuCommandBuffer* cmd, gpu* dataGpu, uvec3 gridDimensions) {
 	ComputePipelinePushConstants data {
 		.data = dataGpu,
 		.sampler_map = (gpu*)cmd->sampler_map
@@ -1376,7 +1953,7 @@ void gpuDispatch(GpuCommandBuffer* cmd, gpu* dataGpu, uvec3 gridDimensions, bool
 	vkCmdDispatch(cmd->command_buffer, gridDimensions.x, gridDimensions.y, gridDimensions.z);
 }
 
-void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* dataGpu, gpu* gridDimensionsGpu, bool no_offsets /* = false*/) {
+void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* dataGpu, gpu* gridDimensionsGpu) {
 	ComputePipelinePushConstants data {
 		.data = dataGpu
 	};
@@ -1390,7 +1967,7 @@ void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* dataGpu, gpu* gridDimension
 	};
 	vkCmdPushDataEXT(cmd->command_buffer, &info);
 
-	auto grid = GPU::detail::closest_buffer(cmd->queue, gridDimensionsGpu, no_offsets);
+	auto grid = GPU::detail::closest_buffer(cmd->queue, gridDimensionsGpu);
 	assert(grid.buffer && "The dispatch dimensions don't lie inside any allocation");
 	vkCmdDispatchIndirect(cmd->command_buffer, grid.buffer, grid.offset);
 }
@@ -1511,7 +2088,8 @@ namespace GPU::detail {
 		VkBufferCopy region {
 			.size = size
 		};
-		vkCmdCopyBuffer(copy_cmd, std::get<VkBuffer>(queue->allocations[(VkDeviceAddress)gpuHostToDevicePointer(queue, tmp)]), buffer, 1, &region);
+		auto staging = GPU::detail::closest_buffer(queue, gpuHostToDevicePointer(queue, tmp));
+		vkCmdCopyBuffer(copy_cmd, staging.buffer, buffer, 1, &region);
 
 		VK_CHECK(vkEndCommandBuffer(copy_cmd), 0);
 		VkSubmitInfo submit {
@@ -1637,7 +2215,9 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
 	auto fragment_spirv = compile_shader(queue, fragmentIR, GPU::shaders::SHADER_STAGE::FRAGMENT);
 	if(!fragment_spirv) return nullptr;
 
-	auto out = (GpuPipeline*)queue->cpu_allocator(nullptr, sizeof(GpuPipeline));
+	// Constructed, not just allocated: a GpuPipeline owns vectors now, and assigning into raw
+	// storage would be writing through whatever those bytes happened to contain
+	auto out = new(queue->cpu_allocator(nullptr, sizeof(GpuPipeline))) GpuPipeline{};
 	out->color_target_count = desc.colorTargets.size();
 
 	std::array<VkShaderModule, 2> shader_modules;
@@ -1723,6 +2303,19 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
 			const uint8_t effectiveMask = blendEnabled ? (target.writeMask & blend.colorWriteMask) : target.writeMask;
 			state.colorWriteMask = GPU::detail::mask2vulkan(effectiveMask);
 
+			// Kept for gpuSetPipeline to apply, since the copy in the create info is ignored once
+			// these are dynamic
+			out->blend_enables.push_back(state.blendEnable);
+			out->blend_equations.push_back(VkColorBlendEquationEXT{
+				.srcColorBlendFactor = state.srcColorBlendFactor,
+				.dstColorBlendFactor = state.dstColorBlendFactor,
+				.colorBlendOp = state.colorBlendOp,
+				.srcAlphaBlendFactor = state.srcAlphaBlendFactor,
+				.dstAlphaBlendFactor = state.dstAlphaBlendFactor,
+				.alphaBlendOp = state.alphaBlendOp,
+			});
+			out->color_write_masks.push_back(effectiveMask);
+
 			attachments.push_back(state);
 		}
 	}
@@ -1733,6 +2326,14 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
 		.pAttachments = attachments.empty() ? nullptr : attachments.data(),
 	};
 
+	// Every one of these has to be listed for the matching vkCmdSet call to have any effect: a
+	// state the pipeline does not declare dynamic keeps whatever the create info said, and the
+	// create info says nothing -- VkPipelineDepthStencilStateCreateInfo above is zero initialized,
+	// which is depth test and depth write disabled. Only the first two used to be counted, so
+	// gpuSetDepthStencilState and gpuSetBlendState were writing state that nothing read; a depth
+	// buffer stayed at whatever it was cleared to no matter what was drawn into it.
+	//
+	// The last three come from VK_EXT_extended_dynamic_state3, which the backend requires.
 	std::array<VkDynamicState, 14> dynamic = {
 		VK_DYNAMIC_STATE_VIEWPORT,
 		VK_DYNAMIC_STATE_SCISSOR,
@@ -1752,7 +2353,7 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
 
 	VkPipelineDynamicStateCreateInfo dynamic_state{};
 	dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-	dynamic_state.dynamicStateCount = 2;
+	dynamic_state.dynamicStateCount = static_cast<uint32_t>(dynamic.size());
 	dynamic_state.pDynamicStates = dynamic.data();
 
 	std::vector<VkFormat> color_formats; color_formats.reserve(desc.colorTargets.size());
@@ -1826,7 +2427,21 @@ void gpuFreeBlendState(GpuQueue* queue, GpuBlendState* state) {
 }
 
 // TODO: Untested!
+namespace GPU::detail {
+	void apply_depth_stencil_state(GpuCommandBuffer* cmd, const GpuDepthStencilDesc& descriptor);
+}
+
 void gpuSetDepthStencilState(GpuCommandBuffer* cmd, const GpuDepthStencilState* state) {
+	GPU::detail::apply_depth_stencil_state(cmd, state->descriptor);
+}
+
+// Every one of these is dynamic state the pipeline declares, which means a draw is invalid until
+// each has been set. A command buffer that never calls gpuSetDepthStencilState still has to be able
+// to draw, so recording one starts by applying a default-constructed description -- no depth test,
+// no depth write, no stencil -- which is what the pipeline's (now ignored) static state used to say.
+// Setting one later overrides it, whatever order that happens in relative to binding a pipeline,
+// since nothing else touches this state.
+void GPU::detail::apply_depth_stencil_state(GpuCommandBuffer* cmd, const GpuDepthStencilDesc& descriptor) {
 	constexpr static auto op2vulkan = [](OP op) -> VkCompareOp {
 		switch (op) {
 			case OP_ALWAYS: return VK_COMPARE_OP_ALWAYS;
@@ -1854,8 +2469,8 @@ void gpuSetDepthStencilState(GpuCommandBuffer* cmd, const GpuDepthStencilState* 
 		std::unreachable();
 	};
 
-	const bool depthRead = (state->descriptor.depthMode & DEPTH_READ) != 0;
-	const bool depthWrite = (state->descriptor.depthMode & DEPTH_WRITE) != 0;
+	const bool depthRead = (descriptor.depthMode & DEPTH_READ) != 0;
+	const bool depthWrite = (descriptor.depthMode & DEPTH_WRITE) != 0;
 
 	// depthTestEnable gates both the compare op AND whether writes happen
 	// in classic GL/D3D semantics; Vulkan separates test-enable from
@@ -1864,45 +2479,46 @@ void gpuSetDepthStencilState(GpuCommandBuffer* cmd, const GpuDepthStencilState* 
 	// meaningful), and gate the actual write bit off DEPTH_WRITE.
 	vkCmdSetDepthTestEnable(cmd->command_buffer, (depthRead || depthWrite) ? VK_TRUE : VK_FALSE);
 	vkCmdSetDepthWriteEnable(cmd->command_buffer, depthWrite ? VK_TRUE : VK_FALSE);
-	vkCmdSetDepthCompareOp(cmd->command_buffer, op2vulkan(state->descriptor.depthTest));
+	vkCmdSetDepthCompareOp(cmd->command_buffer, op2vulkan(descriptor.depthTest));
 
-	const bool stencilEnabled = state->descriptor.stencilFront.test != OP_ALWAYS || state->descriptor.stencilBack.test != OP_ALWAYS
-		|| state->descriptor.stencilFront.failOp != STENCIL_OP_KEEP || state->descriptor.stencilFront.passOp != STENCIL_OP_KEEP
-		|| state->descriptor.stencilFront.depthFailOp != STENCIL_OP_KEEP
-		|| state->descriptor.stencilBack.failOp != STENCIL_OP_KEEP || state->descriptor.stencilBack.passOp != STENCIL_OP_KEEP
-		|| state->descriptor.stencilBack.depthFailOp != STENCIL_OP_KEEP;
+	const bool stencilEnabled = descriptor.stencilFront.test != OP_ALWAYS || descriptor.stencilBack.test != OP_ALWAYS
+		|| descriptor.stencilFront.failOp != STENCIL_OP_KEEP || descriptor.stencilFront.passOp != STENCIL_OP_KEEP
+		|| descriptor.stencilFront.depthFailOp != STENCIL_OP_KEEP
+		|| descriptor.stencilBack.failOp != STENCIL_OP_KEEP || descriptor.stencilBack.passOp != STENCIL_OP_KEEP
+		|| descriptor.stencilBack.depthFailOp != STENCIL_OP_KEEP;
 	vkCmdSetStencilTestEnable(cmd->command_buffer, stencilEnabled ? VK_TRUE : VK_FALSE);
 
 	if (stencilEnabled) {
-		vkCmdSetStencilOp(cmd->command_buffer, VK_STENCIL_FACE_FRONT_BIT, stencil2vulkan(state->descriptor.stencilFront.failOp),
-			stencil2vulkan(state->descriptor.stencilFront.passOp), stencil2vulkan(state->descriptor.stencilFront.depthFailOp),
-			op2vulkan(state->descriptor.stencilFront.test)
+		vkCmdSetStencilOp(cmd->command_buffer, VK_STENCIL_FACE_FRONT_BIT, stencil2vulkan(descriptor.stencilFront.failOp),
+			stencil2vulkan(descriptor.stencilFront.passOp), stencil2vulkan(descriptor.stencilFront.depthFailOp),
+			op2vulkan(descriptor.stencilFront.test)
 		);
-		vkCmdSetStencilOp(cmd->command_buffer, VK_STENCIL_FACE_BACK_BIT, stencil2vulkan(state->descriptor.stencilBack.failOp),
-			stencil2vulkan(state->descriptor.stencilBack.passOp), stencil2vulkan(state->descriptor.stencilBack.depthFailOp),
-			op2vulkan(state->descriptor.stencilBack.test)
+		vkCmdSetStencilOp(cmd->command_buffer, VK_STENCIL_FACE_BACK_BIT, stencil2vulkan(descriptor.stencilBack.failOp),
+			stencil2vulkan(descriptor.stencilBack.passOp), stencil2vulkan(descriptor.stencilBack.depthFailOp),
+			op2vulkan(descriptor.stencilBack.test)
 		);
 
-		vkCmdSetStencilCompareMask(cmd->command_buffer, VK_STENCIL_FACE_FRONT_AND_BACK, state->descriptor.stencilReadMask);
-		vkCmdSetStencilWriteMask(cmd->command_buffer, VK_STENCIL_FACE_FRONT_AND_BACK, state->descriptor.stencilWriteMask);
+		vkCmdSetStencilCompareMask(cmd->command_buffer, VK_STENCIL_FACE_FRONT_AND_BACK, descriptor.stencilReadMask);
+		vkCmdSetStencilWriteMask(cmd->command_buffer, VK_STENCIL_FACE_FRONT_AND_BACK, descriptor.stencilWriteMask);
 
 		// Front/back reference values differ in your struct
 		// (Stencil::reference is per-face) but vkCmdSetStencilReference
 		// takes a face mask too, so two calls if front != back.
-		if (state->descriptor.stencilFront.reference == state->descriptor.stencilBack.reference) {
-			vkCmdSetStencilReference(cmd->command_buffer, VK_STENCIL_FACE_FRONT_AND_BACK, state->descriptor.stencilFront.reference);
+		if (descriptor.stencilFront.reference == descriptor.stencilBack.reference) {
+			vkCmdSetStencilReference(cmd->command_buffer, VK_STENCIL_FACE_FRONT_AND_BACK, descriptor.stencilFront.reference);
 		} else {
-			vkCmdSetStencilReference(cmd->command_buffer, VK_STENCIL_FACE_FRONT_BIT, state->descriptor.stencilFront.reference);
-			vkCmdSetStencilReference(cmd->command_buffer, VK_STENCIL_FACE_BACK_BIT, state->descriptor.stencilBack.reference);
+			vkCmdSetStencilReference(cmd->command_buffer, VK_STENCIL_FACE_FRONT_BIT, descriptor.stencilFront.reference);
+			vkCmdSetStencilReference(cmd->command_buffer, VK_STENCIL_FACE_BACK_BIT, descriptor.stencilBack.reference);
 		}
 	}
 
-	vkCmdSetDepthBias(cmd->command_buffer, state->descriptor.depthBias, state->descriptor.depthBiasClamp, state->descriptor.depthBiasSlopeFactor);
+	vkCmdSetDepthBias(cmd->command_buffer, descriptor.depthBias, descriptor.depthBiasClamp, descriptor.depthBiasSlopeFactor);
 }
 
 // TODO: Untested!
 void gpuSetBlendState(GpuCommandBuffer* cmd, const GpuBlendState* state) {
 	assert(cmd->bound_pipeline);
+	cmd->bound_blend_state = state;
 
 	const uint32_t count = cmd->bound_pipeline->color_target_count.value_or(0);
 	const bool blend_enable = state->descriptor.colorWriteMask > 0;
@@ -1923,10 +2539,14 @@ void gpuSetBlendState(GpuCommandBuffer* cmd, const GpuBlendState* state) {
 		vkCmdSetColorBlendEquationEXT(cmd->command_buffer, 0, count, equations.data());
 	}
 
-	// std::vector<VkColorComponentFlags> masks(count);
-	// for (uint32_t i = 0; i < count; ++i)
-	// 	masks[i] = mask2vulkan(writeMasks[i] & state->descriptor.colorWriteMask);
-	// vkCmdSetColorWriteMaskEXT(cmd, 0, count, masks.data());
+	// The mask each target was created with, narrowed by the one this state carries. Not optional
+	// now that it is dynamic state the pipeline declares: a draw with it unset is invalid, and
+	// leaving it to whatever was set last would silently take its write mask from another pipeline.
+	std::vector<VkColorComponentFlags> masks; masks.reserve(count);
+	for(uint32_t i = 0; i < count; ++i)
+		masks.push_back(GPU::detail::mask2vulkan(
+			cmd->bound_pipeline->color_write_masks[i] & state->descriptor.colorWriteMask));
+	vkCmdSetColorWriteMaskEXT(cmd->command_buffer, 0, count, masks.data());
 }
 
 void gpuSetViewportEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin /*= {0, 0} */, float depth_min /* = 0 */, float depth_max /* = 1 */) {
@@ -2055,6 +2675,25 @@ namespace GPU::detail {
 
 	// An acquired surface image comes with a semaphore the first use of it has to wait on. It is
 	// handed over exactly once: waiting on the same binary semaphore twice never completes.
+	// Block until the queue's submission timeline reaches `value`, which is how the surface waits
+	// for the frame that last used one of its semaphores to be done with it. Zero means the thing
+	// being waited for never happened, so there is nothing to wait for.
+	inline void wait_for_submission(GpuQueue* queue, uint64_t value) {
+		if(value == 0) return;
+
+		uint64_t reached = 0;
+		vkGetSemaphoreCounterValue(queue->device, queue->command_submission_timeline_semaphore, &reached);
+		if(reached >= value) return;
+
+		VkSemaphoreWaitInfo info {
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+			.semaphoreCount = 1,
+			.pSemaphores = &queue->command_submission_timeline_semaphore,
+			.pValues = &value,
+		};
+		vkWaitSemaphores(queue->device, &info, UINT64_MAX);
+	}
+
 	inline void consume_available_semaphore(GpuCommandBuffer* cmd, const GpuTexture* texture) {
 		if(!texture->available_semaphore) return;
 
@@ -2281,14 +2920,14 @@ void main() {
 		shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_6);
 
 		if(!shader.parse(GetDefaultResources(), 460, false, EShMsgDefault)) {
-			assert(false && "The internal blit shader failed to compile");
+			assert(false && "An internal shader failed to compile");
 			return {};
 		}
 
 		glslang::TProgram program;
 		program.addShader(&shader);
 		if(!program.link(EShMsgDefault)) {
-			assert(false && "The internal blit shader failed to link");
+			assert(false && "An internal shader failed to link");
 			return {};
 		}
 
@@ -2644,85 +3283,6 @@ void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const Gpu
 
 
 namespace GPU::detail {
-	std::pair<VkBuffer, VkDeviceSize> ensureIndexBufferAvailable(GpuQueue* queue, gpu* indicesGpu, bool no_offsets, bool no_index_buffer_changes) {
-		constexpr static std::pair<VkBuffer, VkDeviceSize> null_out = {VK_NULL_HANDLE, 0};
-
-		auto indices = GPU::detail::closest_buffer(queue, indicesGpu, no_offsets);
-		if(indices.buffer == VK_NULL_HANDLE) return null_out;
-		auto source_buffer = indices.buffer;
-		auto offset = indices.offset, size = indices.size;
-		auto address = indices.base;
-		if(!queue->gpu2index.contains(address)) {
-			VkBufferCreateInfo buffer_info {
-				.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-				.size = size,
-				.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
-			};
-			VmaAllocationCreateInfo alloc_info {
-				.usage = VMA_MEMORY_USAGE_AUTO,
-				.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-			};
-
-			auto& [index_buffer, allocation, index_size] = queue->gpu2index[address];
-			index_size = size;
-			VK_CHECK(vmaCreateBuffer(queue->gpu_allocator, &buffer_info, &alloc_info, &index_buffer, &allocation, nullptr), null_out);
-
-			no_index_buffer_changes = false;
-		}
-
-		auto [index_buffer, _allocation, _size] = queue->gpu2index[address];
-		if(!no_index_buffer_changes) {
-			VkCommandBuffer tmp = VK_NULL_HANDLE;
-			VkCommandBufferAllocateInfo info {
-				.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-				.commandPool = queue->command_pool,
-				.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-				.commandBufferCount = 1
-			};
-			VK_CHECK(vkAllocateCommandBuffers(queue->device, &info, &tmp), null_out);
-
-			VkCommandBufferBeginInfo begin {
-				.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-				.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-			};
-			VK_CHECK(vkBeginCommandBuffer(tmp, &begin), null_out);
-
-			VkBufferCopy copy {
-				.srcOffset = offset,
-				.dstOffset = offset,
-				.size = size - offset
-			};
-			vkCmdCopyBuffer(tmp, source_buffer, index_buffer, 1, &copy);
-
-			VK_CHECK(vkEndCommandBuffer(tmp), null_out);
-			// Signals the queue's timeline like any other submission does, so that the deferred
-			// free below names a value something actually reaches. It used to borrow the next
-			// gpuSubmit's value, which this submission never signalled — leaving the command buffer
-			// to be freed early, or never at all if no further submission followed.
-			VkCommandBufferSubmitInfo cmd_info {
-				.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-				.commandBuffer = tmp
-			};
-			VkSemaphoreSubmitInfo signal {
-				.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-				.semaphore = queue->command_submission_timeline_semaphore,
-				.value = queue->command_submission_timeline_semaphore_next_value,
-				.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
-			};
-			VkSubmitInfo2 submit {
-				.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-				.commandBufferInfoCount = 1,
-				.pCommandBufferInfos = &cmd_info,
-				.signalSemaphoreInfoCount = 1,
-				.pSignalSemaphoreInfos = &signal,
-			};
-			VK_CHECK(vkQueueSubmit2(queue->queue, 1, &submit, VK_NULL_HANDLE), null_out);
-			queue->command_buffers_pending_free.emplace_back(tmp, queue->command_submission_timeline_semaphore_next_value++);
-		}
-
-		return {index_buffer, offset};
-	}
-
 	VkIndexType index2vulkan(INDEX_TYPE_EXT index_type) {
 		switch (index_type) {
 		case INDEX_TYPE_UINT8: return VK_INDEX_TYPE_UINT8;
@@ -2731,11 +3291,42 @@ namespace GPU::detail {
 		}
 		std::unreachable();
 	}
+
+	inline VkDeviceSize index_stride(INDEX_TYPE_EXT index_type) {
+		switch (index_type) {
+		case INDEX_TYPE_UINT8: return 1;
+		case INDEX_TYPE_UINT16: return 2;
+		case INDEX_TYPE_UINT32: return 4;
+		}
+		std::unreachable();
+	}
+
+	// Bind indices out of the allocation they were written into.
+	//
+	// Every allocation declares index usage (see gpuMalloc), so there is nothing to prepare: the
+	// address names a buffer and an offset into it, and that is what vkCmdBindIndexBuffer takes.
+	// This used to keep a device local index buffer per allocation and copy into it before each
+	// draw, through a submission of its own -- which cost a copy of the whole index range per
+	// draw, and got the ordering wrong as well, since a separate submission made at record time
+	// does not see writes recorded earlier in the command buffer being recorded.
+	bool bind_index_buffer(GpuCommandBuffer* cmd, gpu* indicesGpu, INDEX_TYPE_EXT index_type) {
+		auto indices = closest_buffer(cmd->queue, indicesGpu);
+		assert(indices.buffer && "The index pointer doesn't lie inside any allocation");
+		if(!indices.buffer) return false;
+
+		// Vulkan reads indices at their natural width from this offset, so a misaligned one is not
+		// a slow path but a wrong one: it would shift every index that follows.
+		assert(indices.offset % index_stride(index_type) == 0
+			&& "The index pointer isn't aligned to the size of one index");
+
+		vkCmdBindIndexBuffer(cmd->command_buffer, indices.buffer, indices.offset, index2vulkan(index_type));
+		return true;
+	}
 }
 
 
 
-void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data, gpu* indices, uint32_t index_count, uint32_t instance_count, INDEX_TYPE_EXT index_type /* = INDEX_TYPE_UINT32 */, bool no_offsets /* = false */, bool no_index_buffer_changes /* = false */) {
+void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data, gpu* indices, uint32_t index_count, uint32_t instance_count, INDEX_TYPE_EXT index_type /* = INDEX_TYPE_UINT32 */) {
 	GraphicsPipelinePushConstants data {
 		.vertex = vertex_data,
 		.fragment = fragment_data,
@@ -2752,15 +3343,12 @@ void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragm
 	};
 	vkCmdPushDataEXT(cmd->command_buffer, &info);
 
-	auto [index_buffer, offset] = GPU::detail::ensureIndexBufferAvailable(cmd->queue, indices, no_offsets, no_index_buffer_changes);
-	assert(index_buffer != VK_NULL_HANDLE);
-
-	vkCmdBindIndexBuffer(cmd->command_buffer, index_buffer, offset, GPU::detail::index2vulkan(index_type));
+	if(!GPU::detail::bind_index_buffer(cmd, indices, index_type)) return;
 	vkCmdDrawIndexed(cmd->command_buffer, index_count, instance_count, 0, 0, 0);
 }
 
 // TODO: Untested!
-void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data, gpu* indices, gpu* args, INDEX_TYPE_EXT index_type /* = INDEX_TYPE_UINT32 */, bool no_offsets /* = false */, bool no_index_buffer_changes /* = false */) {
+void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data, gpu* indices, gpu* args, INDEX_TYPE_EXT index_type /* = INDEX_TYPE_UINT32 */) {
 	GraphicsPipelinePushConstants data {
 		.vertex = vertex_data,
 		.fragment = fragment_data,
@@ -2777,13 +3365,9 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd, gpu* vertex_data, gp
 	};
 	vkCmdPushDataEXT(cmd->command_buffer, &info);
 
-	{
-		auto [index_buffer, offset] = GPU::detail::ensureIndexBufferAvailable(cmd->queue, indices, no_offsets, no_index_buffer_changes);
-		assert(index_buffer != VK_NULL_HANDLE);
-		vkCmdBindIndexBuffer(cmd->command_buffer, index_buffer, offset, GPU::detail::index2vulkan(index_type));
-	}
+	if(!GPU::detail::bind_index_buffer(cmd, indices, index_type)) return;
 
-	auto arguments = GPU::detail::closest_buffer(cmd->queue, args, no_offsets);
+	auto arguments = GPU::detail::closest_buffer(cmd->queue, args);
 	assert(arguments.buffer && "The indirect arguments don't lie inside any allocation");
 	// Every argument struct between the provided pointer and the end of its allocation is drawn,
 	// matching what the WebGPU backend does with the same pointer
@@ -2809,13 +3393,19 @@ void gpuDrawMeshlets(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_dat
 	};
 	vkCmdPushDataEXT(cmd->command_buffer, &info);
 
-	if(!vkCmdDrawMeshTasksEXT)
-		throw std::runtime_error("This device wasn't set up with VK_EXT_mesh_shader, so meshlets can't be drawn!");
+	// Reported rather than thrown: this is declared inside an extern "C" block, and an exception
+	// leaving one is not something a C caller can catch -- it terminates. gpuGetCapabilitiesEXT's
+	// mesh_shaders is the form of this a program can test before it records anything.
+	if(!vkCmdDrawMeshTasksEXT) {
+		GPU::detail::report(cmd, GPU_DIAGNOSTIC_UNSUPPORTED,
+			"gpuDrawMeshlets: this device was not set up with VK_EXT_mesh_shader, so nothing is drawn");
+		return;
+	}
 	vkCmdDrawMeshTasksEXT(cmd->command_buffer, dim.x, dim.y, dim.z);
 }
 
 // TODO: Untested!
-void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, gpu* dim, bool no_offsets /* = false */) {
+void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, gpu* dim) {
 	GraphicsPipelinePushConstants data {
 		.vertex = meshlet_data,
 		.fragment = fragment_data,
@@ -2832,10 +3422,13 @@ void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* frag
 	};
 	vkCmdPushDataEXT(cmd->command_buffer, &info);
 
-	if(!vkCmdDrawMeshTasksIndirectEXT)
-		throw std::runtime_error("This device wasn't set up with VK_EXT_mesh_shader, so meshlets can't be drawn!");
+	if(!vkCmdDrawMeshTasksIndirectEXT) {
+		GPU::detail::report(cmd, GPU_DIAGNOSTIC_UNSUPPORTED,
+			"gpuDrawMeshletsIndirect: this device was not set up with VK_EXT_mesh_shader, so nothing is drawn");
+		return;
+	}
 
-	auto dimensions = GPU::detail::closest_buffer(cmd->queue, dim, no_offsets);
+	auto dimensions = GPU::detail::closest_buffer(cmd->queue, dim);
 	assert(dimensions.buffer && "The indirect dimensions don't lie inside any allocation");
 	auto count = (dimensions.size - dimensions.offset) / sizeof(VkDrawMeshTasksIndirectCommandEXT); // VkDrawMeshTasksIndirectCommandEXT == uvec3
 	vkCmdDrawMeshTasksIndirectEXT(cmd->command_buffer, dimensions.buffer, dimensions.offset, count, sizeof(VkDrawMeshTasksIndirectCommandEXT));
@@ -2854,19 +3447,164 @@ GpuSurface* gpuCreateSurfaceEXT(GpuQueue* queue, VkSurfaceKHR surface, const Gpu
 	return out;
 }
 
-static void gpuFreeSurfaceNoSemaphores(GpuQueue* queue, GpuSurface* surface) {
-	for(auto view: surface->image_views)
-		vkDestroyImageView(queue->device, view, queue->callbacks);
-	if(surface->swapchain)
-		vkb::destroy_swapchain(*surface->swapchain);
+namespace GPU::detail {
+	// Drain a signalled acquire semaphore nothing waited on, by submitting a wait of its own.
+	//
+	// A binary semaphore cannot be reset from the host, so an acquire whose image was never
+	// rendered into leaves one signalled with no way to clear it but to consume it. Returns the
+	// submission after which the semaphore is idle again, or zero if there was nothing to drain.
+	inline uint64_t drain_acquire_semaphore(GpuQueue* queue, GpuSurface* surface) {
+		if(surface->current_semaphore == uint32_t(-1)) return 0;
+		auto semaphore = surface->images[surface->current_image].available_semaphore;
+		if(semaphore == VK_NULL_HANDLE) return 0; // Something waited on it already
+
+		VkSemaphoreSubmitInfo wait {
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+			.semaphore = semaphore,
+			.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+		};
+		VkSemaphoreSubmitInfo signal {
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+			.semaphore = queue->command_submission_timeline_semaphore,
+			.value = queue->command_submission_timeline_semaphore_next_value,
+			.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+		};
+		VkSubmitInfo2 info {
+			.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+			.waitSemaphoreInfoCount = 1,
+			.pWaitSemaphoreInfos = &wait,
+			.signalSemaphoreInfoCount = 1,
+			.pSignalSemaphoreInfos = &signal
+		};
+		if(vkQueueSubmit2(queue->queue, 1, &info, VK_NULL_HANDLE) != VK_SUCCESS) return 0;
+
+		surface->images[surface->current_image].available_semaphore = VK_NULL_HANDLE;
+		auto drained_after = queue->command_submission_timeline_semaphore_next_value++;
+		surface->image_available_free_after[surface->current_semaphore] = drained_after;
+		return drained_after;
+	}
+
+	// True once the presentation engine and the GPU are both done with a retired swapchain
+	inline bool retired_swapchain_is_idle(GpuQueue* queue, const GpuSurface* surface, const GpuSurface::RetiredSwapchain& retired) {
+		uint64_t reached = 0;
+		vkGetSemaphoreCounterValue(queue->device, queue->command_submission_timeline_semaphore, &reached);
+		if(reached < retired.free_after_submission) return false; // A submission still names its views
+
+		// How many presents have gone out since this was retired. Once the surface has presented
+		// more images than the retired swapchain even had, the presentation engine has cycled past
+		// all of them -- which is the only answer available without a fence to ask.
+		bool cycled_past = surface->presents_issued > retired.retired_at_present + retired.image_count;
+
+		if(queue->present_fences_supported) {
+			bool all_signalled = true;
+			for(auto fence: retired.present_fences)
+				if(vkGetFenceStatus(queue->device, fence) != VK_SUCCESS) { all_signalled = false; break; }
+			// The fences give the exact answer, and earlier than the count does -- but a present
+			// that failed may never signal the fence it was handed, so the count still has to be
+			// able to release the swapchain or a failed present would strand it here forever.
+			return all_signalled || cycled_past;
+		}
+
+		return cycled_past;
+	}
+}
+
+// Destroy whatever retired swapchains are now idle, and hand their present fences back.
+//
+// Called from the acquire path, so a long resize cleans up as it goes rather than at the end.
+static void reclaim_retired_swapchains(GpuQueue* queue, GpuSurface* surface, bool force) {
+	if(surface->retired.empty()) return;
+
+	// The pile only grows if presents stopped happening, which is the one case where there is
+	// nothing left to wait for but the device itself
+	if(force || surface->retired.size() > 4) {
+		vkDeviceWaitIdle(queue->device);
+		for(auto& retired: surface->retired) {
+			for(auto view: retired.views)
+				vkDestroyImageView(queue->device, view, queue->callbacks);
+			for(auto fence: retired.present_fences)
+				vkDestroyFence(queue->device, fence, queue->callbacks);
+			for(auto semaphore: retired.image_available)
+				vkDestroySemaphore(queue->device, semaphore, queue->callbacks);
+			for(auto semaphore: retired.render_finished)
+				vkDestroySemaphore(queue->device, semaphore, queue->callbacks);
+			if(retired.swapchain) vkb::destroy_swapchain(*retired.swapchain);
+		}
+		surface->retired.clear();
+
+		// The device is idle, so even a fence a failed present never signalled is safe to let go of
+		for(auto fence: surface->quarantined_present_fences)
+			vkDestroyFence(queue->device, fence, queue->callbacks);
+		surface->quarantined_present_fences.clear();
+		return;
+	}
+
+	for(size_t i = surface->retired.size(); i--; ) {
+		auto& retired = surface->retired[i];
+		if(!GPU::detail::retired_swapchain_is_idle(queue, surface, retired)) continue;
+
+		for(auto view: retired.views)
+			vkDestroyImageView(queue->device, view, queue->callbacks);
+		for(auto semaphore: retired.image_available)
+			vkDestroySemaphore(queue->device, semaphore, queue->callbacks);
+		for(auto semaphore: retired.render_finished)
+			vkDestroySemaphore(queue->device, semaphore, queue->callbacks);
+		for(auto fence: retired.present_fences) {
+			// Only a signalled fence is known to be out of the driver's hands. An unsignalled one
+			// here belongs to a present that failed and was released by the frame count instead, so
+			// it can be neither reset nor destroyed yet.
+			if(vkGetFenceStatus(queue->device, fence) == VK_SUCCESS) {
+				vkResetFences(queue->device, 1, &fence);
+				surface->free_present_fences.push_back(fence);
+			} else surface->quarantined_present_fences.push_back(fence);
+		}
+		if(retired.swapchain) vkb::destroy_swapchain(*retired.swapchain);
+		surface->retired.erase(surface->retired.begin() + i);
+	}
+}
+
+// Move the current swapchain, its views and its presents aside to be destroyed once idle, instead
+// of destroying them now. This is what VUID-vkDestroySwapchainKHR-swapchain-01282 was reporting:
+// reconfiguring used to destroy the outgoing swapchain the moment the new one was built, with
+// frames still in flight against it.
+static void retire_swapchain(GpuQueue* queue, GpuSurface* surface) {
+	if(!surface->swapchain && surface->image_views.empty()) return;
+
+	surface->retired.push_back(GpuSurface::RetiredSwapchain{
+		.swapchain = std::move(surface->swapchain),
+		.views = std::move(surface->image_views),
+		.present_fences = std::move(surface->present_fences),
+		.image_available = std::move(surface->image_available_semaphores),
+		.render_finished = std::move(surface->render_finished_semaphores),
+		// Everything queued up to now may name one of those views
+		.free_after_submission = queue->command_submission_timeline_semaphore_next_value - 1,
+		.retired_at_present = surface->presents_issued,
+		.image_count = static_cast<uint32_t>(surface->images.size()),
+	});
+	surface->swapchain = nullptr;
+	surface->image_views.clear();
+	surface->present_fences.clear();
+	// Emptied rather than reused, so the acquire and present paths build a fresh set for the new
+	// swapchain and nothing carries a stale signal across
+	surface->image_available_semaphores.clear();
+	surface->render_finished_semaphores.clear();
+	surface->image_available_free_after.clear();
+	surface->render_finished_free_after.clear();
+
+	reclaim_retired_swapchains(queue, surface, false);
 }
 
 void gpuFreeSurfaceEXT(GpuQueue* queue, GpuSurface* surface) {
+	retire_swapchain(queue, surface);
+	// Nothing is going to present again, so there is no later point at which the pile would drain
+	reclaim_retired_swapchains(queue, surface, true);
+
 	for(auto semaphore: surface->image_available_semaphores)
 		vkDestroySemaphore(queue->device, semaphore, queue->callbacks);
 	for(auto semaphore: surface->render_finished_semaphores)
 		vkDestroySemaphore(queue->device, semaphore, queue->callbacks);
-	gpuFreeSurfaceNoSemaphores(queue, surface);
+	for(auto fence: surface->free_present_fences)
+		vkDestroyFence(queue->device, fence, queue->callbacks);
 	surface->~GpuSurface();
 	queue->cpu_allocator(surface, 0);
 }
@@ -2918,7 +3656,13 @@ void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSur
 		return;
 	}
 
-	gpuFreeSurfaceNoSemaphores(queue, surface);
+	// An image acquired from the outgoing swapchain and never presented leaves its acquire semaphore
+	// signalled with nothing left to consume it, but that semaphore is retired along with the
+	// swapchain and destroyed once idle, so there is nothing to unwind here.
+	surface->image_acquired = false;
+	surface->current_semaphore = uint32_t(-1);
+
+	retire_swapchain(queue, surface);
 	surface->swapchain = std::make_shared<vkb::Swapchain>(std::move(*swap));
 	// What the swapchain settled on, which is not necessarily what was asked for: a FORMAT_NONE
 	// request in particular means "whatever the surface prefers", and the caller still has to be able
@@ -2997,19 +3741,37 @@ GpuSurfaceDescriptor gpuSurfaceGetConfigurationEXT(const GpuSurface* surface) {
 }
 
 const GpuTexture* gpuSurfaceNextTextureEXT(GpuQueue* queue, GpuSurface* surface) {
-	if(surface->image_available_semaphores.size() != surface->images.size()) {
-		for(auto semaphore: surface->image_available_semaphores)
-			vkDestroySemaphore(queue->device, semaphore, queue->callbacks);
+	// One acquired image at a time. A surface only lets a few be held at once, and holding one
+	// while asking for another is how that limit gets exceeded; it also loses track of the
+	// semaphore the held image was acquired with. Presenting is what releases it.
+	if(surface->image_acquired) {
+		GPU::detail::report(queue, GPU_DIAGNOSTIC_UNSUPPORTED,
+			"gpuSurfaceNextTextureEXT: an image is already acquired and not yet presented, so no new one is handed out; present the one you have first");
+		errno = VK_NOT_READY;
+		return nullptr;
+	}
 
+	// Swapchains a resize left behind, destroyed here as they fall idle so that a long drag cleans
+	// up as it goes instead of piling up until it ends
+	reclaim_retired_swapchains(queue, surface, false);
+
+	// A fresh set for each swapchain generation; the previous one went into retirement with the
+	// swapchain it was used against, so there is nothing here to destroy or wait for
+	if(surface->image_available_semaphores.size() != surface->images.size()) {
 		surface->image_available_semaphores.resize(surface->images.size());
 		for(auto& semaphore: surface->image_available_semaphores) {
 			VkSemaphoreCreateInfo info { info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
 			vkCreateSemaphore(queue->device, &info, queue->callbacks, &semaphore);
 		}
+		surface->image_available_free_after.assign(surface->images.size(), 0);
 		surface->semaphore_counter = -1;
 	}
 
 	surface->semaphore_counter = (surface->semaphore_counter + 1) % surface->image_available_semaphores.size();
+	// The frame that last used this semaphore has to have finished before it can be signalled
+	// again, which is a wait the CPU does here rather than a race it loses later
+	GPU::detail::wait_for_submission(queue, surface->image_available_free_after[surface->semaphore_counter]);
+
 	auto acquired = vkAcquireNextImageKHR(queue->device, surface->swapchain->swapchain, UINT64_MAX, surface->image_available_semaphores[surface->semaphore_counter], VK_NULL_HANDLE, &surface->current_image);
 	// A suboptimal swapchain no longer matches the window but can still be rendered into and
 	// presented, so the image is handed back and it is up to the caller whether that is worth a
@@ -3020,23 +3782,48 @@ const GpuTexture* gpuSurfaceNextTextureEXT(GpuQueue* queue, GpuSurface* surface)
 	}
 	if(acquired == VK_SUBOPTIMAL_KHR) errno = SURFACE_SUBOPTIMAL;
 
-
+	surface->image_acquired = true;
+	surface->current_semaphore = surface->semaphore_counter;
 	surface->images[surface->current_image].available_semaphore = surface->image_available_semaphores[surface->semaphore_counter];
 	return &surface->images[surface->current_image];
 }
 
 void gpuSurfacePresentEXT(GpuQueue* queue, GpuSurface* surface, uint64_t wait_submission_index /*= NO_SUBMISSION_WAIT */) {
+	// Nothing was acquired, so there is no image to hand back
+	if(!surface->image_acquired) {
+		GPU::detail::report(queue, GPU_DIAGNOSTIC_UNSUPPORTED,
+			"gpuSurfacePresentEXT: no image is currently acquired, so nothing is presented; call gpuSurfaceNextTextureEXT first");
+		return;
+	}
+	surface->image_acquired = false;
+
+	// The acquire semaphore is waited on by whatever recorded a render pass against the image. If
+	// nothing did -- a frame that acquired and then changed its mind -- it is still signalled, and
+	// signalling it again on its next turn would be invalid, so it gets drained here. Otherwise the
+	// submission being presented is the one that waited on it, and that is when it comes free.
+	if(!GPU::detail::drain_acquire_semaphore(queue, surface) && surface->current_semaphore != uint32_t(-1))
+		surface->image_available_free_after[surface->current_semaphore] =
+			wait_submission_index == NO_SUBMISSION_WAIT
+				? queue->command_submission_timeline_semaphore_next_value - 1
+				: wait_submission_index;
+	surface->current_semaphore = uint32_t(-1);
+
 	if(wait_submission_index != NO_SUBMISSION_WAIT) {
 		if(surface->render_finished_semaphores.size() != surface->images.size()) {
-			for(auto semaphore: surface->render_finished_semaphores)
-				vkDestroySemaphore(queue->device, semaphore, queue->callbacks);
-
 			surface->render_finished_semaphores.resize(surface->images.size());
 			for(auto& semaphore: surface->render_finished_semaphores) {
 				VkSemaphoreCreateInfo info { info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
 				vkCreateSemaphore(queue->device, &info, queue->callbacks, &semaphore);
 			}
+			surface->render_finished_free_after.assign(surface->images.size(), 0);
 		}
+
+		// This one is signalled below and waited on by the presentation engine, so it is only free
+		// to be signalled again once that present has been consumed. The image index it is keyed by
+		// does not come back around until the presentation engine is done with it, but the frame
+		// that signalled it still has to have finished for the signal itself to be idle.
+		GPU::detail::wait_for_submission(queue, surface->render_finished_free_after[surface->current_image]);
+		surface->render_finished_free_after[surface->current_image] = wait_submission_index;
 
 		// Launch an empty/no command buffer that waits for the timeline semaphore and then signals the render finished semaphore
 		VkSemaphoreSubmitInfo wait {
@@ -3070,5 +3857,35 @@ void gpuSurfacePresentEXT(GpuQueue* queue, GpuSurface* surface, uint64_t wait_su
 		info.waitSemaphoreCount = 1;
 		info.pWaitSemaphores = &surface->render_finished_semaphores[surface->current_image];
 	}
-	VK_CHECK(vkQueuePresentKHR(queue->queue, &info), /*nothing*/);
+
+	// A fence per present, where the device can give one. It is the only thing that says when the
+	// presentation engine has finished with an image, and so the only thing that can tell a retired
+	// swapchain it is safe to destroy without draining the whole device to find out.
+	VkSwapchainPresentFenceInfoKHR fence_info { .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR };
+	VkFence present_fence = VK_NULL_HANDLE;
+	if(queue->present_fences_supported) {
+		if(!surface->free_present_fences.empty()) {
+			present_fence = surface->free_present_fences.back();
+			surface->free_present_fences.pop_back();
+		} else {
+			VkFenceCreateInfo create { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+			if(vkCreateFence(queue->device, &create, queue->callbacks, &present_fence) != VK_SUCCESS)
+				present_fence = VK_NULL_HANDLE;
+		}
+
+		if(present_fence) {
+			fence_info.swapchainCount = 1;
+			fence_info.pFences = &present_fence;
+			fence_info.pNext = info.pNext;
+			info.pNext = &fence_info;
+		}
+	}
+
+	auto presented = vkQueuePresentKHR(queue->queue, &info);
+	// Recorded whether or not the present succeeded: a fence handed to a failed present is not
+	// signalled, but it was still consumed, and the swapchain still needs it accounted for
+	if(present_fence) surface->present_fences.push_back(present_fence);
+	++surface->presents_issued;
+
+	if(presented != VK_SUCCESS && presented != VK_SUBOPTIMAL_KHR) errno = presented;
 }

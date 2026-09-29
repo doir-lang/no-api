@@ -340,6 +340,26 @@ fn cs_set_max() {
 			}
 	}
 
+	// Report a call that could not be honored, or could only be honored conservatively.
+	//
+	// Once per distinct message per queue: the callers of this sit in functions a program calls per
+	// draw or per dispatch, so reporting every occurrence would push the first one -- the only one
+	// that says anything new -- out of any log worth reading.
+	inline void report(GpuQueue* queue, GPU_DIAGNOSTIC kind, std::string message) {
+		if(!queue) return;
+		if(!queue->reported_diagnostics.insert(message).second) return;
+
+		if(queue->diagnostic_callback)
+			queue->diagnostic_callback(queue, kind, {message.data(), message.size()}, queue->diagnostic_userdata);
+		else
+			fprintf(stderr, "[noapi] %s: %s\n",
+				kind == GPU_DIAGNOSTIC_UNSUPPORTED ? "unsupported" : "emulated", message.c_str());
+	}
+
+	inline void report(GpuCommandBuffer* cmd, GPU_DIAGNOSTIC kind, std::string message) {
+		report(cmd ? cmd->queue : nullptr, kind, std::move(message));
+	}
+
 	inline void push_to_monobuffer(GpuCommandBuffer* cmd, GpuQueue::MonobufferRange range, void* cpu) {
 		auto size = range.size();
 		WGPUBufferDescriptor d{
@@ -1550,7 +1570,38 @@ GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limi
 	// A command buffer that never calls gpuSetEnabledSamplersEXT still has to bind something, and
 	// every set resolves an unknown description to slot 0 anyway, so the default is a set of one
 	out->default_sampler_set = GPU::detail::ensure_sampler_set(out, {});
+
+	// What this backend can and cannot do. These are properties of WebGPU itself rather than of the
+	// adapter, so they are decided here rather than queried:
+	//
+	// - Mesh shaders do not exist in WebGPU, in any form or extension.
+	// - A 64 bit atomic does not exist in WGSL, so two of the three SIGNAL operations cannot be
+	//   performed; gpuSignalAfter reports those and honors SIGNAL_ATOMIC_SET.
+	// - Nothing can stall on a value in memory, and there are no events, so no wait is ever split.
+	// - A monobuffer is bound writable to compute and read only to graphics, and WebGPU forbids one
+	//   buffer being both in a single pass, so the heap cannot be bound out of the monobuffer it
+	//   was allocated in and gpuSetActiveTextureHeapPtr snapshots it. That is also why asking for
+	//   MEMORY_DESCRIPTOR_HEAP changes nothing here: no memory is bindable as a heap in place.
+	out->capabilities = GpuCapabilities {
+		.mesh_shaders = false,
+		.split_barrier_signals = false,
+		.split_barriers = false,
+		.gpu_writable_texture_heap = false,
+		.descriptor_heap_in_any_memory = true,
+		.texture_descriptor_stride_ratio = 1,
+	};
 	return out;
+}
+
+GpuCapabilities gpuGetCapabilitiesEXT(const GpuQueue* queue) {
+	return queue->capabilities;
+}
+
+void gpuSetDiagnosticCallbackEXT(GpuQueue* queue, GpuDiagnosticCallbackEXT callback, void* userdata) {
+	queue->diagnostic_callback = callback;
+	queue->diagnostic_userdata = userdata;
+	// A new destination has not been told any of this yet, so let it hear each cause once too
+	queue->reported_diagnostics.clear();
 }
 
 void gpuFreeQueue(GpuQueue* queue) {
@@ -1710,9 +1761,9 @@ gpu* gpuHostToDevicePointer(GpuQueue* queue, void* ptr) {
 }
 
 void* gpuDeviceToHostPointerEXT(GpuQueue* queue, gpu* ptr) {
-	if(queue->allocations.contains(ptr))
-		return std::get<void*>(queue->allocations[ptr]);
-	return nullptr;
+	auto found = queue->allocations.find(ptr);
+	if(found == queue->allocations.end()) return nullptr;
+	return std::get<void*>(found->second);
 }
 
 void gpuFree(GpuQueue* queue, void* ptr) {
@@ -1743,10 +1794,11 @@ void gpuFreeDevicePointerEXT(GpuQueue* queue, gpu* ptr) {
 		queue->cpu_allocator(texture, 0);
 	}
 
-	auto [range, cpu, _memory_type] = queue->allocations[ptr];
+	auto found = queue->allocations.find(ptr);
+	auto [range, cpu, _memory_type] = found->second; // A copy, so erasing below is safe
 	queue->cpu_allocator(cpu, 0);
 
-	queue->allocations.erase(ptr);
+	queue->allocations.erase(found);
 	queue->cpu2gpu.erase(cpu);
 
 	queue->buffer_freelist.push_back(range);
@@ -1796,6 +1848,11 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 				errno = WGPUErrorType_OutOfMemory;
 				return nullptr;
 			}
+			// Reported as well as asserted: an assert is compiled out of a release build, and a
+			// caller who asked for something WebGPU does not have should hear about it either way
+			if(desc.type == TEXTURE_1D)
+				GPU::report(queue, GPU_DIAGNOSTIC_UNSUPPORTED,
+					"gpuCreateTexture: WebGPU has no 1D textures, so TEXTURE_1D is created as a 2D texture one texel tall");
 			assert(desc.type != TEXTURE_1D && "1D textures aren't supported by WebGPU");
 			assert(desc.type != TEXTURE_3D || desc.layerCount == 1 && "3D textures can't be arrays in WebGPU");
 
@@ -2367,12 +2424,18 @@ void gpuWaitIdleEXT(GpuQueue* queue) {
 
 void gpuSyncMemoryEXT(GpuCommandBuffer* cmd, gpu* mem) {
 	endCurrentPass(cmd);
-	auto [range, cpu, memory_type] = cmd->queue->allocations[mem];
+	auto found = cmd->queue->allocations.find(mem);
+	if(found == cmd->queue->allocations.end()) return;
+	auto [range, cpu, memory_type] = found->second;
 
 	switch (memory_type) {
 	case MEMORY_DEFAULT:
 	case MEMORY_GPU:
 	case MEMORY_TEXTURE:
+	// Nothing here can be bound as a descriptor heap in place, so this is MEMORY_DEFAULT under
+	// another name and syncs the same way. Leaving it out of this switch would have made a heap
+	// allocated that way silently never reach the GPU.
+	case MEMORY_DESCRIPTOR_HEAP:
 		GPU::push_to_monobuffer(cmd, range, cpu);
 
 	break; case MEMORY_READBACK:
@@ -2431,39 +2494,37 @@ namespace GPU::detail {
 	// The allocation holding `addr` is the one whose base is the greatest at or below it and whose
 	// size actually reaches it — not, as this used to look for, the nearest base at or *above* it,
 	// which resolved every interior pointer to the next allocation along and handed back a negative
-	// offset. no_offsets promises the address is already a base, which skips the search.
+	// offset.
 	//
 	// An address encodes its monobuffer in its top bits, so ordering addresses as integers orders
-	// them by (monobuffer, offset), which is exactly what this walk wants.
+	// them by (monobuffer, offset). `allocations` is kept in that order, so upper_bound lands one
+	// past the allocation holding an address and stepping back once names it -- which is why the
+	// search costs a lookup rather than a walk over every live allocation, and why callers no
+	// longer have to promise (with no_offsets) that they are handing over an allocation base.
 	//
 	// Nothing here inserts into `allocations`: an address belonging to no allocation comes back
 	// null rather than quietly adding an empty entry that the next search would then find.
-	inline BufferLocation closest_buffer(GpuQueue* queue, gpu* addr, bool no_offsets) {
-		if(no_offsets) {
-			auto found = queue->allocations.find(addr);
-			assert(found != queue->allocations.end() && "no_offsets promises an address that is an allocation base");
-			if(found == queue->allocations.end()) return {};
-			return {std::get<GpuQueue::MonobufferRange>(found->second), 0, addr};
+	inline BufferLocation closest_buffer(GpuQueue* queue, gpu* addr) {
+		auto after = queue->allocations.upper_bound(addr);
+		if(after == queue->allocations.begin()) { // Below every allocation
+			assert(false && "The address doesn't lie inside any allocation");
+			return {};
 		}
+		auto found = std::prev(after);
 
-		BufferLocation out;
 		auto address = (uintptr_t)addr;
-		for(const auto& [key, allocation]: queue->allocations) {
-			auto base = (uintptr_t)key;
-			if(base > address) continue; // Starts past the address, so it can't be holding it
-
-			const auto& range = std::get<GpuQueue::MonobufferRange>(allocation);
-			if(address - base >= range.size()) continue; // Ends before it
-			if(out.base && base < (uintptr_t)out.base) continue; // Something tighter was found already
-
-			out = {range, ptrdiff_t(address - base), key};
+		auto base = (uintptr_t)found->first;
+		const auto& range = std::get<GpuQueue::MonobufferRange>(found->second);
+		if(address - base >= range.size()) { // The nearest one ends before the address
+			assert(false && "The address doesn't lie inside any allocation");
+			return {};
 		}
-		assert(out.base && "The address doesn't lie inside any allocation");
-		return out;
+
+		return {range, ptrdiff_t(address - base), found->first};
 	}
 
-	inline std::array<BufferLocation, 2> closest_buffer(GpuQueue* queue, gpu* addrA, gpu* addrB, bool no_offsets) {
-		return {closest_buffer(queue, addrA, no_offsets), closest_buffer(queue, addrB, no_offsets)};
+	inline std::array<BufferLocation, 2> closest_buffer(GpuQueue* queue, gpu* addrA, gpu* addrB) {
+		return {closest_buffer(queue, addrA), closest_buffer(queue, addrB)};
 	}
 }
 
@@ -2543,8 +2604,8 @@ namespace GPU::detail {
 
 }
 
-void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes, bool no_offsets /* = false */) {
-	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_, no_offsets);
+void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes) {
+	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_);
 	auto [dest_range, dest_offset, dest_addr] = dest; auto [src_range, src_offset, src_addr] = src;
 
 	if(src_range.buffer == dest_range.buffer) {
@@ -2563,8 +2624,8 @@ void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes, bool 
 }
 
 // TODO: Untested!
-void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* texture, bool no_offsets /* = false */) {
-	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_, no_offsets);
+void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* texture) {
+	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_);
 	auto [dest_range, dest_offset, dest_addr] = dest; auto [src_range, src_offset, src_addr] = src;
 
 	assert(cmd->queue->gpu2textures[dest_addr] == texture);
@@ -2601,8 +2662,8 @@ void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* 
 }
 
 // TODO: Untested!
-void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuTexture* texture, bool no_offsets /* = false */) {
-	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_, no_offsets);
+void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuTexture* texture) {
+	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_);
 	auto [dest_range, dest_offset, dest_addr] = dest; auto [src_range, src_offset, src_addr] = src;
 
 	assert(cmd->queue->gpu2textures[src_addr] == texture);
@@ -2633,9 +2694,9 @@ void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuT
 
 
 
-void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap, bool no_offsets /* = false */) {
+void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap) {
 	// TODO: Should we add some validation to check that what is provided is a valid texture heap?
-	auto [dest_range, dest_offset, dest_addr] = GPU::detail::closest_buffer(cmd->queue, texture_heap, no_offsets);
+	auto [dest_range, dest_offset, dest_addr] = GPU::detail::closest_buffer(cmd->queue, texture_heap);
 	dest_range.start += dest_offset;
 	// dest_range.end -= dest_offset;
 
@@ -2648,6 +2709,13 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap, bool n
 	// would have to re-copy on every activation anyway. A copy recorded here is also ordered in the
 	// command stream, so it picks up whatever the commands before it wrote into the heap, and two
 	// command buffers in flight with different heaps each get their own.
+	//
+	// The consequence a caller has to know about is that the snapshot, not their memory, is what the
+	// shaders read, so a descriptor a shader writes is not seen until the heap is set again. There
+	// is no MEMORY_DESCRIPTOR_HEAP escape from it here the way there is on Vulkan, which is why
+	// gpuGetCapabilitiesEXT reports gpu_writable_texture_heap false on this backend.
+	GPU::report(cmd, GPU_DIAGNOSTIC_EMULATED,
+		"gpuSetActiveTextureHeapPtr: a WebGPU monobuffer cannot be bound as a descriptor heap, so the heap is copied on every call and writes a shader makes to it are not seen");
 	endCurrentPass(cmd); // A copy can't be recorded with a pass open
 
 	auto size = dest_range.size();
@@ -2672,14 +2740,43 @@ void gpuSetEnabledSamplersEXT(GpuCommandBuffer* cmd, GpuSamplerDescSpan enabled_
 	cmd->sampler_set = GPU::detail::ensure_sampler_set(cmd->queue, enabled_samplers);
 }
 
-void gpuBarrier(GpuCommandBuffer* cmd, STAGE before, STAGE after, HAZARD_FLAGS hazards /* = (HAZARD_FLAGS)0 */) {
-	// TODO: I believe webgpu handles these internally... is there any reason to not make them noops?
-}
+// Nothing to record, and nothing missing either. WebGPU has no barrier command because it does not
+// expose the hazards one would name: the ordering between passes, and the visibility of what a pass
+// wrote to the passes after it, are guaranteed by the specification, and an implementation inserts
+// whatever its hardware needs at each pass boundary. A barrier here would have nothing to add.
+void gpuBarrier(GpuCommandBuffer* cmd, STAGE before, STAGE after, HAZARD_FLAGS hazards /* = (HAZARD_FLAGS)0 */) {}
+
 void gpuSignalAfter(GpuCommandBuffer* cmd, STAGE before, gpu* ptr, uint64_t value, SIGNAL signal) {
-	// TODO: I believe webgpu handles these internally... is there any reason to not make them noops?
+	// A store is expressible and the other two are not: WGSL has 32 bit atomics only, so there is
+	// no way to read-modify-write the 64 bit counter this API is built on. (The semaphore pipelines
+	// elsewhere in this backend fake one with a pair of 32 bit atomics, which is fine for a single
+	// producer bumping a timeline and wrong for the multi-producer case SIGNAL_ATOMIC_MAX and
+	// SIGNAL_ATOMIC_OR exist to serve -- so they are not reused here.)
+	if(signal != SIGNAL_ATOMIC_SET) {
+		GPU::report(cmd, GPU_DIAGNOSTIC_UNSUPPORTED,
+			"gpuSignalAfter: SIGNAL_ATOMIC_MAX and SIGNAL_ATOMIC_OR need a 64 bit atomic, which WGSL has no form of, so the counter is left alone");
+		return;
+	}
+
+	// Ordered in the command stream rather than written immediately, so the counter lands after
+	// whatever was recorded before it -- which is the whole point of signalling "after" a stage
+	auto counter = GPU::detail::closest_buffer(cmd->queue, ptr);
+	if(!counter.base) return;
+
+	auto range = counter.range;
+	range.start += counter.offset;
+	range.end = range.start + sizeof(value);
+	GPU::push_to_monobuffer(cmd, range, &value);
 }
+
 void gpuWaitBefore(GpuCommandBuffer* cmd, STAGE after, gpu* ptr, uint64_t value, OP op, HAZARD_FLAGS hazards /* = (HAZARD_FLAGS)0 */, uint64_t mask /* = ~uint64_t(0) */) {
-	// TODO: I believe webgpu handles these internally... is there any reason to not make them noops?
+	// There is no command to record and no way to record one: WebGPU cannot stall on a value in
+	// memory, and has no events to split a dependency across either. What saves this from being
+	// wrong is that it does not need to be right in the first place -- the ordering the pair
+	// describes is already guaranteed between passes, conservatively, whether or not anyone asks.
+	// So the dependency holds and only the splitting is lost, which is what EMULATED means.
+	GPU::report(cmd, GPU_DIAGNOSTIC_EMULATED,
+		"gpuWaitBefore: WebGPU has neither a wait on memory nor events, so nothing is split; the ordering the pair asks for is already implied by its pass boundaries");
 }
 
 
@@ -2815,11 +2912,6 @@ WGPUBindGroup createBufferBindGroup(GpuCommandBuffer* cmd, const void* shader_da
 	return wgpuDeviceCreateBindGroup(cmd->queue->device, &d);
 }
 
-WGPUBindGroup createBufferBindGroup(GpuCommandBuffer* cmd, gpu* data, bool no_offsets) {
-	ComputeShaderData shader_data { .compute = data };
-	return createBufferBindGroup(cmd, &shader_data, sizeof(shader_data), true);
-}
-
 // Binds every group needed by a dispatch or a draw (the texture groups are shared between the two)
 void bindGroups(GpuCommandBuffer* cmd, const void* shader_data, size_t shader_data_size, bool compute) {
 	auto group0 = createBufferBindGroup(cmd, shader_data, shader_data_size, compute);
@@ -2850,18 +2942,18 @@ void bindGraphicsGroups(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_d
 	bindGroups(cmd, &shader_data, sizeof(shader_data), false);
 }
 
-void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions, bool no_offsets /* = false */) {
+void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions) {
 	assert(cmd->compute_pass);
 
 	bindComputeGroups(cmd, data);
 
 	wgpuComputePassEncoderDispatchWorkgroups(cmd->compute_pass, grid_dimensions.x, grid_dimensions.y, grid_dimensions.z);
 }
-void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* data, gpu* grid_dimensions_gpu, bool no_offsets /* = false */) {
+void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* data, gpu* grid_dimensions_gpu) {
 	assert(cmd->compute_pass);
 	assert(grid_dimensions_gpu);
 
-	auto [grid_range, grid_offset, grid_addr] = GPU::detail::closest_buffer(cmd->queue, grid_dimensions_gpu, no_offsets);
+	auto [grid_range, grid_offset, grid_addr] = GPU::detail::closest_buffer(cmd->queue, grid_dimensions_gpu);
 
 	bindComputeGroups(cmd, data);
 
@@ -3292,29 +3384,39 @@ struct GpuDrawIndexedIndirectCommand {
 
 namespace GPU::detail {
 	// The monobuffers are created with Index usage, so the indices are drawn straight out of the one
-	// they were allocated in; no shadow copy (and thus nothing for no_index_buffer_changes to skip)
-	inline void bind_index_buffer(GpuCommandBuffer* cmd, gpu* indices, INDEX_TYPE_EXT index_type, bool no_offsets) {
-		auto [range, offset, address] = GPU::detail::closest_buffer(cmd->queue, indices, no_offsets);
+	// they were allocated in, with no shadow copy anywhere -- which is what the Vulkan backend now
+	// does too.
+	inline void bind_index_buffer(GpuCommandBuffer* cmd, gpu* indices, INDEX_TYPE_EXT index_type) {
+		auto [range, offset, address] = GPU::detail::closest_buffer(cmd->queue, indices);
 		assert(range.start + offset < range.end && "The indices point past the end of their allocation");
 
+		auto stride = index_type == INDEX_TYPE_UINT8 ? 1u : index_type == INDEX_TYPE_UINT16 ? 2u : 4u;
+		auto start = range.start + offset;
+		// Indices are read at their natural width from here, so a misaligned start is not a slow
+		// path but a wrong one: it would shift every index that follows
+		assert(start % stride == 0 && "The index pointer isn't aligned to the size of one index");
+
+		// The bound size has to be a whole number of indices; the rest of the allocation's tail is
+		// not one, and WebGPU rejects a size that doesn't divide evenly
+		auto size = ((range.end - start) / stride) * stride;
 		wgpuRenderPassEncoderSetIndexBuffer(cmd->render_pass, cmd->queue->monobuffers[range.buffer],
-			GPU::index2wgpu(index_type), range.start + offset, range.end - (range.start + offset));
+			GPU::index2wgpu(index_type), start, size);
 	}
 }
 
-void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data, gpu* indices, uint32_t index_count, uint32_t instance_count, INDEX_TYPE_EXT index_type /* = INDEX_TYPE_UINT32 */, bool no_offsets /* = false */, bool no_index_buffer_changes /* = false */) {
+void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data, gpu* indices, uint32_t index_count, uint32_t instance_count, INDEX_TYPE_EXT index_type /* = INDEX_TYPE_UINT32 */) {
 	assert(cmd->render_pass);
 	assert(indices);
 
 	cmd->index_type = index_type;
 	bindRenderPipeline(cmd);
 	bindGraphicsGroups(cmd, vertex_data, fragment_data, indices);
-	GPU::detail::bind_index_buffer(cmd, indices, index_type, no_offsets);
+	GPU::detail::bind_index_buffer(cmd, indices, index_type);
 
 	wgpuRenderPassEncoderDrawIndexed(cmd->render_pass, index_count, instance_count, 0, 0, 0);
 }
 
-void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data, gpu* indices, gpu* args, INDEX_TYPE_EXT index_type /* = INDEX_TYPE_UINT32 */, bool no_offsets /* = false */, bool no_index_buffer_changes /* = false */) {
+void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data, gpu* indices, gpu* args, INDEX_TYPE_EXT index_type /* = INDEX_TYPE_UINT32 */) {
 	assert(cmd->render_pass);
 	assert(indices);
 	assert(args);
@@ -3322,9 +3424,9 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd, gpu* vertex_data, gp
 	cmd->index_type = index_type;
 	bindRenderPipeline(cmd);
 	bindGraphicsGroups(cmd, vertex_data, fragment_data, indices);
-	GPU::detail::bind_index_buffer(cmd, indices, index_type, no_offsets);
+	GPU::detail::bind_index_buffer(cmd, indices, index_type);
 
-	auto [range, offset, address] = GPU::detail::closest_buffer(cmd->queue, args, no_offsets);
+	auto [range, offset, address] = GPU::detail::closest_buffer(cmd->queue, args);
 	auto start = range.start + offset;
 	auto count = (range.end - start) / sizeof(GpuDrawIndexedIndirectCommand);
 
@@ -3334,12 +3436,17 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd, gpu* vertex_data, gp
 		wgpuRenderPassEncoderDrawIndexedIndirect(cmd->render_pass, cmd->queue->monobuffers[range.buffer], start + i * sizeof(GpuDrawIndexedIndirectCommand));
 }
 
+// Reported rather than thrown: these are declared inside an extern "C" block, and an exception
+// leaving one is not something a C caller can catch -- it terminates. gpuGetCapabilitiesEXT's
+// mesh_shaders is the form of this a program can actually test before it records anything.
 void gpuDrawMeshlets(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, uvec3 dim) {
-	throw std::runtime_error("WebGPU doesn't support mesh shaders!");
+	GPU::report(cmd, GPU_DIAGNOSTIC_UNSUPPORTED,
+		"gpuDrawMeshlets: WebGPU has no mesh shaders, so nothing is drawn");
 }
 
-void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, gpu* dim, bool no_offsets /* = false */) {
-	throw std::runtime_error("WebGPU doesn't support mesh shaders!");
+void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, gpu* dim) {
+	GPU::report(cmd, GPU_DIAGNOSTIC_UNSUPPORTED,
+		"gpuDrawMeshletsIndirect: WebGPU has no mesh shaders, so nothing is drawn");
 }
 
 

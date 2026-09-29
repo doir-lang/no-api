@@ -294,17 +294,43 @@ int real_main() {
 
 	auto pipe = gpuCreateComputePipeline(state.queue, string_to_bytes(slang_compute));
 
+	// The counter a split barrier pair is built around. Readback memory because the point of the
+	// check below is that the CPU can see what the signal wrote: the counter is ordinary memory,
+	// not an opaque fence, so a program can watch the producer's progress through it.
+	auto counter = gpuMalloc<uint64_t>(state.queue, 1, MEMORY_READBACK);
+	*counter = 0;
+	auto counter_gpu = gpuHostToDevicePointer(state.queue, counter);
+	gpuSyncMemoryEXT(state.queue, counter_gpu);
+
+	const auto capabilities = gpuGetCapabilitiesEXT(state.queue);
+	constexpr uint64_t SIGNALLED = 7;
+
 	{
 		auto cmd = gpuStartCommandRecording(state.queue);
 		gpuSyncMemoryEXT(cmd, data->upload);
 		gpuSetPipeline(cmd, pipe);
 		gpuDispatch(cmd, data_gpu, {1, 1, 1});
+
+		// A split barrier around the dispatch above. The pair is what the backend can honor
+		// exactly: same counter, same value, same command buffer, outside any render pass.
+		gpuSignalAfter(cmd, STAGE_COMPUTE, counter_gpu, SIGNALLED, SIGNAL_ATOMIC_MAX);
+		gpuWaitBefore(cmd, STAGE_TRANSFER, counter_gpu, SIGNALLED, OP_GREATER_EQUAL);
+
 		gpuSyncMemoryEXT(cmd, data->download);
+		gpuSyncMemoryEXT(cmd, counter_gpu);
 		auto index = gpuSubmit(state.queue, {&cmd, 1});
 		gpuWaitSemaphore(state.queue, gpuGetSubmissionSemaphoreEXT(state.queue), index);
 	}
 
 	std::println("upload: {}, download: {}", upload[3], download[3]);
+
+	// Whether the signal wrote anything is a capability, so this checks what was promised rather
+	// than assuming: where the backend says it writes the counter, it has to have written it.
+	std::println("split barrier: signals={} splits={}, counter={} (expected {})",
+		capabilities.split_barrier_signals, capabilities.split_barriers,
+		*counter, capabilities.split_barrier_signals ? SIGNALLED : 0);
+	assert(*counter == (capabilities.split_barrier_signals ? SIGNALLED : 0)
+		&& "gpuSignalAfter didn't leave the counter where the queue's capabilities say it would");
 
 	gpuFreePipeline(state.queue, pipe);
 

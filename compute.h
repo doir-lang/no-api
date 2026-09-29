@@ -148,8 +148,22 @@ typedef struct GpuSemaphore GpuSemaphore;
  *
  * MEMORY_TEXTURE_READBACK – Semantically identical to MEMORY_READBACK but with the
  * same internal optimizations as MEMORY_TEXTURE.
+ *
+ * MEMORY_DESCRIPTOR_HEAP – CPU-mapped GPU memory, like MEMORY_DEFAULT, that may also be
+ * handed to gpuSetActiveTextureHeapPtr as a texture descriptor
+ * heap. Whether this is a distinct kind of memory or just
+ * MEMORY_DEFAULT under another name is a property of the device:
+ * some drivers accept descriptor heaps in any memory they accept
+ * a buffer in, and others confine them to their own memory types.
+ * gpuGetCapabilitiesEXT reports which of those a device is, via
+ * `descriptor_heap_in_any_memory`; when it is true this behaves
+ * exactly like MEMORY_DEFAULT, and when it is false only memory
+ * allocated this way can be bound as a heap in place. Allocating
+ * every heap this way is correct either way, which is why it is
+ * spelled as a memory type rather than a capability the caller
+ * has to branch on.
  */
-typedef enum MEMORY { MEMORY_DEFAULT, MEMORY_GPU, MEMORY_READBACK, MEMORY_TEXTURE, MEMORY_TEXTURE_READBACK } MEMORY;
+typedef enum MEMORY { MEMORY_DEFAULT, MEMORY_GPU, MEMORY_READBACK, MEMORY_TEXTURE, MEMORY_TEXTURE_READBACK, MEMORY_DESCRIPTOR_HEAP } MEMORY;
 
 /**
  * OP – Comparison operator used by depth tests, stencil tests, and semaphore
@@ -509,8 +523,17 @@ typedef struct GpuTextureSizeAlign {
  * This is the "raw descriptor" that GPUs load into scalar registers (AMD) or index
  * into the sampler descriptor heap (Nvidia, Apple, Qualcomm). The user writes these
  * blobs directly into a gpuMalloc'd array of GpuTextureDescriptor objects — the
- * global texture heap. The GPU and CPU can both read and write this array without
- * any additional API objects, unlike DX12's descriptor heap copy APIs.
+ * global texture heap. The CPU reads and writes that array through the mapped pointer
+ * it was allocated with, and no additional API object stands between the two, unlike
+ * DX12's descriptor heap copy APIs.
+ *
+ * Whether a shader can write the array too is a device property, reported as
+ * gpuGetCapabilitiesEXT().gpu_writable_texture_heap. Where it is true the heap is bound
+ * where it was allocated and a descriptor a shader writes is seen by the draws and
+ * dispatches after the next barrier carrying HAZARD_DESCRIPTORS. Where it is false the
+ * backend binds a snapshot taken when gpuSetActiveTextureHeapPtr was called, so a
+ * shader's writes are not visible until the heap is set again. Allocate the heap as
+ * MEMORY_DESCRIPTOR_HEAP to get the in place binding wherever the device offers it.
  *
  * 512 bits rather than the 256 an AMD image descriptor occupies, because that is not the
  * widest one in circulation: Intel lays a sampled image out in 512 and requires it aligned
@@ -546,6 +569,114 @@ NOAPI_EXTERN_C_BEGIN
  * @param queue Queue to destroy.
  */
 void gpuFreeQueue(GpuQueue* queue);
+
+// ---------------------------------------------------------------------------
+// Capabilities and diagnostics
+// ---------------------------------------------------------------------------
+
+/**
+ * GpuCapabilities – What a device and backend can actually do, for the parts of this API
+ * that cannot be provided everywhere.
+ *
+ * Every field answers a question the API would otherwise answer by failing at record
+ * time. A call that isn't supported reports through the diagnostic callback and does
+ * nothing rather than aborting, so a program that never reads this struct still runs --
+ * it just renders wrong. Read it to branch before you record.
+ */
+typedef struct GpuCapabilities {
+	/**
+	 * gpuDrawMeshlets and gpuDrawMeshletsIndirect do something. False on WebGPU always,
+	 * and on a Vulkan device without VK_EXT_mesh_shader.
+	 *
+	 * @note There is currently no way to create a pipeline for them either, so this is
+	 * false everywhere until one exists.
+	 */
+	bool mesh_shaders;
+
+	/**
+	 * gpuSignalAfter writes the counter it is given, so a shader or the CPU can read it
+	 * back. When false the call does nothing and the counter never changes.
+	 */
+	bool split_barrier_signals;
+
+	/**
+	 * gpuWaitBefore is a real split barrier -- work recorded between the two halves is not
+	 * stalled by the pair. When false the consuming half is a full barrier from every
+	 * stage, which is correct but gives up what a split barrier is for.
+	 *
+	 * @note Even when true, only a wait that pairs with an earlier gpuSignalAfter on the
+	 * same pointer and value, recorded outside a render pass in the same command buffer, is
+	 * split; anything else falls back. The fallback reports itself.
+	 */
+	bool split_barriers;
+
+	/**
+	 * A texture heap is bound where it was allocated, so writes a shader makes to its
+	 * descriptors are seen by the draws and dispatches that follow. When false the backend
+	 * binds a snapshot taken at gpuSetActiveTextureHeapPtr time, so CPU writes still land
+	 * (they happen before the call) but GPU writes need another call to be picked up.
+	 */
+	bool gpu_writable_texture_heap;
+
+	/**
+	 * Any MEMORY_DEFAULT allocation can be bound as a texture descriptor heap, so
+	 * MEMORY_DESCRIPTOR_HEAP is just another name for it. When false, heaps have to be
+	 * allocated as MEMORY_DESCRIPTOR_HEAP to be bound in place.
+	 */
+	bool descriptor_heap_in_any_memory;
+
+	/**
+	 * How many native descriptor slots one GpuTextureDescriptor spans. A shader multiplies
+	 * a heap index by this, which is what the `noapi` module's GPU_HEAP_STRIDE_RATIO is;
+	 * it is here for a program that wants to size or inspect a heap itself.
+	 */
+	uint32_t texture_descriptor_stride_ratio;
+
+} GpuCapabilities;
+
+/**
+ * gpuGetCapabilitiesEXT – What the queue's device and backend support.
+ *
+ * @param queue Queue to describe.
+ */
+GpuCapabilities gpuGetCapabilitiesEXT(const GpuQueue* queue);
+
+/**
+ * GPU_DIAGNOSTIC – What a diagnostic is telling you.
+ *
+ * GPU_DIAGNOSTIC_UNSUPPORTED – The call could not be honored at all and did nothing.
+ * The corresponding GpuCapabilities field is false.
+ *
+ * GPU_DIAGNOSTIC_EMULATED – The call was honored, but more conservatively than asked:
+ * correct, and slower or coarser. A split barrier that
+ * became a full barrier, or a descriptor heap that had to
+ * be snapshotted, reports this.
+ */
+typedef enum GPU_DIAGNOSTIC { GPU_DIAGNOSTIC_UNSUPPORTED, GPU_DIAGNOSTIC_EMULATED } GPU_DIAGNOSTIC;
+
+/**
+ * GpuDiagnosticCallbackEXT – Hook the backend reports unsupported and emulated calls
+ * through.
+ *
+ * @param queue The queue the call was recorded against.
+ * @param kind Whether the call did nothing or was emulated conservatively.
+ * @param message Human readable description, not null terminated.
+ * @param userdata The pointer handed to gpuSetDiagnosticCallbackEXT alongside the callback.
+ */
+typedef void (*GpuDiagnosticCallbackEXT)(GpuQueue* queue, GPU_DIAGNOSTIC kind, GpuStringView message, void* userdata);
+
+/**
+ * gpuSetDiagnosticCallbackEXT – Route diagnostics somewhere.
+ *
+ * When none is set they are printed to stderr. Either way each distinct message is
+ * reported once per queue: these fire from calls made per draw, and a report per draw
+ * would bury the first one.
+ *
+ * @param queue Queue to report for.
+ * @param callback Where to report, or NULL to go back to printing.
+ * @param userdata Passed back to \p callback untouched.
+ */
+void gpuSetDiagnosticCallbackEXT(GpuQueue* queue, GpuDiagnosticCallbackEXT callback, void* userdata);
 
 // ---------------------------------------------------------------------------
 // Memory management
@@ -887,9 +1018,8 @@ void gpuFreeSemaphore(GpuQueue* queue, GpuSemaphore* semaphore);
  * @param dest Destination GPU address.
  * @param src Source GPU address.
  * @param bytes Number of bytes to copy.
- * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest, gpu* src, size_t bytes, bool no_offsets NOAPI_DEFAULT(false));
+void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest, gpu* src, size_t bytes);
 
 /**
  * gpuCopyToTexture – Record a copy from a linear CPU-mapped staging region into a
@@ -905,9 +1035,8 @@ void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest, gpu* src, size_t bytes, bool no
  * @param dest GPU-only texture memory pointer (from gpuMalloc MEMORY_GPU).
  * @param src CPU-mapped (MEMORY_DEFAULT) GPU pointer to linear texture data.
  * @param texture GpuTexture handle describing the layout/format for swizzling.
- * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, GpuTexture* texture, bool no_offsets NOAPI_DEFAULT(false));
+void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, GpuTexture* texture);
 
 /**
  * gpuCopyFromTexture – Record a copy from a MEMORY_GPU texture back to a linear
@@ -918,9 +1047,8 @@ void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, GpuTexture* te
  * @param dest MEMORY_READBACK GPU pointer (CPU can read after semaphore wait).
  * @param src GPU-only texture memory pointer.
  * @param texture GpuTexture handle.
- * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, const GpuTexture* texture, bool no_offsets NOAPI_DEFAULT(false));
+void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, const GpuTexture* texture);
 
 /**
  * gpuBlitTextureEXT – Copy one texture subresource onto another by sampling it in a
@@ -976,11 +1104,16 @@ void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const Gpu
  * On modern GPUs the base address is embedded per sample instruction and multiple
  * heaps can be sampled seamlessly.
  *
+ * Allocate the heap as MEMORY_DESCRIPTOR_HEAP. Where the device allows it that lets the
+ * heap be bound where it lies, which is both cheaper (nothing is copied) and what makes
+ * a descriptor written by a shader visible; see GpuTextureDescriptor. Any other memory
+ * still works, at the cost of a snapshot per call, and the backend reports that through
+ * the diagnostic callback the first time it has to take one.
+ *
  * @param cmd Command buffer to record into.
  * @param texture_heap GPU virtual address of the first GpuTextureDescriptor in the heap.
- * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap, bool no_offsets NOAPI_DEFAULT(false));
+void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap);
 
 // ---------------------------------------------------------------------------
 // GPU commands – barriers and split barriers
@@ -1025,6 +1158,14 @@ void gpuBarrier(GpuCommandBuffer* cmd, STAGE before, STAGE after, HAZARD_FLAGS h
  * // ... independent work that doesn't depend on the compute output ...
  * gpuWaitBefore(cb, STAGE_PIXEL_SHADER, counterGpu, N, OP_GREATER_EQUAL);
  *
+ * The counter is real memory and the write really happens, so a shader or the CPU can
+ * read it to observe the producer's progress -- as long as
+ * gpuGetCapabilitiesEXT().split_barrier_signals says so. Where it is false the call does
+ * nothing and reports itself once through the diagnostic callback.
+ *
+ * Whether the paired wait is a true split barrier is a separate question, answered by
+ * gpuGetCapabilitiesEXT().split_barriers; see gpuWaitBefore.
+ *
  * @param cmd Command buffer to record into.
  * @param before Producer stage; signal fires after this stage completes.
  * @param ptr GPU virtual address of a 64-bit counter value in GPU memory.
@@ -1039,6 +1180,23 @@ void gpuSignalAfter(GpuCommandBuffer* cmd, STAGE before, gpu* ptr, uint64_t valu
  * `value`. Optionally performs cache invalidation via `hazards` and limits which
  * bits of the counter are compared via `mask` (e.g. for multi-producer bitmask
  * patterns using SIGNAL_ATOMIC_OR).
+ *
+ * How much of that a backend can honor varies, and the honest summary is that the
+ * counter comparison is an interface no current native API implements directly:
+ *
+ * - A wait that pairs with an earlier gpuSignalAfter in the same command buffer, on the
+ * same \p ptr and \p value, recorded outside a render pass, becomes a real split
+ * barrier: work recorded between the two halves is not stalled by the pair. This is
+ * the pattern the example above uses, and the one to write.
+ * - Anything else -- a \p mask, an \p op other than OP_GREATER_EQUAL or OP_EQUAL, a
+ * counter written by a shader rather than by gpuSignalAfter, or a signal that is in
+ * another command buffer -- cannot be expressed. The wait then becomes a full barrier
+ * from every stage, which is a superset of the dependency asked for (so correct on one
+ * queue) but gives up the independent work in between. Each such fallback reports
+ * itself once through the diagnostic callback.
+ *
+ * gpuGetCapabilitiesEXT().split_barriers is false on a backend where even the paired
+ * form cannot be split, in which case every wait is the full barrier above.
  *
  * @param cmd Command buffer to record into.
  * @param after Consumer stage; this stage stalls until the condition is met.
@@ -1080,7 +1238,7 @@ void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline);
  * @param data GPU pointer to the root data struct (see root arguments design).
  * @param grid_dimensions Thread group grid (x * y * z total groups).
  */
-void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions, bool no_offsets NOAPI_DEFAULT(false));
+void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions);
 
 /**
  * gpuDispatchIndirect – Like gpuDispatch but reads the thread group dimensions from
@@ -1091,8 +1249,7 @@ void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions, bool n
  * @param cmd Command buffer to record into.
  * @param data GPU pointer to the root data struct.
  * @param grid_dimensions_gpu GPU pointer to a uvec3 holding the group dimensions.
- * @param no_offsets When true it skips calculating offsets into buffers for the gpu*'s
  */
-void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* data, gpu* grid_dimensions_gpu, bool no_offsets NOAPI_DEFAULT(false));
+void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* data, gpu* grid_dimensions_gpu);
 
 NOAPI_EXTERN_C_END

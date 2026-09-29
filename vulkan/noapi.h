@@ -120,11 +120,19 @@ NOAPI_INLINE VkPhysicalDeviceVulkan11Features gpuEnableRequiredVulkan11FeaturesE
 
 /**
  * gpuEnableRequiredVulkan12FeaturesEXT – The Vulkan 1.2 features this backend needs.
+ *
+ * shaderBufferInt64Atomics is what gpuSignalAfter costs: SIGNAL_ATOMIC_MAX and
+ * SIGNAL_ATOMIC_OR are atomic read-modify-writes of the 64 bit counter the split barrier
+ * pair is built on, which nothing narrower can express. A device without it still gets
+ * SIGNAL_ATOMIC_SET (a plain write), and the other two report themselves as unsupported
+ * through the diagnostic callback; gpuGetCapabilitiesEXT().split_barrier_signals says
+ * which of the two situations you are in.
  */
 NOAPI_INLINE VkPhysicalDeviceVulkan12Features gpuEnableRequiredVulkan12FeaturesEXT(VkPhysicalDeviceVulkan12Features features) {
 	features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
 	features.bufferDeviceAddress = true;
 	features.timelineSemaphore = true;
+	features.shaderBufferInt64Atomics = true;
 	return features;
 }
 
@@ -153,7 +161,32 @@ NOAPI_INLINE VkPhysicalDeviceVulkan14Features gpuEnableRequiredVulkan14FeaturesE
  * without, as a span of statically allocated strings.
  */
 NOAPI_INLINE GpuCStringSpan gpuRequiredVulkanDeviceExtensionsEXT(void) {
-	static const char* const extensions[] = {"VK_EXT_descriptor_heap", "VK_KHR_shader_untyped_pointers"};
+	static const char* const extensions[] = {"VK_EXT_descriptor_heap", "VK_KHR_shader_untyped_pointers", "VK_EXT_extended_dynamic_state3"};
+
+	GpuCStringSpan out;
+	out.ptr = extensions;
+	out.count = sizeof(extensions) / sizeof(extensions[0]);
+	return out;
+}
+
+/**
+ * gpuOptionalVulkanDeviceExtensionsEXT – The device extensions the backend uses when they
+ * are there and does without when they are not, as a span of statically allocated strings.
+ *
+ * VK_KHR_swapchain_maintenance1 lets a present carry a fence, which is the only way to be
+ * told when the presentation engine has finished with an image. With it, a swapchain
+ * replaced by a window resize is destroyed exactly when it falls idle; without it, it is
+ * held until enough later frames have been presented that it cannot still be in use.
+
+ *
+ * @note A hand rolled device creation should enable these too -- alongside the matching
+ * feature bits, which vkb::PhysicalDevice::enable_extension_features_if_present or an
+ * equivalent check supplies. The backend decides what to use from what the *physical*
+ * device reports, so a device that skips one of these while its physical device supports it
+ * will be asked to do something it was not set up for.
+ */
+NOAPI_INLINE GpuCStringSpan gpuOptionalVulkanDeviceExtensionsEXT(void) {
+	static const char* const extensions[] = {"VK_KHR_swapchain_maintenance1"};
 
 	GpuCStringSpan out;
 	out.ptr = extensions;
@@ -175,7 +208,16 @@ NOAPI_INLINE void* gpuRequiredVulkanDeviceCreateInfoPnextEXT(void) {
 		.pNext = &descriptor_heap_info,
 		.shaderUntypedPointers = true
 	};
-	return &untyped_pointers_info;
+	// What gpuCreateBlendState and gpuSetBlendState rest on: without these, blending would have to
+	// be compiled into each pipeline, which this API has no way to express
+	static VkPhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic_state3_info = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
+		.pNext = &untyped_pointers_info,
+		.extendedDynamicState3ColorBlendEnable = true,
+		.extendedDynamicState3ColorBlendEquation = true,
+		.extendedDynamicState3ColorWriteMask = true
+	};
+	return &dynamic_state3_info;
 }
 
 /**

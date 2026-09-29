@@ -11,7 +11,8 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
-// #include <map>
+#include <map>
+#include <set>
 #include <array>
 #include <variant>
 #include <vector>
@@ -78,6 +79,17 @@ struct GpuQueue {
 	WGPUComputePipeline semaphore_set_pipeline = nullptr;
 	WGPUComputePipeline semaphore_set_max_pipeline = nullptr;
 
+	// What this backend can do, for the parts of the API it can't provide. Filled in by
+	// gpuCreateQueue and handed out by gpuGetCapabilitiesEXT.
+	GpuCapabilities capabilities = {};
+
+	// Where unsupported and emulated calls are reported, and the messages already reported.
+	// Deduplicated because these fire from per draw calls, and one report per draw would bury the
+	// first one.
+	GpuDiagnosticCallbackEXT diagnostic_callback = nullptr;
+	void* diagnostic_userdata = nullptr;
+	std::set<std::string> reported_diagnostics;
+
 	size_t next_submission_index = 1;
 	// The highest submission index the queue has reported finished, kept up to date by the
 	// wgpuQueueOnSubmittedWorkDone callback gpuSubmitNoFree registers. Reclaiming deferred deletes
@@ -101,7 +113,11 @@ struct GpuQueue {
 		uint32_t start, end;
 		size_t size() const { return end - start; }
 	};
-	std::unordered_map<gpu*, std::tuple<MonobufferRange, void*, MEMORY>> allocations;
+	// Ordered rather than hashed: the lookup that matters is "which allocation holds this address",
+	// which an ordered map answers with one upper_bound instead of a scan over every live
+	// allocation. An address carries its monobuffer in its top bits, so integer order is
+	// (monobuffer, offset) order (see GPU::detail::closest_buffer).
+	std::map<gpu*, std::tuple<MonobufferRange, void*, MEMORY>> allocations;
 	std::unordered_map<void*, gpu*> cpu2gpu;
 	std::unordered_map<gpu*, GpuTexture*> gpu2textures;
 	std::vector<MonobufferRange> buffer_freelist;

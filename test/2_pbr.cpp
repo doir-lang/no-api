@@ -497,7 +497,7 @@ TEST_MAIN({
 	std::println("environment: {} mip levels, roughness 1 reads level {}",
 		environment.desc.mipCount, environment.desc.mipCount - 1);
 
-	auto heap = gpuMalloc<GpuTextureDescriptor>(app.queue, 1);
+	auto heap = gpuMalloc<GpuTextureDescriptor>(app.queue, 1, MEMORY_DESCRIPTOR_HEAP);
 	heap[0] = gpuTextureViewDescriptor(app.queue, environment.texture, GpuViewDesc{});
 	auto heap_gpu = gpuHostToDevicePointer(app.queue, heap);
 	gpuSyncMemoryEXT(app.queue, heap_gpu);

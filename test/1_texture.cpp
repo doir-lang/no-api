@@ -196,10 +196,10 @@ TEST_MAIN({
 	std::println("albedo: {} mip levels", albedo.desc.mipCount);
 
 	//
-	// The texture heap. Just an array in gpu memory holding one 256 bit descriptor per texture; the
+	// The texture heap. Just an array in gpu memory holding one 512 bit descriptor per texture; the
 	// shader's `albedo` field is an index into it and nothing else binds anything.
 	//
-	auto heap = gpuMalloc<GpuTextureDescriptor>(app.queue, 1);
+	auto heap = gpuMalloc<GpuTextureDescriptor>(app.queue, 1, MEMORY_DESCRIPTOR_HEAP);
 	heap[0] = gpuTextureViewDescriptor(app.queue, albedo.texture, GpuViewDesc{});
 	auto heap_gpu = gpuHostToDevicePointer(app.queue, heap);
 	gpuSyncMemoryEXT(app.queue, heap_gpu);
@@ -250,9 +250,10 @@ TEST_MAIN({
 			data->fit[0] = 1.0f;
 			data->fit[1] = window_aspect / photo_aspect;
 		}
-		// Both of these record a copy, so they have to happen before the render pass opens: the
-		// heap is snapshotted out of the buffer it lives in, and gpuSyncMemoryEXT pushes the root
-		// data the frame just rewrote
+		// Both of these can record a copy, so they have to happen before the render pass opens:
+		// gpuSyncMemoryEXT pushes the root data the frame just rewrote, and setting the heap
+		// snapshots it wherever it can't be bound where it lies (which is anywhere the heap wasn't
+		// allocated as MEMORY_DESCRIPTOR_HEAP, and WebGPU regardless)
 		gpuSyncMemoryEXT(cmd, data_gpu);
 		gpuSetActiveTextureHeapPtr(cmd, heap_gpu);
 		gpuSetEnabledSamplersEXT(cmd, {&ALBEDO_SAMPLER, 1});
