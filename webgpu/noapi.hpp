@@ -271,20 +271,36 @@ struct GpuTexture {
 	WGPUTexture texture;
 };
 
-// The 256 bits behind a GpuTextureDescriptor. Everything a shader needs to sample the texture:
-// which monotexture holds it, which layers of it are the view's, how big the texture itself is (the
-// monotexture is bigger, and WGSL can report its size on its own), and which mips are in range.
-//
-// type, baseMip and mipCount share a word. None of them needs more than a byte, and the space buys
-// depth, without which a 3D view couldn't scale its coordinates.
+/**
+ * GPU_UV_UNCLAMPED – The uvMax a texture that fills its monotexture slot gets: far enough past 1
+ * that the shader's clamp never bites, so the sampler's own addressing mode still reaches the
+ * whole range and a REPEAT sampler tiles the way it was asked to.
+ */
+constexpr static float GPU_UV_UNCLAMPED = 3.0e38f;
+
+/**
+ * The 512 bits behind a GpuTextureDescriptor: everything a shader needs to sample the texture.
+ *
+ * uvScale and uvMax are what make the monotexture atlas invisible to a shader. A monotexture is
+ * sized by the first texture to land in its bucket, and the bucket keys on power of two rounded
+ * dimensions, so a smaller texture only covers the top left corner of its slot: uvScale maps the
+ * texture's own 0..1 onto that corner, and uvMax is the coordinate past which a bilinear tap would
+ * start reaching into the slot's leftovers. Both are computed once here rather than recovered in
+ * the shader, which is what lets gpuBackendSample skip a textureDimensions() and a divide per
+ * sample -- and uvMax is why nothing has to fill those leftovers in the first place.
+ *
+ * width/height/depth are the texture's own dimensions. Nothing in the sample path reads them any
+ * more now that uvScale carries the ratio, but they are what a heap entry means, and there is room.
+ */
 struct GpuTextureDescriptorImpl {
-	uint8_t type = TEXTURE_2D; ///< Dimensionality and view type (a TEXTURE).
-	uint8_t baseMip = 0; ///< First mip level the view covers.
-	uint8_t mipCount = 1; ///< Number of mip levels it covers.
-	uint8_t _reserved0 = 0;
+	uint32_t type = TEXTURE_2D; ///< Dimensionality and view type (a TEXTURE).
+	uint32_t baseMip = 0; ///< First mip level the view covers.
+	uint32_t mipCount = 1; ///< Number of mip levels it covers.
+	uint32_t _reserved = 0;
 	uint32_t width = 1, height = 1, depth = 1; ///< The texture's own dimensions in texels.
 	GpuQueue::MonotextureRange range;
-	uint32_t _reserved1 = 0;
+	float uvScale[3] = {1, 1, 1}; ///< The texture's share of its monotexture, per axis.
+	float uvMax[3] = {GPU_UV_UNCLAMPED, GPU_UV_UNCLAMPED, GPU_UV_UNCLAMPED}; ///< Half a texel inside that share.
 };
 static_assert(sizeof(GpuTextureDescriptorImpl) == sizeof(GpuTextureDescriptor), "GPU Texture Descriptors of The Wrong Size");
 

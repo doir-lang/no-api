@@ -79,7 +79,7 @@ typedef struct GpuQueue GpuQueue;
  * CPU-side handle for a GPU texture allocation. Needed because the triangle
  * rasterizer is not yet fully bindless on modern GPUs: the CPU driver must
  * prepare render-target and depth/stencil command packets. Created by
- * gpuCreateTexture. The 256-bit sampler descriptor written into the descriptor
+ * gpuCreateTexture. The 512-bit texture descriptor written into the descriptor
  * heap is a separate GpuTextureDescriptor value (see below).
  */
 typedef struct GpuTexture GpuTexture;
@@ -466,7 +466,7 @@ typedef struct GpuTextureDesc {
 /**
  * GpuViewDesc – Describes a sub-range of a GpuTexture for use in a descriptor.
  * Passed to gpuTextureViewDescriptor / gpuRWTextureViewDescriptor to create a
- * 256-bit descriptor blob that is stored in the global texture descriptor heap.
+ * 512-bit descriptor blob that is stored in the global texture descriptor heap.
  *
  * ALL_MIPS / ALL_LAYERS sentinel values indicate "from base to the last level/layer".
  */
@@ -504,7 +504,7 @@ typedef struct GpuTextureSizeAlign {
 } GpuTextureSizeAlign;
 
 /**
- * GpuTextureDescriptor – A 256-bit opaque hardware-specific texture descriptor blob.
+ * GpuTextureDescriptor – A 512-bit opaque hardware-specific texture descriptor blob.
  *
  * This is the "raw descriptor" that GPUs load into scalar registers (AMD) or index
  * into the sampler descriptor heap (Nvidia, Apple, Qualcomm). The user writes these
@@ -512,10 +512,18 @@ typedef struct GpuTextureSizeAlign {
  * global texture heap. The GPU and CPU can both read and write this array without
  * any additional API objects, unlike DX12's descriptor heap copy APIs.
  *
+ * 512 bits rather than the 256 an AMD image descriptor occupies, because that is not the
+ * widest one in circulation: Intel lays a sampled image out in 512 and requires it aligned
+ * to 512 as well, so a 256 bit slot could neither hold one nor sit where one may start. The
+ * width is fixed rather than queried because it is the stride of an array the program
+ * allocates and indexes itself, and an index a shader takes has to mean the same thing on
+ * every device. A backend whose descriptors are narrower leaves the rest of each slot unused
+ * and scales the index it hands the hardware.
+ *
  * Created by gpuTextureViewDescriptor (sampled, read-only) or
  * gpuRWTextureViewDescriptor (storage / read-write).
  */
-typedef struct GpuTextureDescriptor { uint64_t data[4]; } GpuTextureDescriptor;
+typedef struct GpuTextureDescriptor { NOAPI_ALIGNAS(64) uint64_t data[8]; } GpuTextureDescriptor;
 
 // ---------------------------------------------------------------------------
 // Functions
@@ -692,7 +700,7 @@ GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue* queue, NOAPI_CONST_REF(GpuText
  * The GpuTexture object is a thin CPU-side handle required because the rasterizer
  * is not yet fully bindless: the CPU driver must write rasterizer command packets
  * (render-target setup, clear, resolve) that refer to vendor-specific internal
- * texture metadata, which is not accessible through the 256-bit descriptor heap.
+ * texture metadata, which is not accessible through the descriptor heap.
  *
  * @note It is assumed that only a single image is bound to each memory allocation.
  * @note Textures are freed by freeing the bound memory.
@@ -704,7 +712,7 @@ GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue* queue, NOAPI_CONST_REF(GpuText
 GpuTexture* gpuCreateTexture(GpuQueue* queue, NOAPI_CONST_REF(GpuTextureDesc) desc, gpu* memory);
 
 /**
- * gpuTextureViewDescriptor – Create a read-only (sampled) 256-bit descriptor blob
+ * gpuTextureViewDescriptor – Create a read-only (sampled) 512-bit descriptor blob
  * for a sub-range of a GpuTexture, suitable for storing in the global texture heap.
  *
  * The returned GpuTextureDescriptor value can be written directly into a CPU-mapped
@@ -719,7 +727,7 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, NOAPI_CONST_REF(GpuTextureDesc) de
 GpuTextureDescriptor gpuTextureViewDescriptor(GpuQueue* queue, const GpuTexture* texture, NOAPI_CONST_REF(GpuViewDesc) desc);
 
 /**
- * gpuRWTextureViewDescriptor – Create a read/write (storage image / UAV) 256-bit
+ * gpuRWTextureViewDescriptor – Create a read/write (storage image / UAV) 512-bit
  * descriptor blob for a GpuTexture, for use in compute shaders that write to
  * textures (TextureRW in shader code).
  *
@@ -960,7 +968,7 @@ void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const Gpu
  * gpuSetActiveTextureHeapPtr – Set the GPU pointer to the global texture descriptor
  * heap for all subsequent draw and dispatch commands in this command buffer.
  *
- * The heap is a flat array of GpuTextureDescriptor values (each 256 bits / 32 bytes)
+ * The heap is a flat array of GpuTextureDescriptor values (each 512 bits / 64 bytes)
  * allocated via gpuMalloc. Shaders access textures by writing a 32-bit index into
  * their root data struct; the sampler fetches heap[index] internally.
  *

@@ -365,7 +365,11 @@ public uint gpuBackendSamplerSlot(uint packed) {
 // named statically. `layer` is therefore ignored. Layered, 3D and cube sampling needs
 // typed entry points this backend does not offer yet.
 public float4 gpuBackendSample(uint heap_index, uint slot, float3 uv, uint layer, float mip) {
-	Texture2D<float4> texture = ResourceDescriptorHeap[heap_index];
+	// The heap a program builds is an array of GpuTextureDescriptor, which is a fixed 64 bytes,
+	// while this indexes in units of whatever the driver lays an image descriptor out in. The ratio
+	// between the two is baked in at compile time (see heap_stride_ratio); it is 1 where the driver
+	// uses the full 64 and 2 where it uses 32, leaving the back half of each slot unused.
+	Texture2D<float4> texture = ResourceDescriptorHeap[heap_index * GPU_HEAP_STRIDE_RATIO];
 	SamplerState sampler = SamplerDescriptorHeap[slot];
 	return texture.SampleLevel(sampler, uv.xy, mip);
 }
@@ -379,7 +383,7 @@ public float4 gpuBackendSample(uint heap_index, uint slot, float3 uv, uint layer
  *
  * @return The SPIR-V words, or nothing (having reported why) if the shader did not compile.
  */
-static std::optional<std::string> compile_shader(GpuByteSpan ir, GPU::shaders::SHADER_STAGE stage) {
+static std::optional<std::string> compile_shader(GpuQueue* queue, GpuByteSpan ir, GPU::shaders::SHADER_STAGE stage) {
 	auto compute = stage == GPU::shaders::SHADER_STAGE::COMPUTE;
 	std::string error;
 	auto code = GPU::shaders::compile(SLANG_SPIRV, NOAPI_BACKEND_MODULE,
@@ -387,6 +391,10 @@ static std::optional<std::string> compile_shader(GpuByteSpan ir, GPU::shaders::S
 			{"GPU_COMPUTE", compute ? "1" : "0"},
 			{"GPU_GRAPHICS", compute ? "0" : "1"},
 			{"GPU_STORES", "1"},
+			// Device dependent, so it is a macro rather than a constant in the module source. The
+			// compiler's session cache keys on the macros, so two devices disagreeing about it get
+			// their own sessions rather than one another's code.
+			{"GPU_HEAP_STRIDE_RATIO", std::to_string(queue->heap_stride_ratio)},
 		}, error);
 
 	if(!code) {
@@ -548,6 +556,23 @@ GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice dev
 	vkGetPhysicalDeviceProperties2(gpu, &properties);
 	out->minimum_descriptor_heap_size = heap_properties.minResourceHeapReservedRange;
 	out->sampler_size = heap_properties.samplerDescriptorSize;
+	out->image_size = heap_properties.imageDescriptorSize;
+
+	// A GpuTextureDescriptor is 64 bytes because that is the widest image descriptor in
+	// circulation (Intel's), so a driver's own is either that or a divisor of it -- 32 on AMD and
+	// Nvidia. The shader multiplies its heap index by this to land on the right slot, and whatever
+	// the driver does not fill of each slot is simply left alone.
+	assert(heap_properties.imageDescriptorSize <= sizeof(GpuTextureDescriptor)
+		&& "This driver's image descriptors are wider than GpuTextureDescriptor");
+	assert(sizeof(GpuTextureDescriptor) % heap_properties.imageDescriptorSize == 0
+		&& "This driver's image descriptor size doesn't divide GpuTextureDescriptor's");
+	assert(heap_properties.imageDescriptorAlignment <= alignof(GpuTextureDescriptor)
+		&& "This driver wants image descriptors aligned more strictly than GpuTextureDescriptor is");
+	if(heap_properties.imageDescriptorSize == 0
+		|| heap_properties.imageDescriptorSize > sizeof(GpuTextureDescriptor)
+		|| sizeof(GpuTextureDescriptor) % heap_properties.imageDescriptorSize != 0) return {};
+
+	out->heap_stride_ratio = static_cast<uint32_t>(sizeof(GpuTextureDescriptor) / heap_properties.imageDescriptorSize);
 
 	return out;
 }
@@ -937,6 +962,16 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 }
 
 static GpuTextureDescriptor gpuTextureViewDescriptorImpl(GpuQueue* queue, const GpuTexture* texture, const GpuViewDesc& desc, bool read_only) {
+	// GpuTextureDescriptor is a fixed 256 bits, which is how wide AMD and Nvidia lay an image
+	// descriptor out. Intel's is 512. vkWriteResourceDescriptorsEXT writes the driver's size
+	// regardless of the range it is handed, so on a driver like that this would overrun `out` --
+	// and the heap the caller builds out of these would have half the stride the shader indexes it
+	// by, so widening the write alone would not save it. The descriptor's width is part of this
+	// API's ABI, so there is nothing to do here but say so.
+	// The whole 64 byte slot is offered even though the driver only fills image_size of it: the
+	// write is rejected outright if the range is narrower than the driver's descriptor, and it
+	// writes that many bytes whatever the range says, so the range has to be the larger of the two.
+	// The slack at the end of a slot on a narrow driver is never read by anything.
 	GpuTextureDescriptor out = {};
 	VkHostAddressRangeEXT host_info {
 		.address = &out,
@@ -1012,7 +1047,7 @@ struct ComputePipelinePushConstants {
 };
 
 GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, GpuByteSpan computeIR) {
-	auto spirv = compile_shader(computeIR, GPU::shaders::SHADER_STAGE::COMPUTE);
+	auto spirv = compile_shader(queue, computeIR, GPU::shaders::SHADER_STAGE::COMPUTE);
 	if(!spirv) return nullptr;
 
 	auto out = (GpuPipeline*)queue->cpu_allocator(nullptr, sizeof(GpuPipeline));
@@ -1068,6 +1103,15 @@ void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes, bool 
 	vkCmdCopyBuffer(cmd->command_buffer, src.buffer, dest.buffer, 1, &region);
 }
 
+namespace GPU::detail {
+	// Defined further down, next to the rest of the layout tracking. Declared here because the
+	// copies below are the first thing in the file that has to move an image into GENERAL.
+	inline void transition_texture(VkCommandBuffer cmd, const GpuTexture* texture, VkImageLayout new_layout,
+		VkAccessFlags source_access_mask, VkAccessFlags destination_access_mask,
+		VkPipelineStageFlags source_stage, VkPipelineStageFlags destination_stage,
+		uint32_t mip, uint32_t slice, bool discard);
+}
+
 void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* texture, bool no_offsets /* = false */) {
 	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_, no_offsets);
 	assert(dest.buffer && src.buffer && "Neither end of a copy may be an address outside every allocation");
@@ -1076,7 +1120,15 @@ void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* 
 
 	assert(dest.offset == 0); // TODO: Can we relax this restriction?
 
-	// TODO: DO we need a barrier?
+	// An image is created without a layout and every other path in this backend expects to find it
+	// in GENERAL -- which is also the layout its heap descriptors are written against -- so the
+	// copy has to put it there first. Without this the image is still UNDEFINED when it is
+	// sampled, which is undefined contents rather than a diagnosable error. Discarding, because
+	// the copy is about to overwrite what is being transitioned.
+	GPU::detail::transition_texture(cmd->command_buffer, texture, VK_IMAGE_LAYOUT_GENERAL,
+		0, VK_ACCESS_TRANSFER_WRITE_BIT,
+		VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 0, true);
 
 	VkBufferImageCopy copy {
 		.bufferOffset = src.offset,
@@ -1106,7 +1158,12 @@ void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuT
 
 	assert(src.offset == 0); // TODO: Can we relax this restriction?
 
-	// TODO: DO we need a barrier?
+	// Into GENERAL, the layout this backend keeps textures in, in case the last thing to touch it
+	// left it somewhere else. Not discarding: the contents are the entire point of a readback.
+	GPU::detail::transition_texture(cmd->command_buffer, texture, VK_IMAGE_LAYOUT_GENERAL,
+		VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+		VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 0, false);
 
 	VkBufferImageCopy copy {
 		// The texture is the source here, so the buffer half of the copy is the destination
@@ -1276,7 +1333,10 @@ void gpuBarrier(GpuCommandBuffer* cmd, STAGE before, STAGE after, HAZARD_FLAGS h
 		.imageMemoryBarrierCount = 0,
 		.pImageMemoryBarriers = nullptr,
 	};
-	vkCmdPipelineBarrier2KHR(cmd->command_buffer, &dependency);
+	// The core 1.3 entry point rather than the KHR alias: the device is created against 1.4, where
+	// synchronization2 is core, and volk only resolves the suffixed alias when the extension that
+	// introduced it was explicitly enabled -- which it isn't, so the alias is left null.
+	vkCmdPipelineBarrier2(cmd->command_buffer, &dependency);
 }
 
 // The split barrier pair is conservative here rather than exact. Vulkan has no command that stalls
@@ -1398,11 +1458,19 @@ namespace GPU::detail {
 				.addressModeW = address2vulkan(enabled_samplers[i].address_mode_w),
 				.maxLod = VK_LOD_CLAMP_NONE
 			});
-		VkHostAddressRangeEXT host_info {
-			.address = tmp,
-			.size = size
-		};
-		vkWriteSamplerDescriptorsEXT(queue->device, sampler_infos.size(), sampler_infos.data(), &host_info);
+		// One range per sampler, not one range covering the lot. pDescriptors is an array parallel
+		// to pSamplers, so handing over a single range while claiming samplerCount of them leaves
+		// the driver reading whatever happens to follow it in memory as the destination for every
+		// sampler past the first -- which wrote the default sampler into slot 0 correctly and left
+		// every other slot untouched, so that any shader asking gpuGetSamplerIndex for a sampler it
+		// had actually enabled sampled black.
+		std::vector<VkHostAddressRangeEXT> sampler_ranges; sampler_ranges.reserve(sampler_infos.size());
+		for(size_t i = 0; i < sampler_infos.size(); ++i)
+			sampler_ranges.emplace_back(VkHostAddressRangeEXT{
+				.address = (char*)tmp + i * queue->sampler_size,
+				.size = queue->sampler_size,
+			});
+		vkWriteSamplerDescriptorsEXT(queue->device, sampler_infos.size(), sampler_infos.data(), sampler_ranges.data());
 
 		VkBufferCreateInfo buffer_info {
 			.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -1564,9 +1632,9 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
 	// Both stages are compiled before anything is created, so a shader that does not build
 	// leaves no half made pipeline behind. Handing the same source in as both is normal: the
 	// entry points are told apart by stage, not by which argument they arrived in.
-	auto vertex_spirv = compile_shader(vertexIR, GPU::shaders::SHADER_STAGE::VERTEX);
+	auto vertex_spirv = compile_shader(queue, vertexIR, GPU::shaders::SHADER_STAGE::VERTEX);
 	if(!vertex_spirv) return nullptr;
-	auto fragment_spirv = compile_shader(fragmentIR, GPU::shaders::SHADER_STAGE::FRAGMENT);
+	auto fragment_spirv = compile_shader(queue, fragmentIR, GPU::shaders::SHADER_STAGE::FRAGMENT);
 	if(!fragment_spirv) return nullptr;
 
 	auto out = (GpuPipeline*)queue->cpu_allocator(nullptr, sizeof(GpuPipeline));

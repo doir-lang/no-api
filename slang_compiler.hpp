@@ -664,8 +664,17 @@ inline slang::ISession* get_session(SlangCompileTarget target, std::string_view 
 	// making every shader flip for one backend and not the other (which is what the two hand
 	// written shader sets this replaced had to do), the SPIR-V target is told to invert Y on
 	// the way out, so the same source lands the same way up on both.
+	// Slang lowers ResourceDescriptorHeap/SamplerDescriptorHeap two different ways. Without this
+	// capability it emits a traditional set/binding descriptor array, which a pipeline created with
+	// VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT then has to be handed an explicit
+	// VkShaderDescriptorSetAndBindingMappingInfoEXT for -- against binding numbers Slang picked. With
+	// it, the heap access is emitted as SPV_EXT_descriptor_heap and needs no mapping at all, which is
+	// what the Vulkan backend's heap is built around.
+	auto descriptor_heap = global->findCapability("spvDescriptorHeapEXT");
+
 	slang::CompilerOptionEntry spirv_options[] = {
 		{slang::CompilerOptionName::VulkanInvertY, {slang::CompilerOptionValueKind::Int, 1, 0, nullptr, nullptr}},
+		{slang::CompilerOptionName::Capability, {slang::CompilerOptionValueKind::Int, descriptor_heap, 0, nullptr, nullptr}},
 	};
 
 	slang::TargetDesc target_desc {
@@ -692,8 +701,14 @@ inline slang::ISession* get_session(SlangCompileTarget target, std::string_view 
 		return nullptr;
 	}
 
-	// The modules a shader may import, innermost first: whatever the program registered,
-	// then the backend's half of the ABI, then the portable module written against it
+	// The modules a shader may import, innermost first: the backend's half of the ABI, the
+	// portable module written against it, and then whatever the program registered.
+	//
+	// The API's own two have to go in before the registered ones, not after: a module is
+	// compiled as it is loaded, so anything it imports has to already be in the session. A
+	// registered module that says `import noapi` -- which is the whole point of being able to
+	// register one that describes a shared data layout -- fails to find it otherwise. Nothing
+	// is lost by the order, since neither of the API's modules can import a registered one.
 	auto load = [&](const char* name, std::string_view source) -> bool {
 		Slang::ComPtr<slang::IBlob> diagnostics;
 		auto path = std::string(name) + ".slang";
@@ -708,10 +723,10 @@ inline slang::ISession* get_session(SlangCompileTarget target, std::string_view 
 		return true;
 	};
 
-	for(auto& [name, source]: modules)
-		if(!load(name.c_str(), source)) return nullptr;
 	if(!load("noapi_backend", backend_module)) return nullptr;
 	if(!load("noapi", PORTABLE_MODULE)) return nullptr;
+	for(auto& [name, source]: modules)
+		if(!load(name.c_str(), source)) return nullptr;
 
 	cache.session = session;
 	cache.target = target;

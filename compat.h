@@ -66,6 +66,12 @@
 	#define NOAPI_INLINE inline
 	#define NOAPI_CONSTEXPR constexpr
 	#define NOAPI_NOEXCEPT noexcept
+
+	/**
+	 * NOAPI_ALIGNAS – Raises a struct member's alignment, and with it the struct's own.
+	 * Spelled on a member rather than on the type because C only allows it there.
+	 */
+	#define NOAPI_ALIGNAS(BYTES) alignas(BYTES)
 #else
 	#include <stdbool.h>
 	#include <stddef.h>
@@ -80,6 +86,9 @@
 	#define NOAPI_INLINE static inline
 	#define NOAPI_CONSTEXPR static inline
 	#define NOAPI_NOEXCEPT
+
+	/// See the C++ flavour above.
+	#define NOAPI_ALIGNAS(BYTES) _Alignas(BYTES)
 #endif
 
 // ---------------------------------------------------------------------------

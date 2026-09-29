@@ -88,7 +88,16 @@ struct GpuQueue {
 	std::unordered_map<VkDeviceAddress, std::tuple<VkBuffer, VmaAllocation, VkDeviceSize>> allocations;
 	// Mapping from gpu* (Device Addresses) to a mapped descriptor heap
 	std::unordered_map<VkDeviceAddress, std::tuple<VkBuffer, VmaAllocation, VkDeviceSize, VkDeviceAddress>> descriptor_heaps;
-	VkDeviceSize minimum_descriptor_heap_size = 0, sampler_size = 0;
+	VkDeviceSize minimum_descriptor_heap_size = 0, sampler_size = 0, image_size = 0;
+	/**
+	 * How many native descriptor slots one GpuTextureDescriptor spans.
+	 *
+	 * The heap a program builds is an array of GpuTextureDescriptor, whose width is fixed by the
+	 * API, while ResourceDescriptorHeap[] in a shader indexes in units of the driver's own image
+	 * descriptor. Those are only the same number on a driver that lays an image out in the full
+	 * 64 bytes; everywhere else the shader has to multiply, and the rest of each slot goes unused.
+	 */
+	uint32_t heap_stride_ratio = 1;
 	// Mappings between cpu and gpu pointers
 	std::unordered_map<void*, VkDeviceAddress> host2gpu;
 	std::unordered_map<VkDeviceAddress, void*> gpu2host;

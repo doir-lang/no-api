@@ -1281,28 +1281,25 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 		}
 	};
 
-	// A texture only owns part of the monotexture holding it, so its [0, 1] coordinates are
-	// scaled down by its share of the atlas before they are sampled. Each of these declares
-	// `at`, in whatever type the sample call below wants. Cube coordinates are a direction
-	// rather than a position, so they pass through untouched.
+	// A texture only owns part of the monotexture holding it, so its [0, 1] coordinates are scaled
+	// onto its share of the atlas before they are sampled, and pinned half a texel inside it so
+	// that a bilinear tap can't reach the leftovers past the image. Both numbers come out of the
+	// heap entry (see GpuTextureDescriptorImpl), which is what spares this a textureDimensions()
+	// call and a divide on every sample. Each of these declares `at`, in whatever type the sample
+	// call below wants. Cube coordinates are a direction rather than a position, so they pass
+	// through untouched.
 	constexpr static auto sample_remap = [](TEXTURE type) {
 		switch (GPU::texture_view2wgpu(type)) {
 		case WGPUTextureViewDimension_1D:
-			return "\t\tuint dw; sampled_tex_{0}.GetDimensions(dw);\n"
-				"\t\tlet at = uv.x * float(size.x) / float(dw);\n";
+			return "\t\tlet at = min(uv.x * scale.x, limit.x);\n";
 		case WGPUTextureViewDimension_3D:
-			return "\t\tuint dw, dh, dd; sampled_tex_{0}.GetDimensions(dw, dh, dd);\n"
-				"\t\tlet at = uv * float3(size) / float3(float(dw), float(dh), float(dd));\n";
+			return "\t\tlet at = min(uv * scale, limit);\n";
 		case WGPUTextureViewDimension_Cube:
 			return "\t\tlet at = uv;\n";
 		case WGPUTextureViewDimension_CubeArray:
 			return "\t\tlet at = uv;\n";
-		case WGPUTextureViewDimension_2DArray:
-			return "\t\tuint dw, dh, dl; sampled_tex_{0}.GetDimensions(dw, dh, dl);\n"
-				"\t\tlet at = uv.xy * float2(float(size.x), float(size.y)) / float2(float(dw), float(dh));\n";
 		default:
-			return "\t\tuint dw, dh; sampled_tex_{0}.GetDimensions(dw, dh);\n"
-				"\t\tlet at = uv.xy * float2(float(size.x), float(size.y)) / float2(float(dw), float(dh));\n";
+			return "\t\tlet at = min(uv.xy * scale.xy, limit.xy);\n";
 		}
 	};
 
@@ -1445,10 +1442,11 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 		"static const uint GPU_MONOTEXTURE_STORAGE_BIT = 0x80000000u;\n"
 		"static const uint GPU_MONOTEXTURE_INDEX_MASK = 0x7FFFFFFFu;\n"
 		"\n"
-		"// One entry of the texture heap, as gpuTextureViewDescriptor lays it out: eight words,\n"
-		"// the first of which packs three bytes. `size` is the texture's own, not the\n"
-		"// monotexture's -- WGSL can report the monotexture's itself, but not how much of it\n"
-		"// this texture owns.\n"
+		"// One entry of the texture heap, as gpuTextureViewDescriptor lays it out: sixteen words,\n"
+		"// one per field. `size` is the texture's own rather than the monotexture's, and `uv_scale`\n"
+		"// and `uv_max` are its share of that monotexture and the coordinate a bilinear tap has to\n"
+		"// stay inside of -- WGSL can report the monotexture's own size, but not how much of it this\n"
+		"// texture owns, so both are worked out on the host and read back here.\n"
 		"public struct GpuTextureDescriptor {{\n"
 		"\tpublic uint texture_type;\n"
 		"\tpublic uint base_mip;\n"
@@ -1457,14 +1455,17 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 		"\tpublic uint monotexture; // Top bit set means a storage monotexture, the rest is the index\n"
 		"\tpublic uint first_layer; // Absolute layer within that monotexture\n"
 		"\tpublic uint end_layer;\n"
+		"\tpublic float3 uv_scale;\n"
+		"\tpublic float3 uv_max;\n"
 		"}}\n"
 		"\n"
 		"public GpuTextureDescriptor gpuBackendTextureDescriptor(uint heap_index) {{\n"
-		"\tlet at = heap_index * 8u;\n"
-		"\tlet packed = texture_heap[at];\n"
-		"\treturn GpuTextureDescriptor(packed & 0xFFu, (packed >> 8u) & 0xFFu, (packed >> 16u) & 0xFFu,\n"
-		"\t\tuint3(texture_heap[at + 1u], texture_heap[at + 2u], texture_heap[at + 3u]),\n"
-		"\t\ttexture_heap[at + 4u], texture_heap[at + 5u], texture_heap[at + 6u]);\n"
+		"\tlet at = heap_index * 16u;\n"
+		"\treturn GpuTextureDescriptor(texture_heap[at], texture_heap[at + 1u], texture_heap[at + 2u],\n"
+		"\t\tuint3(texture_heap[at + 4u], texture_heap[at + 5u], texture_heap[at + 6u]),\n"
+		"\t\ttexture_heap[at + 7u], texture_heap[at + 8u], texture_heap[at + 9u],\n"
+		"\t\tfloat3(asfloat(texture_heap[at + 10u]), asfloat(texture_heap[at + 11u]), asfloat(texture_heap[at + 12u])),\n"
+		"\t\tfloat3(asfloat(texture_heap[at + 13u]), asfloat(texture_heap[at + 14u]), asfloat(texture_heap[at + 15u])));\n"
 		"}}\n"
 		"\n"
 		"public uint gpuBackendMonotextureIndex(GpuTextureDescriptor descriptor) {{\n"
@@ -1482,9 +1483,8 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 	binding = 0;
 	for (auto const& [_cap, texture, view, desc] : queue->sampled_monotextures) {
 		auto coordinate = sample_coordinate(desc.type);
-		auto remap = std::vformat(sample_remap(desc.type), std::make_format_args(binding));
-		out += std::format("float4 gpu_sample_tex_{}(uint slot, uint3 size, float3 uv, uint layer, float mip) {{\n{}"
-			"\tswitch(slot) {{\n", binding, remap);
+		out += std::format("float4 gpu_sample_tex_{}(uint slot, float3 scale, float3 limit, float3 uv, uint layer, float mip) {{\n{}"
+			"\tswitch(slot) {{\n", binding, sample_remap(desc.type));
 		for (uint32_t i = 1; i < gpu_sampler_slot_count; ++i)
 			out += std::format("\tcase {}u: return sampled_tex_{}.SampleLevel(gpu_sampler_{}, {}, mip);\n",
 				i, binding, i, coordinate);
@@ -1496,12 +1496,13 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 	}
 
 	out += "// Samples monotexture `texture` on `layer`, through the sampler in `slot` (see\n"
-		"// gpuBackendSamplerSlot). `uv` runs 0..1 over a texture of `size`, which is scaled down onto\n"
-		"// whatever part of the monotexture that texture occupies. `layer` and `mip` are absolute.\n"
-		"public float4 gpuBackendSampleTexture(uint texture, uint slot, uint3 size, float3 uv, uint layer, float mip) {\n"
+		"// gpuBackendSamplerSlot). `uv` runs 0..1 over the texture itself and is scaled by `scale`\n"
+		"// onto whatever part of the monotexture that texture occupies, then held to `limit` so it\n"
+		"// stays inside it. `layer` and `mip` are absolute.\n"
+		"public float4 gpuBackendSampleTexture(uint texture, uint slot, float3 scale, float3 limit, float3 uv, uint layer, float mip) {\n"
 		"\tswitch(texture) {\n";
 	for (uint32_t i = 0; i < sampled_count; ++i)
-		out += std::format("\tcase {}u: return gpu_sample_tex_{}(slot, size, uv, layer, mip);\n", i, i);
+		out += std::format("\tcase {}u: return gpu_sample_tex_{}(slot, scale, limit, uv, layer, mip);\n", i, i);
 	out += "\tdefault: return float4(0.0);\n"
 		"\t}\n"
 		"}\n"
@@ -1513,7 +1514,8 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 		"\tlet descriptor = gpuBackendTextureDescriptor(heap_index);\n"
 		"\tlet level = float(descriptor.base_mip) + clamp(mip, 0.0, max(float(descriptor.mip_count), 1.0) - 1.0);\n"
 		"\tlet at = descriptor.first_layer + min(layer, descriptor.end_layer - descriptor.first_layer - 1u);\n"
-		"\treturn gpuBackendSampleTexture(gpuBackendMonotextureIndex(descriptor), slot, descriptor.size, uv, at, level);\n"
+		"\treturn gpuBackendSampleTexture(gpuBackendMonotextureIndex(descriptor), slot,\n"
+		"\t\tdescriptor.uv_scale, descriptor.uv_max, uv, at, level);\n"
 		"}\n";
 
 	return out;
@@ -1936,14 +1938,41 @@ GpuTextureDescriptor gpuTextureViewDescriptor(GpuQueue* queue, const GpuTexture*
 	assert(texture->range && "This texture has no monotexture slot, so no descriptor can name it");
 
 	GpuTextureDescriptorImpl out {
-		.type = static_cast<uint8_t>(texture->descriptor.type),
+		.type = static_cast<uint32_t>(texture->descriptor.type),
 		.baseMip = desc.baseMip,
-		.mipCount = static_cast<uint8_t>(desc.mipCount == ALL_MIPS ? texture->descriptor.mipCount - desc.baseMip : desc.mipCount),
+		.mipCount = desc.mipCount == ALL_MIPS ? texture->descriptor.mipCount - desc.baseMip : desc.mipCount,
 		.width = texture->descriptor.dimensions.x,
 		.height = texture->descriptor.dimensions.y,
 		.depth = texture->descriptor.dimensions.z,
 		.range = texture->range ? *texture->range : GpuQueue::MonotextureRange::INVALID
 	};
+
+	// The texture's share of the monotexture holding it, which is what the shader scales its
+	// coordinates by, and how far into that share a bilinear tap may reach. A texture that fills
+	// its slot -- which is every power of two one, since the bucket rounds dimensions up to a power
+	// of two -- gets a scale of exactly 1 and no limit at all, so the sampler's own addressing mode
+	// still applies across the whole range and REPEAT tiles the way it was asked to. One that
+	// doesn't fill it is held half a texel inside its image instead, which is what keeps the
+	// leftovers of the slot out of the filter and is why nothing has to write them.
+	//
+	// Layers are addressed separately, so only a 3D texture scales its third axis; for everything
+	// else the image and its slot are one layer deep and the axis falls out unscaled.
+	const uint32_t image[3] = {
+		texture->descriptor.dimensions.x, texture->descriptor.dimensions.y, texture->descriptor.dimensions.z
+	};
+	const uint32_t slot[3] = {
+		std::max(wgpuTextureGetWidth(texture->texture), 1u),
+		std::max(wgpuTextureGetHeight(texture->texture), 1u),
+		texture->descriptor.type == TEXTURE_3D
+			? std::max(wgpuTextureGetDepthOrArrayLayers(texture->texture), 1u) : std::max(image[2], 1u),
+	};
+	for(int axis = 0; axis < 3; ++axis) {
+		out.uvScale[axis] = float(image[axis]) / float(slot[axis]);
+		out.uvMax[axis] = image[axis] >= slot[axis]
+			? GPU_UV_UNCLAMPED
+			: (float(image[axis]) - 0.5f) / float(slot[axis]);
+	}
+
 	if(texture->range) {
 		auto check = texture->range;
 		out.range.start += desc.baseLayer;
@@ -2512,128 +2541,6 @@ namespace GPU::detail {
 		};
 	}
 
-	// Replicates a freshly uploaded texture's right and bottom edges across the rest of its slot.
-	// Whatever the gap holds is otherwise undefined, and it gets sampled the moment normalized
-	// coordinates run past the image or the sampler filters across its last row or column.
-	//
-	// The replication has to come out of the same staging buffer the upload did: WebGPU rejects a
-	// texture to texture copy whose source and destination are the same mip of the same layer, so
-	// the texture can't be used to widen itself.
-	//
-	// Naming bytesPerRow at all forces it to be 256 byte aligned, so every copy that can get away
-	// with leaving it undefined does — that is any copy of a single row of a single layer, which
-	// covers all of this but the one strip that has to walk down the image.
-	inline void pad_monotexture_slot(GpuCommandBuffer* cmd, const GpuTexture* texture,
-			WGPUBuffer buffer, uint64_t base, uint32_t layer, uint32_t layers) {
-		const uint32_t width = texture->descriptor.dimensions.x, height = texture->descriptor.dimensions.y;
-		auto slot = monotexture_slot_extent(texture, 0);
-		const uint32_t gap_x = slot.x > width ? slot.x - width : 0;
-		const uint32_t gap_y = slot.y > height ? slot.y - height : 0;
-		if(!gap_x && !gap_y) return;
-
-		const uint32_t bytes = format_bytes(texture->descriptor.format);
-		const uint64_t row = uint64_t(width) * bytes;
-		const uint64_t image = row * height; // What one array layer of the staging data spans
-
-		WGPUTexelCopyTextureInfo destination {
-			.texture = texture->texture,
-			.mipLevel = 0,
-			.aspect = WGPUTextureAspect_All,
-		};
-
-		// The last column, stretched across every column the image doesn't reach. This is the only
-		// strip that spans rows, so it is the only one carrying the upload's row alignment.
-		for(uint32_t x = width; x < slot.x; ++x) {
-			WGPUTexelCopyBufferInfo source {
-				.layout = {
-					.offset = base + uint64_t(width - 1) * bytes,
-					.bytesPerRow = static_cast<uint32_t>(row),
-					.rowsPerImage = height,
-				},
-				.buffer = buffer,
-			};
-			destination.origin = {x, 0, layer};
-			WGPUExtent3D size {1, height, layers};
-			wgpuCommandEncoderCopyBufferToTexture(cmd->encoder, &source, &destination, &size);
-		}
-
-		// The last row, stretched down every row the image doesn't reach. Each layer keeps its own
-		// last row, so they are written one at a time rather than strided over in a single copy.
-		for(uint32_t l = 0; l < layers; ++l)
-			for(uint32_t y = height; y < slot.y; ++y) {
-				WGPUTexelCopyBufferInfo source {
-					.layout = {
-						.offset = base + l * image + (height - 1) * row,
-						.bytesPerRow = WGPU_COPY_STRIDE_UNDEFINED,
-						.rowsPerImage = WGPU_COPY_STRIDE_UNDEFINED,
-					},
-					.buffer = buffer,
-				};
-				destination.origin = {0, y, layer + l};
-				WGPUExtent3D size {width, 1, 1};
-				wgpuCommandEncoderCopyBufferToTexture(cmd->encoder, &source, &destination, &size);
-			}
-
-		if(!gap_x || !gap_y) return;
-
-		// Where the two gaps meet every texel is the image's bottom right one. Copying it out of the
-		// staging buffer directly would cost a command per texel, so each layer's corner texel is
-		// first smeared across a scratch row that its remaining rows fill from in one command each.
-		const bool alignable = bytes % 4 == 0 && (base + (height - 1) * row + uint64_t(width - 1) * bytes) % 4 == 0 && image % 4 == 0;
-		if(alignable) {
-			WGPUBufferDescriptor scratch_desc {
-				.label = {"NoAPI Monotexture Corner", WGPU_STRLEN},
-				.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst,
-				.size = uint64_t(gap_x) * bytes * layers,
-			};
-			auto scratch = wgpuDeviceCreateBuffer(cmd->queue->device, &scratch_desc);
-			cmd->queue->code_pending_submission_finished.emplace_back([scratch] {
-				wgpuBufferRelease(scratch);
-			}, cmd->queue->next_submission_index);
-
-			for(uint32_t l = 0; l < layers; ++l) {
-				auto corner = base + l * image + (height - 1) * row + uint64_t(width - 1) * bytes;
-				for(uint32_t i = 0; i < gap_x; ++i)
-					wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, buffer, corner,
-						scratch, (uint64_t(l) * gap_x + i) * bytes, bytes);
-			}
-
-			for(uint32_t l = 0; l < layers; ++l)
-				for(uint32_t y = height; y < slot.y; ++y) {
-					WGPUTexelCopyBufferInfo source {
-						.layout = {
-							.offset = uint64_t(l) * gap_x * bytes,
-							.bytesPerRow = WGPU_COPY_STRIDE_UNDEFINED,
-							.rowsPerImage = WGPU_COPY_STRIDE_UNDEFINED,
-						},
-						.buffer = scratch,
-					};
-					destination.origin = {width, y, layer + l};
-					WGPUExtent3D size {gap_x, 1, 1};
-					wgpuCommandEncoderCopyBufferToTexture(cmd->encoder, &source, &destination, &size);
-				}
-		} else {
-			// A buffer to buffer copy has to be 4 byte aligned, which the narrow formats can't
-			// promise, so those fall back to writing the corner a texel at a time
-			for(uint32_t l = 0; l < layers; ++l) {
-				auto corner = base + l * image + (height - 1) * row + uint64_t(width - 1) * bytes;
-				for(uint32_t y = height; y < slot.y; ++y)
-					for(uint32_t x = width; x < slot.x; ++x) {
-						WGPUTexelCopyBufferInfo source {
-							.layout = {
-								.offset = corner,
-								.bytesPerRow = WGPU_COPY_STRIDE_UNDEFINED,
-								.rowsPerImage = WGPU_COPY_STRIDE_UNDEFINED,
-							},
-							.buffer = buffer,
-						};
-						destination.origin = {x, y, layer + l};
-						WGPUExtent3D size {1, 1, 1};
-						wgpuCommandEncoderCopyBufferToTexture(cmd->encoder, &source, &destination, &size);
-					}
-			}
-		}
-	}
 }
 
 void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes, bool no_offsets /* = false */) {
@@ -2685,10 +2592,12 @@ void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* 
 	};
 	wgpuCommandEncoderCopyBufferToTexture(cmd->encoder, &source, &destination, &size);
 
-	// The texture may not fill the slot it was handed in its monotexture, and the gap would
-	// otherwise be sampled as undefined data the moment a coordinate ran past the image
-	if(texture->range)
-		GPU::detail::pad_monotexture_slot(cmd, texture, source.buffer, base, destination.origin.z, size.depthOrArrayLayers);
+	// Nothing fills the rest of the monotexture slot this texture was handed. It used to be
+	// padded here with the image's edge replicated across it, at a cost of one copy command per
+	// column of the gap, because a coordinate running past the image would otherwise sample
+	// undefined data. Nothing reads it any more: a sample is held inside the image by the uvMax in
+	// the heap entry (see gpuTextureViewDescriptor), and gpuBlitTextureEXT -- which is what writes
+	// the smaller mips -- pins its own source read the same way.
 }
 
 // TODO: Untested!
@@ -3097,8 +3006,12 @@ namespace GPU::detail {
 	constexpr static std::string_view BLIT_WGSL_CODE = R"WGSL(
 @group(0) @binding(0) var blit_source : texture_2d<f32>;
 @group(0) @binding(1) var blit_sampler : sampler;
-// xy = the viewport's size over the destination image's, so that uv reaches 1 exactly at the
-// image's edge even when the viewport was opened up to cover the rest of a monotexture slot
+// xy = the viewport's size over the destination image's, times the source image's share of the
+// monotexture holding it, so that uv reaches the source image's edge exactly where the destination
+// image ends even when the viewport was opened up to cover the rest of a monotexture slot.
+// zw = that edge, half a texel in. The fragments past it are pinned there, which is what fills the
+// gap around the destination image by replicating the source's edge instead of resampling whatever
+// the source's own slot holds beyond it.
 @group(0) @binding(2) var<uniform> blit_uv_scale : vec4<f32>;
 
 struct Varyings {
@@ -3120,7 +3033,7 @@ fn vertex(@builtin(vertex_index) index : u32) -> Varyings {
 @fragment
 fn fragment(varyings : Varyings) -> @location(0) vec4<f32> {
 	// The view covers a single mip, so there is never another level to pick between
-	return textureSampleLevel(blit_source, blit_sampler, varyings.uv, 0.0);
+	return textureSampleLevel(blit_source, blit_sampler, min(varyings.uv, blit_uv_scale.zw), 0.0);
 }
 )WGSL";
 
@@ -3144,7 +3057,9 @@ fn fragment(varyings : Varyings) -> @location(0) vec4<f32> {
 				}
 			}, WGPUBindGroupLayoutEntry{
 				.binding = 2,
-				.visibility = WGPUShaderStage_Vertex,
+				// Both stages: the vertex half reads the scale, the fragment half reads the limit
+				// it pins the source coordinate to
+				.visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment,
 				.buffer = {
 					.type = WGPUBufferBindingType_Uniform,
 					.minBindingSize = sizeof(float) * 4,
@@ -3276,16 +3191,28 @@ void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const Gpu
 	auto pipeline = GPU::detail::blit_pipeline(cmd->queue, GPU::format2wgpu(destination->descriptor.format), filtering);
 
 	// The viewport is opened up to the whole monotexture slot so that fragments exist past the
-	// destination image, and the uv scale keeps uv = 1 sitting exactly on the image's edge. Those
-	// outer fragments therefore sample above 1, where the blit sampler's clamped addressing
-	// replicates the edge texels into the gap, covering it in the same draw.
+	// destination image, and the uv scale puts the source image's edge exactly where the
+	// destination image ends. Those outer fragments read past it and are pinned to it, which
+	// replicates the source's edge texels into the gap, covering it in the same draw.
+	//
+	// Both sides need their own slot ratio. The source view covers a whole monotexture mip, not
+	// just the image inside it, so 1.0 in view coordinates is the slot's edge; scaling by the
+	// destination's ratio alone -- which is what this did before -- resampled the source's
+	// leftovers into the destination image whenever either texture failed to fill its slot.
 	auto extent = GPU::detail::attachment_extent(destination, destination_mip);
 	auto slot = GPU::detail::monotexture_slot_extent(destination, destination_mip);
+	auto source_extent = GPU::detail::attachment_extent(source, source_mip);
+	auto source_slot = GPU::detail::monotexture_slot_extent(source, source_mip);
 
+	float source_fraction[2] = {
+		static_cast<float>(source_extent.x) / source_slot.x,
+		static_cast<float>(source_extent.y) / source_slot.y,
+	};
 	float uv_scale[4] = {
-		static_cast<float>(slot.x) / extent.x,
-		static_cast<float>(slot.y) / extent.y,
-		0, 0,
+		source_fraction[0] * slot.x / extent.x,
+		source_fraction[1] * slot.y / extent.y,
+		source_fraction[0] - 0.5f / source_slot.x,
+		source_fraction[1] - 0.5f / source_slot.y,
 	};
 	WGPUBufferDescriptor scale_desc {
 		.label = {"NoAPI Blit UV Scale", WGPU_STRLEN},

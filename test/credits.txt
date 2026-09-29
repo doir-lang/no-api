@@ -1,0 +1,5 @@
+pexels-70588695-35341664.jpg: https://www.pexels.com/photo/vibrant-purple-anemone-flower-in-bloom-35341664/
+sunflowers_puresky_2k.hdr: https://polyhaven.com/a/sunflowers_puresky
+teapot.obj: https://graphics.stanford.edu/courses/cs148-10-summer/as3/code/as3/teapot.obj
+stb_image.h: https://github.com/nothings/stb (public domain / MIT)
+tiny_obj_loader.h: https://github.com/tinyobjloader/tinyobjloader (MIT)
