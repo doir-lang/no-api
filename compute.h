@@ -585,11 +585,11 @@ void gpuFreeQueue(GpuQueue* queue);
  */
 typedef struct GpuCapabilities {
 	/**
-	 * gpuDrawMeshlets and gpuDrawMeshletsIndirect do something. False on WebGPU always,
-	 * and on a Vulkan device without VK_EXT_mesh_shader.
+	 * gpuCreateGraphicsMeshletPipeline, gpuDrawMeshlets and gpuDrawMeshletsIndirect do
+	 * something. False on WebGPU always, and on a Vulkan device without VK_EXT_mesh_shader.
 	 *
-	 * @note There is currently no way to create a pipeline for them either, so this is
-	 * false everywhere until one exists.
+	 * When false the pipeline creation returns NULL and the two draws report and draw
+	 * nothing, so this is what to branch on before building a meshlet path at all.
 	 */
 	bool mesh_shaders;
 

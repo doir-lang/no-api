@@ -113,12 +113,13 @@ endfunction()
 noapi_add_test(0_basic C_COMPAT)
 noapi_add_test(1_texture ASSETS)
 noapi_add_test(2_pbr ASSETS)
+noapi_add_test(3_meshlet)
 
 if(EMSCRIPTEN)
 	add_custom_target(serve
 		COMMAND ${CMAKE_COMMAND} -E chdir ${CMAKE_BINARY_DIR} python3 -m http.server 8080
 		COMMENT "Web server has started on port 8080, press ctrl+c when you are finished"
-		DEPENDS 0_basic 1_texture 2_pbr
+		DEPENDS 0_basic 1_texture 2_pbr 3_meshlet
 		BYPRODUCTS ${CMAKE_BINARY_DIR}/server_started
 	)
 endif()

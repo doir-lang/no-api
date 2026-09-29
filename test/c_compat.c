@@ -88,6 +88,10 @@ void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data) {
 
 	GpuPipeline* graphics = gpuCreateGraphicsPipeline(queue, ir, ir, &raster);
 
+	// Optional, so null is one of the answers this is allowed to give; nothing here runs, so only
+	// the declaration is being checked either way
+	GpuPipeline* meshlet = gpuCreateGraphicsMeshletPipeline(queue, ir, ir, &raster);
+
 	// Dynamic state
 	GpuDepthStencilDesc depth_desc = GPU_DEPTH_STENCIL_DESC_DEFAULT;
 	depth_desc.depthMode = DEPTH_READ | DEPTH_WRITE;
@@ -183,6 +187,7 @@ void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data) {
 	gpuFreeBlendState(queue, blend);
 	gpuFreeDepthStencilState(queue, depth);
 	gpuFreePipeline(queue, graphics);
+	if(meshlet) gpuFreePipeline(queue, meshlet);
 	gpuFreePipeline(queue, compute);
 	gpuFreeSurfaceEXT(queue, surface);
 	gpuFree(queue, host);

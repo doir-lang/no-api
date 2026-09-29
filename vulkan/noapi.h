@@ -177,7 +177,12 @@ NOAPI_INLINE GpuCStringSpan gpuRequiredVulkanDeviceExtensionsEXT(void) {
  * told when the presentation engine has finished with an image. With it, a swapchain
  * replaced by a window resize is destroyed exactly when it falls idle; without it, it is
  * held until enough later frames have been presented that it cannot still be in use.
-
+ *
+ * VK_EXT_mesh_shader is what gpuCreateGraphicsMeshletPipeline and the two gpuDrawMeshlets
+ * calls are made of; there is no way to emulate a mesh stage without it, so where it is
+ * missing gpuGetCapabilitiesEXT().mesh_shaders reports false and those three calls decline.
+ * Only the mesh stage is asked for, not the task stage: this API dispatches mesh thread
+ * groups directly and has no amplification stage to put in front of them.
  *
  * @note A hand rolled device creation should enable these too -- alongside the matching
  * feature bits, which vkb::PhysicalDevice::enable_extension_features_if_present or an
@@ -186,7 +191,7 @@ NOAPI_INLINE GpuCStringSpan gpuRequiredVulkanDeviceExtensionsEXT(void) {
  * will be asked to do something it was not set up for.
  */
 NOAPI_INLINE GpuCStringSpan gpuOptionalVulkanDeviceExtensionsEXT(void) {
-	static const char* const extensions[] = {"VK_KHR_swapchain_maintenance1"};
+	static const char* const extensions[] = {"VK_KHR_swapchain_maintenance1", "VK_EXT_mesh_shader"};
 
 	GpuCStringSpan out;
 	out.ptr = extensions;

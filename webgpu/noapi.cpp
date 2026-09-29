@@ -1574,7 +1574,9 @@ GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limi
 	// What this backend can and cannot do. These are properties of WebGPU itself rather than of the
 	// adapter, so they are decided here rather than queried:
 	//
-	// - Mesh shaders do not exist in WebGPU, in any form or extension.
+	// - Mesh shaders do not exist in WebGPU, in any form or extension, so
+	//   gpuCreateGraphicsMeshletPipeline returns null and the two meshlet draws report and do
+	//   nothing.
 	// - A 64 bit atomic does not exist in WGSL, so two of the three SIGNAL operations cannot be
 	//   performed; gpuSignalAfter reports those and honors SIGNAL_ATOMIC_SET.
 	// - Nothing can stall on a value in memory, and there are no events, so no wait is ever split.
@@ -2249,6 +2251,16 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
 	// state, and the index format are all baked into a WebGPU PSO but none of them are bound until
 	// a draw is recorded. The first draw builds the initial variant.
 	return out;
+}
+
+// Nothing to try: a mesh stage does not exist in WGSL or in any WebGPU extension, so unlike the
+// calls that report and carry on conservatively there is no degraded version of this to hand back.
+// gpuGetCapabilitiesEXT's mesh_shaders is false on this backend for exactly this reason, and is
+// what a program should branch on rather than waiting for the null.
+GpuPipeline* gpuCreateGraphicsMeshletPipeline(GpuQueue* queue, GpuByteSpan meshletIR, GpuByteSpan fragmentIR, const GpuRasterDesc& desc) {
+	GPU::report(queue, GPU_DIAGNOSTIC_UNSUPPORTED,
+		"gpuCreateGraphicsMeshletPipeline: WebGPU has no mesh shaders, so no pipeline is created");
+	return nullptr;
 }
 
 void gpuFreePipeline(GpuQueue* queue, GpuPipeline* pipeline) {

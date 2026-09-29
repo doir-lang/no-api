@@ -193,6 +193,45 @@ namespace GPU::detail {
 		}
 	};
 
+	/**
+	 * PRESENT_MODE_PREFERENCE – The order a present mode request falls back through, best first.
+	 *
+	 * One list, used twice, because the two uses have to agree: gpuSurfaceReconfigureEXT picks the
+	 * mode to build the swapchain with, and gpuGetSurfaceCapabilitiesEXT reports the same order so
+	 * that presentModes[0] really is what PRESENT_MODE_BEST_AVAILABLE will resolve to. They used to
+	 * be two copies of this order written out separately.
+	 *
+	 * Mailbox (tear free at the lowest latency), then relaxed fifo, then the fifo every surface is
+	 * required to have. Immediate trails the tear free modes rather than leading on its latency,
+	 * which is why a BEST_AVAILABLE request never reaches for it.
+	 */
+	constexpr static PRESENT_MODE PRESENT_MODE_PREFERENCE[] = {
+		PRESENT_MODE_MAILBOX, PRESENT_MODE_FIFO_RELAXED, PRESENT_MODE_FIFO, PRESENT_MODE_IMMEDIATE
+	};
+
+	// What the surface will actually present with, out of the modes it supports: the requested one
+	// where it is available, otherwise the best of PRESENT_MODE_PREFERENCE that is.
+	//
+	// Resolved here rather than left to the swapchain builder's fallback list because the mode has
+	// to be known before the swapchain is created -- VkSwapchainPresentModesCreateInfoKHR, below,
+	// has to name it. Fifo is the floor: every surface is required to support it.
+	inline VkPresentModeKHR resolve_present_mode(VkPhysicalDevice gpu, VkSurfaceKHR surface, PRESENT_MODE requested) {
+		uint32_t count = 0;
+		vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, surface, &count, nullptr);
+		std::vector<VkPresentModeKHR> modes(count);
+		vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, surface, &count, modes.data());
+
+		auto supported = [&modes](PRESENT_MODE mode) {
+			return std::ranges::find(modes, present2vulkan(mode)) != modes.end();
+		};
+
+		if(requested != PRESENT_MODE_BEST_AVAILABLE && supported(requested))
+			return present2vulkan(requested);
+		for(auto mode: PRESENT_MODE_PREFERENCE)
+			if(supported(mode)) return present2vulkan(mode);
+		return VK_PRESENT_MODE_FIFO_KHR;
+	}
+
 	inline VkImageUsageFlags usage2vulkan(TEXTURE_USAGE_FLAGS usageFlags) {
 		VkImageUsageFlags result = 0;
 		if (usageFlags & USAGE_SAMPLED)
@@ -378,12 +417,14 @@ public float4 gpuBackendSample(uint heap_index, uint slot, float3 uv, uint layer
  * @return The SPIR-V words, or nothing (having reported why) if the shader did not compile.
  */
 static std::optional<std::string> compile_shader(GpuQueue* queue, GpuByteSpan ir, GPU::shaders::SHADER_STAGE stage) {
-	auto compute = stage == GPU::shaders::SHADER_STAGE::COMPUTE;
+	// A mesh stage counts as graphics here, which is what gives it the draw's root pointers rather
+	// than the dispatch's -- see gpuBackendRootVertex above, which gpuMeshletData reads through
+	auto graphics = GPU::shaders::is_graphics(stage);
 	std::string error;
 	auto code = GPU::shaders::compile(SLANG_SPIRV, NOAPI_BACKEND_MODULE,
 		std::string_view((const char*)ir.data(), ir.size()), stage, {
-			{"GPU_COMPUTE", compute ? "1" : "0"},
-			{"GPU_GRAPHICS", compute ? "0" : "1"},
+			{"GPU_COMPUTE", graphics ? "0" : "1"},
+			{"GPU_GRAPHICS", graphics ? "1" : "0"},
 			{"GPU_STORES", "1"},
 			// Device dependent, so it is a macro rather than a constant in the module source. The
 			// compiler's session cache keys on the macros, so two devices disagreeing about it get
@@ -490,6 +531,16 @@ bool gpuSetupDefaultVulkanEXT(GpuVulkanSurfaceLoaderEXT surface_loader, void* su
 	};
 	if(gpu.enable_extension_features_if_present(swapchain_maintenance))
 		gpu.enable_extension_if_present("VK_KHR_swapchain_maintenance1");
+
+	// Only meshShader, not taskShader: gpuDrawMeshlets dispatches mesh thread groups itself, so
+	// there is no amplification stage to turn on, and asking for one a device does not have would
+	// lose the mesh stage with it. VK_EXT_mesh_shader permits either bit on its own.
+	VkPhysicalDeviceMeshShaderFeaturesEXT mesh_shader {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,
+		.meshShader = true
+	};
+	if(gpu.enable_extension_features_if_present(mesh_shader))
+		gpu.enable_extension_if_present("VK_EXT_mesh_shader");
 
 
 	// Logical Device
@@ -633,12 +684,31 @@ GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice dev
 		out->present_fences_supported = maintenance.swapchainMaintenance1;
 	}
 
+	// Whether this device can run a mesh stage at all, which is what gpuCreateGraphicsMeshletPipeline
+	// and the two gpuDrawMeshlets calls all check before doing anything.
+	//
+	// Both halves are needed, and neither alone would do. The physical device saying meshShader only
+	// means the feature could have been asked for; whether the VkDevice actually enabled
+	// VK_EXT_mesh_shader is not queryable, the same blind spot the feature checks above have. The
+	// entry points fill it in: vkGetDeviceProcAddr (which volkLoadDevice went through) hands back
+	// null for a command belonging to an extension the device did not enable, so a non-null pair is
+	// the device's own answer. A hand rolled device that enabled the extension without the feature
+	// bit is the case the physical device query catches, since the commands would be there but a
+	// mesh pipeline would be invalid.
+	{
+		VkPhysicalDeviceMeshShaderFeaturesEXT mesh {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT
+		};
+		VkPhysicalDeviceFeatures2 features { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &mesh };
+		vkGetPhysicalDeviceFeatures2(gpu, &features);
+		out->capabilities.mesh_shaders = mesh.meshShader
+			&& vkCmdDrawMeshTasksEXT && vkCmdDrawMeshTasksIndirectEXT;
+	}
+
 	// Events give Vulkan a real split barrier, so a paired wait need not stall the work between the
-	// halves. Mesh shading is reported off regardless of VK_EXT_mesh_shader, because there is still
-	// no way to create a pipeline that could be drawn with it.
+	// halves.
 	out->capabilities.split_barriers = true;
 	out->capabilities.gpu_writable_texture_heap = true;
-	out->capabilities.mesh_shaders = false;
 
 	out->command_submission_timeline_semaphore = gpuCreateSemaphoreImpl(out, 0)->semaphore;
 
@@ -2185,7 +2255,25 @@ namespace GPU::detail {
 
 
 
-GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, GpuByteSpan fragmentIR, const GpuRasterDesc& desc) {
+namespace GPU::detail {
+/**
+ * create_raster_pipeline – The body both graphics pipeline creation functions share, with the
+ * stage that feeds the rasterizer as a parameter.
+ *
+ * A mesh pipeline is the same VkGraphicsPipeline as a vertex one: the same dynamic state, the
+ * same blend bookkeeping, the same dynamic rendering formats. Exactly two things differ, and both
+ * follow from a mesh shader producing primitives itself rather than being fed them -- the stage
+ * bit, and the absence of a vertex input and input assembly state (which Vulkan ignores for a
+ * mesh pipeline; passing them would be describing a fixed function stage that is not there).
+ *
+ * @param primitiveIR Source of the stage ahead of the rasterizer.
+ * @param primitive_stage Which stage that is: VERTEX or MESH.
+ */
+static GpuPipeline* create_raster_pipeline(GpuQueue* queue, GpuByteSpan primitiveIR,
+	GPU::shaders::SHADER_STAGE primitive_stage, GpuByteSpan fragmentIR, const GpuRasterDesc& desc
+) {
+	const bool mesh = primitive_stage == GPU::shaders::SHADER_STAGE::MESH;
+
 	constexpr static auto topology2vulkan = [](TOPOLOGY t) -> VkPrimitiveTopology{
 		switch (t) {
 			// case TOPOLOGY_POINT_LIST: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
@@ -2210,8 +2298,8 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
 	// Both stages are compiled before anything is created, so a shader that does not build
 	// leaves no half made pipeline behind. Handing the same source in as both is normal: the
 	// entry points are told apart by stage, not by which argument they arrived in.
-	auto vertex_spirv = compile_shader(queue, vertexIR, GPU::shaders::SHADER_STAGE::VERTEX);
-	if(!vertex_spirv) return nullptr;
+	auto primitive_spirv = compile_shader(queue, primitiveIR, primitive_stage);
+	if(!primitive_spirv) return nullptr;
 	auto fragment_spirv = compile_shader(queue, fragmentIR, GPU::shaders::SHADER_STAGE::FRAGMENT);
 	if(!fragment_spirv) return nullptr;
 
@@ -2224,8 +2312,8 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
 	{
 		VkShaderModuleCreateInfo info {
 			.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-			.codeSize = vertex_spirv->size(),
-			.pCode = (const uint32_t*)vertex_spirv->data(),
+			.codeSize = primitive_spirv->size(),
+			.pCode = (const uint32_t*)primitive_spirv->data(),
 		};
 		VK_CHECK(vkCreateShaderModule(queue->device, &info, queue->callbacks, &shader_modules[0]), nullptr);
 	}{
@@ -2240,7 +2328,7 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
 	std::array<VkPipelineShaderStageCreateInfo, 2> shader_stages {
 		VkPipelineShaderStageCreateInfo{
 			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-			.stage = VK_SHADER_STAGE_VERTEX_BIT,
+			.stage = mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT,
 			.module = shader_modules[0],
 			.pName = "main",
 		}, VkPipelineShaderStageCreateInfo {
@@ -2378,8 +2466,11 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
 		.pNext = &create_flags,
 		.stageCount = shader_stages.size(),
 		.pStages = shader_stages.data(),
-		.pVertexInputState = &vertex_input_state,
-		.pInputAssemblyState = &assembly_state,
+		// A mesh shader emits primitives rather than being handed them, so there is no vertex
+		// input and no input assembly for these to describe; Vulkan ignores both for a mesh
+		// pipeline, and leaving them null says that rather than leaving a description nothing reads
+		.pVertexInputState = mesh ? nullptr : &vertex_input_state,
+		.pInputAssemblyState = mesh ? nullptr : &assembly_state,
 		.pViewportState = &viewport_state,
 		.pRasterizationState = &rasterization_state,
 		.pMultisampleState = &multisample_state,
@@ -2397,6 +2488,26 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
 	// vkDestroyRenderPass(queue->device, compatible_render_pass, queue->callbacks);
 
 	return out;
+}
+}
+
+GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, GpuByteSpan fragmentIR, const GpuRasterDesc& desc) {
+	return GPU::detail::create_raster_pipeline(queue, vertexIR, GPU::shaders::SHADER_STAGE::VERTEX, fragmentIR, desc);
+}
+
+GpuPipeline* gpuCreateGraphicsMeshletPipeline(GpuQueue* queue, GpuByteSpan meshletIR, GpuByteSpan fragmentIR, const GpuRasterDesc& desc) {
+	// Checked before the shaders are compiled: a device without the extension cannot be handed a
+	// mesh pipeline whatever the source says, so compiling first would only turn one refusal into
+	// a slower one -- and would report a shader error for a shader this device was never going to
+	// run. Reported rather than thrown because this is declared inside an extern "C" block.
+	if(!queue->capabilities.mesh_shaders) {
+		GPU::detail::report(queue, GPU_DIAGNOSTIC_UNSUPPORTED,
+			"gpuCreateGraphicsMeshletPipeline: this device was not set up with VK_EXT_mesh_shader, so no pipeline is created");
+		errno = VK_ERROR_FEATURE_NOT_PRESENT;
+		return nullptr;
+	}
+
+	return GPU::detail::create_raster_pipeline(queue, meshletIR, GPU::shaders::SHADER_STAGE::MESH, fragmentIR, desc);
 }
 
 
@@ -3375,37 +3486,18 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd, gpu* vertex_data, gp
 	vkCmdDrawIndexedIndirect(cmd->command_buffer, arguments.buffer, arguments.offset, count, sizeof(VkDrawIndexedIndirectCommand));
 }
 
-// TODO: Untested!
 void gpuDrawMeshlets(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, uvec3 dim) {
-	GraphicsPipelinePushConstants data {
-		.vertex = meshlet_data,
-		.fragment = fragment_data,
-		.index = nullptr,
-		.sampler_map = (gpu*)cmd->sampler_map
-	};
-	VkPushDataInfoEXT info {
-		.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
-		.offset = 0,
-		.data = {
-			.address = &data,
-			.size = sizeof(GraphicsPipelinePushConstants)
-		}
-	};
-	vkCmdPushDataEXT(cmd->command_buffer, &info);
-
 	// Reported rather than thrown: this is declared inside an extern "C" block, and an exception
 	// leaving one is not something a C caller can catch -- it terminates. gpuGetCapabilitiesEXT's
-	// mesh_shaders is the form of this a program can test before it records anything.
-	if(!vkCmdDrawMeshTasksEXT) {
+	// mesh_shaders is the form of this a program can test before it records anything, and is also
+	// what gpuCreateGraphicsMeshletPipeline declined on, so a program that got this far without it
+	// has no pipeline to draw with either.
+	if(!cmd->queue->capabilities.mesh_shaders) {
 		GPU::detail::report(cmd, GPU_DIAGNOSTIC_UNSUPPORTED,
 			"gpuDrawMeshlets: this device was not set up with VK_EXT_mesh_shader, so nothing is drawn");
 		return;
 	}
-	vkCmdDrawMeshTasksEXT(cmd->command_buffer, dim.x, dim.y, dim.z);
-}
 
-// TODO: Untested!
-void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, gpu* dim) {
 	GraphicsPipelinePushConstants data {
 		.vertex = meshlet_data,
 		.fragment = fragment_data,
@@ -3421,12 +3513,32 @@ void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* frag
 		}
 	};
 	vkCmdPushDataEXT(cmd->command_buffer, &info);
+	vkCmdDrawMeshTasksEXT(cmd->command_buffer, dim.x, dim.y, dim.z);
+}
 
-	if(!vkCmdDrawMeshTasksIndirectEXT) {
+void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, gpu* dim) {
+	// See gpuDrawMeshlets for why this reports rather than throws.
+	if(!cmd->queue->capabilities.mesh_shaders) {
 		GPU::detail::report(cmd, GPU_DIAGNOSTIC_UNSUPPORTED,
 			"gpuDrawMeshletsIndirect: this device was not set up with VK_EXT_mesh_shader, so nothing is drawn");
 		return;
 	}
+
+	GraphicsPipelinePushConstants data {
+		.vertex = meshlet_data,
+		.fragment = fragment_data,
+		.index = nullptr,
+		.sampler_map = (gpu*)cmd->sampler_map
+	};
+	VkPushDataInfoEXT info {
+		.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
+		.offset = 0,
+		.data = {
+			.address = &data,
+			.size = sizeof(GraphicsPipelinePushConstants)
+		}
+	};
+	vkCmdPushDataEXT(cmd->command_buffer, &info);
 
 	auto dimensions = GPU::detail::closest_buffer(cmd->queue, dim);
 	assert(dimensions.buffer && "The indirect dimensions don't lie inside any allocation");
@@ -3625,16 +3737,34 @@ void gpuSurfaceReconfigureEXT(GpuQueue* queue, GpuSurface* surface, const GpuSur
 	auto builder = vkb::SwapchainBuilder(queue->gpu, queue->device, surface->surface, queue->queue_family);
 	if(surface->swapchain)
 		builder.set_old_swapchain(*surface->swapchain);
-	// The requested mode first, then the fallbacks a PRESENT_MODE_BEST_AVAILABLE request starts
-	// from: mailbox (tear free at the lowest latency), then relaxed fifo, then the fifo every
-	// surface has. Spelled out rather than left to use_default_present_mode_selection, whose order
-	// skips relaxed fifo, so that both backends resolve BEST_AVAILABLE the same way and
-	// gpuGetSurfaceCapabilities can report one order for it.
-	if(desc.presentMode != PRESENT_MODE_BEST_AVAILABLE)
-		builder.set_desired_present_mode(GPU::detail::present2vulkan(desc.presentMode));
-	builder.add_fallback_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
+
+	// Resolved up front rather than left to the builder's fallback list, because
+	// VkSwapchainPresentModesCreateInfoKHR below has to name the mode the swapchain is created
+	// with. resolve_present_mode walks PRESENT_MODE_PREFERENCE, the same order
+	// gpuGetSurfaceCapabilitiesEXT reports, so the two cannot drift apart. The fallbacks stay on as
+	// a safety net in case the surface's answer changes between the query and the build.
+	auto present_mode = GPU::detail::resolve_present_mode(queue->gpu, surface->surface, desc.presentMode);
+	builder.set_desired_present_mode(present_mode)
+		.add_fallback_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
 		.add_fallback_present_mode(VK_PRESENT_MODE_FIFO_RELAXED_KHR)
 		.add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR);
+
+	// Which present modes this swapchain may later be presented with. Naming exactly the one it is
+	// being created with says what is true here: changing the mode goes through
+	// gpuSurfaceReconfigureEXT, which builds a new swapchain, so none is ever switched in place. A
+	// mode is always compatible with itself, so this needs no VkSurfacePresentModeCompatibilityKHR
+	// query to be a valid subset.
+	//
+	// Only meaningful with VK_KHR_swapchain_maintenance1, which is also what lets a present carry a
+	// fence (see present_fences_supported). Leaving it out while that extension is enabled is what
+	// the best practices validation layer flags: the swapchain would silently be locked to its
+	// creation mode rather than deliberately so.
+	VkSwapchainPresentModesCreateInfoKHR present_modes {
+		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR,
+		.presentModeCount = 1,
+		.pPresentModes = &present_mode,
+	};
+	if(queue->present_fences_supported) builder.add_pNext(&present_modes);
 	// FORMAT_NONE means "whatever the surface prefers", which is what leaving the desired format
 	// unset asks for. Naming VK_FORMAT_UNDEFINED instead would match nothing and fall back to
 	// whichever format the surface happens to list first.
@@ -3718,10 +3848,9 @@ GpuSurfaceCapabilities gpuGetSurfaceCapabilitiesEXT(GpuQueue* queue, GpuSurface*
 	std::vector<VkPresentModeKHR> modes(count);
 	vkGetPhysicalDeviceSurfacePresentModesKHR(queue->gpu, surface->surface, &count, modes.data());
 
-	// The fallback order gpuSurfaceReconfigureEXT hands the swapchain builder, so presentModes[0]
-	// is what PRESENT_MODE_BEST_AVAILABLE resolves to. Immediate trails the tear free modes rather
-	// than leading on its latency, matching the mode that fallback list never reaches for.
-	for(auto mode: {PRESENT_MODE_MAILBOX, PRESENT_MODE_FIFO_RELAXED, PRESENT_MODE_FIFO, PRESENT_MODE_IMMEDIATE})
+	// PRESENT_MODE_PREFERENCE is the order gpuSurfaceReconfigureEXT resolves through, so
+	// presentModes[0] is what PRESENT_MODE_BEST_AVAILABLE will land on
+	for(auto mode: GPU::detail::PRESENT_MODE_PREFERENCE)
 		if(std::ranges::find(modes, GPU::detail::present2vulkan(mode)) != modes.end()
 			&& out.presentModeCount < GPU_MAX_SURFACE_PRESENT_MODES)
 			out.presentModes[out.presentModeCount++] = mode;

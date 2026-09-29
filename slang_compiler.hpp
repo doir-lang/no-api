@@ -43,7 +43,14 @@ namespace GPU::shaders {
  * STAGE – Which entry point a compile is looking for. Deliberately not the STAGE enum in
  * compute.h, which names pipeline stages for barriers rather than shader entry points.
  */
-enum class SHADER_STAGE { COMPUTE, VERTEX, FRAGMENT };
+enum class SHADER_STAGE { COMPUTE, VERTEX, FRAGMENT, MESH };
+
+/**
+ * is_graphics – Whether a stage belongs to a graphics pipeline, which is every stage but
+ * compute. What this selects is which set of root pointers the backend module exposes
+ * (GPU_COMPUTE below), and a mesh shader is handed the graphics set.
+ */
+constexpr inline bool is_graphics(SHADER_STAGE stage) { return stage != SHADER_STAGE::COMPUTE; }
 
 // ---------------------------------------------------------------------------
 // The portable module
@@ -410,6 +417,14 @@ public GpuPtr<T> gpuComputeData<T : IGpuLoadable>() { return GpuPtr<T>(GpuAddres
 #else
 /// The root data pointer the draw gave the vertex stage.
 public GpuPtr<T> gpuVertexData<T : IGpuLoadable>() { return GpuPtr<T>(GpuAddress(gpuBackendRootVertex())); }
+/**
+ * The root data pointer gpuDrawMeshlets gave the mesh stage.
+ *
+ * The same slot as gpuVertexData -- a mesh shader replaces the vertex stage rather than
+ * joining it, so there is only ever one of the two in a pipeline and they share the pointer.
+ * This name exists so a mesh shader does not have to read as though it had a vertex stage.
+ */
+public GpuPtr<T> gpuMeshletData<T : IGpuLoadable>() { return GpuPtr<T>(GpuAddress(gpuBackendRootVertex())); }
 /// The root data pointer the draw gave the pixel stage.
 public GpuPtr<T> gpuFragmentData<T : IGpuLoadable>() { return GpuPtr<T>(GpuAddress(gpuBackendRootFragment())); }
 /// The index buffer the draw was given, or a null pointer for a non indexed draw.
@@ -671,10 +686,18 @@ inline slang::ISession* get_session(SlangCompileTarget target, std::string_view 
 	// it, the heap access is emitted as SPV_EXT_descriptor_heap and needs no mapping at all, which is
 	// what the Vulkan backend's heap is built around.
 	auto descriptor_heap = global->findCapability("spvDescriptorHeapEXT");
+	// Mesh shading is what a mesh entry point lowers through, and saying so here rather than
+	// letting it be inferred is what keeps the diagnostic for a mesh shader on a target that
+	// cannot run one a compile error rather than a silently mis-lowered module. A shader with no
+	// mesh entry point emits none of it, so declaring it costs a device without
+	// VK_EXT_mesh_shader nothing -- what such a device refuses is the pipeline, which
+	// gpuGetCapabilitiesEXT().mesh_shaders says up front.
+	auto mesh_shading = global->findCapability("spvMeshShadingEXT");
 
 	slang::CompilerOptionEntry spirv_options[] = {
 		{slang::CompilerOptionName::VulkanInvertY, {slang::CompilerOptionValueKind::Int, 1, 0, nullptr, nullptr}},
 		{slang::CompilerOptionName::Capability, {slang::CompilerOptionValueKind::Int, descriptor_heap, 0, nullptr, nullptr}},
+		{slang::CompilerOptionName::Capability, {slang::CompilerOptionValueKind::Int, mesh_shading, 0, nullptr, nullptr}},
 	};
 
 	slang::TargetDesc target_desc {
@@ -747,6 +770,7 @@ inline SlangStage to_slang_stage(SHADER_STAGE stage) {
 	case SHADER_STAGE::COMPUTE: return SLANG_STAGE_COMPUTE;
 	case SHADER_STAGE::VERTEX: return SLANG_STAGE_VERTEX;
 	case SHADER_STAGE::FRAGMENT: return SLANG_STAGE_FRAGMENT;
+	case SHADER_STAGE::MESH: return SLANG_STAGE_MESH;
 	}
 	return SLANG_STAGE_NONE;
 }
@@ -756,6 +780,7 @@ inline const char* stage_name(SHADER_STAGE stage) {
 	case SHADER_STAGE::COMPUTE: return "compute";
 	case SHADER_STAGE::VERTEX: return "vertex";
 	case SHADER_STAGE::FRAGMENT: return "fragment";
+	case SHADER_STAGE::MESH: return "mesh";
 	}
 	return "unknown";
 }

@@ -543,13 +543,28 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
  * TBDR GPUs, mesh shaders are generally not supported because per-triangle tile
  * binning requires a vertex-shader-granularity primitive stream.
  *
+ * The mesh shader replaces the vertex stage rather than joining it, so the pipeline has no
+ * vertex input and no index buffer: the entry point is marked [shader("mesh")] and reads its
+ * root data through the `noapi` module's gpuMeshletData<T>(), which is the same pointer
+ * gpuVertexData<T>() would hand back. Draw one with gpuDrawMeshlets or
+ * gpuDrawMeshletsIndirect; GpuRasterDesc::topology is ignored, since the shader declares its
+ * own output topology.
+ *
+ * @note This is an optional feature. It is available only where
+ * gpuGetCapabilitiesEXT().mesh_shaders is true -- a Vulkan device with VK_EXT_mesh_shader,
+ * and never on WebGPU, which has no mesh shaders in any form. Where it is false this
+ * reports through the diagnostic callback and returns NULL, without compiling anything, so
+ * a program can either branch on the capability or branch on the NULL.
+ *
  * @param queue The GPU queue (device) on which the pipeline will be created.
- * @param meshletIR Mesh shader source (Slang; see shaders.h).
+ * @param meshletIR Mesh shader source (Slang; see shaders.h). May be the same module as
+ * \p fragmentIR, since entry points are found by stage.
  * @param fragmentIR Pixel shader source (Slang; see shaders.h).
  * @param desc Rasterizer, format, and optional embedded blend state.
+ * @return The pipeline, or NULL if it could not be created (including because the device
+ * has no mesh shaders).
  */
-// GpuPipeline gpuCreateGraphicsMeshletPipeline(GpuQueue* queue, std::span<const std::byte> meshletIR, std::span<const std::byte> fragmentIR, GpuRasterDesc desc);
-// NOTE: WebGPU doesn't yet support mesh shaders!
+GpuPipeline* gpuCreateGraphicsMeshletPipeline(GpuQueue* queue, GpuByteSpan meshletIR, GpuByteSpan fragmentIR, NOAPI_CONST_REF(GpuRasterDesc) desc);
 
 // ---------------------------------------------------------------------------
 // Separate state objects
@@ -766,7 +781,11 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd,
  * vertices, 128 triangles on AMD; 126 vertices, 64 triangles on Nvidia). Offline
  * vertex deduplication eliminates the need for an index deduplication unit.
  *
- * @note WebGPU doesn't yet support mesh shaders!
+ * Requires a pipeline from gpuCreateGraphicsMeshletPipeline to be bound.
+ *
+ * @note Optional, alongside the pipeline it draws with: where
+ * gpuGetCapabilitiesEXT().mesh_shaders is false this reports through the diagnostic callback
+ * and draws nothing. WebGPU has no mesh shaders at all.
  *
  * @param cmd Command buffer to record into.
  * @param meshlet_data GPU pointer to the mesh shader root data struct.
@@ -781,7 +800,12 @@ void gpuDrawMeshlets(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_dat
  * group grid dimensions from GPU memory, enabling the GPU to cull and compact
  * meshlet lists without CPU round-trips.
  *
- * @note WebGPU doesn't yet support mesh shaders!
+ * Requires a pipeline from gpuCreateGraphicsMeshletPipeline to be bound. Every uvec3 between
+ * \p dim and the end of its allocation is dispatched, matching gpuDrawIndexedInstancedIndirect.
+ *
+ * @note Optional, alongside the pipeline it draws with: where
+ * gpuGetCapabilitiesEXT().mesh_shaders is false this reports through the diagnostic callback
+ * and draws nothing. WebGPU has no mesh shaders at all.
  *
  * @param cmd Command buffer to record into.
  * @param meshlet_data GPU pointer to the mesh shader root data struct.
