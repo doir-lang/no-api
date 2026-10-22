@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 #ifdef __linux__
+	#include <malloc.h>
 	#include <sys/wait.h>
 #endif
 
@@ -513,10 +514,8 @@ TEST_CASE("Vulkan calls that fail are reported, and leave nothing behind") {
 #endif
 
 #ifdef NOAPI_BACKEND_WEBGPU
-// A device of its own, asked for without the optional features gpuSetupDefaultWebGPUEXT requests where it can
-TEST_CASE("a device without dual source blending turns such pipelines down") {
-	// An adapter hands out one device, so this one comes from an adapter of its own
-	auto backend = noapi_doctest_backend();
+// An adapter hands out one device, so each device of its own comes from an adapter of its own
+static std::pair<WGPUAdapter, WGPUDevice> request_device(const GpuWebGPUDefault& backend, const WGPUDeviceDescriptor& desc) {
 	struct Requested { WGPUAdapter adapter = nullptr; WGPUDevice device = nullptr; bool answered = false; } requested;
 	wgpuInstanceRequestAdapter(backend.instance, nullptr, {
 		.mode = WGPUCallbackMode_AllowSpontaneous,
@@ -526,7 +525,6 @@ TEST_CASE("a device without dual source blending turns such pipelines down") {
 	while(!requested.answered) wgpuInstanceProcessEvents(backend.instance);
 	REQUIRE(requested.adapter);
 	requested.answered = false;
-	WGPUDeviceDescriptor desc = {.requiredLimits = &backend.limits};
 	wgpuAdapterRequestDevice(requested.adapter, &desc, {
 		.mode = WGPUCallbackMode_AllowSpontaneous,
 		.callback = [](WGPURequestDeviceStatus, WGPUDevice device, WGPUStringView, void* out, void*) { ((Requested*)out)->device = device; ((Requested*)out)->answered = true; },
@@ -534,9 +532,15 @@ TEST_CASE("a device without dual source blending turns such pipelines down") {
 	});
 	while(!requested.answered) wgpuInstanceProcessEvents(backend.instance);
 	REQUIRE(requested.device);
-	auto device = requested.device;
+	return {requested.adapter, requested.device};
+}
 
-	auto queue = gpuCreateQueue(requested.adapter, device, backend.limits, gpuDefaultCpuAllocator);
+// Asked for without the optional features gpuSetupDefaultWebGPUEXT requests where it can
+TEST_CASE("a device without dual source blending turns such pipelines down") {
+	auto backend = noapi_doctest_backend();
+	auto [adapter, device] = request_device(backend, {.requiredLimits = &backend.limits});
+
+	auto queue = gpuCreateQueue(adapter, device, backend.limits, gpuDefaultCpuAllocator);
 	REQUIRE(queue);
 	CHECK(!gpuGetCapabilitiesEXT(queue).dual_source_blending);
 	GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
@@ -544,8 +548,68 @@ TEST_CASE("a device without dual source blending turns such pipelines down") {
 	CHECK(!gpuCreateGraphicsPipeline(queue, shader, shader, {.supportDualSourceBlending = true, .colorTargets = {&target, 1}}));
 	gpuFreeQueue(queue);
 	wgpuDeviceRelease(device);
-	wgpuAdapterRelease(requested.adapter);
+	wgpuAdapterRelease(adapter);
 }
+
+#ifdef __linux__
+// Dawn destroys a device once the program drops it, whatever still refers to it, so a queue's leftovers only show as memory that each queue made and freed takes for good
+TEST_CASE("gpuFreeQueue releases everything it made on the device") {
+	auto backend = noapi_doctest_backend();
+	auto make_and_free_queue = [&] {
+		WGPULimits limits = backend.limits;
+		limits.maxStorageBufferBindingSize = 64 << 10; // So that three allocations fill two monobuffers and move on to a third
+		auto queue = gpuCreateQueue(backend.adapter, backend.device, limits, gpuDefaultCpuAllocator);
+		REQUIRE(queue);
+		for(int i = 0; i < 3; ++i) REQUIRE(gpuMalloc(queue, 48 << 10));
+
+		GpuTextureDesc texture_desc = {.dimensions = {16, 16, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_SAMPLED};
+		auto texture_memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, texture_desc));
+		REQUIRE(gpuCreateTexture(queue, texture_desc, texture_memory));
+		gpuFree(queue, texture_memory);
+		auto kept_texture_memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, texture_desc));
+		REQUIRE(gpuCreateTexture(queue, texture_desc, kept_texture_memory)); // Left for gpuFreeQueue
+
+		auto pipeline = gpuCreateComputePipeline(queue, string_to_bytes(R"slang(import noapi; [shader("compute")] [numthreads(1, 1, 1)] void main() {})slang"));
+		REQUIRE(pipeline);
+		auto readback = gpuMalloc<uint32_t>(queue, 4, MEMORY_READBACK);
+		auto cmd = gpuStartCommandRecording(queue);
+		gpuSetPipeline(cmd, pipeline);
+		gpuDispatch(cmd, nullptr, {1, 1, 1});
+		gpuSyncMemoryEXT(cmd, gpuHostToDevicePointer(queue, readback));
+		gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
+
+		// Abandoned mid pass, with a readback still waiting on them
+		cmd = gpuStartCommandRecording(queue);
+		gpuSyncMemoryEXT(cmd, gpuHostToDevicePointer(queue, readback));
+		gpuSetPipeline(cmd, pipeline);
+		gpuFreeCommandBuffer(cmd);
+		GpuTextureDesc target_desc = {.dimensions = {16, 16, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_COLOR_ATTACHMENT};
+		auto target_memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, target_desc));
+		GpuColorAttachment target = {.texture = gpuCreateTexture(queue, target_desc, target_memory)};
+		REQUIRE(target.texture);
+		cmd = gpuStartCommandRecording(queue);
+		gpuSyncMemoryEXT(cmd, gpuHostToDevicePointer(queue, readback));
+		gpuBeginRenderPass(cmd, {.colorAttachments = {&target, 1}});
+		gpuFreeCommandBuffer(cmd);
+
+		gpuFreePipeline(queue, pipeline);
+		gpuFreeQueue(queue);
+		// Dawn deletes what was released only after the GPU is done with it, on a later tick
+		for(int i = 0; i < 4; ++i) (void)wgpuDeviceTick(backend.device);
+	};
+
+	noapi_doctest_begin();
+	for(int i = 0; i < 4; ++i) make_and_free_queue(); // Until what is made once, such as Slang's session and Dawn's caches and pools, has stopped growing
+	auto kept_by_eight = [&] {
+		auto before = mallinfo2().uordblks;
+		for(int i = 0; i < 8; ++i) make_and_free_queue();
+		return (ptrdiff_t)(mallinfo2().uordblks - before); // Negative when Dawn trims a cache
+	};
+	// A leak grows with every queue, while Dawn's pools grow in rare steps, so the quieter of two runs is what counts
+	CHECK(std::min(kept_by_eight(), kept_by_eight()) < 8 * 1024);
+	noapi_doctest_end();
+}
+#endif
 #endif
 
 #ifdef NOAPI_DOCTEST_FAULTS

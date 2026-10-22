@@ -251,7 +251,8 @@ struct GpuCommandBuffer {
 	std::optional<GpuBlendDesc> blend = {};
 	INDEX_TYPE_EXT index_type = INDEX_TYPE_UINT32;
 
-	std::vector<std::function<void()>> code_pending_submission_finished;
+	// Told whether the buffer was submitted: one freed unsubmitted only releases what it made, since the work it was waiting on never ran.
+	std::vector<std::function<void(bool submitted)>> code_pending_submission_finished;
 };
 
 struct GpuDepthStencilState {

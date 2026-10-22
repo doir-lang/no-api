@@ -870,7 +870,34 @@ void gpuFreeQueue(GpuQueue* queue) {
 	for(auto& [address, _allocation]: queue->allocations) leftovers.push_back(address);
 	for(auto address: leftovers) gpuFreeDevicePointerEXT(queue, address);
 
+	// What freeing the leftovers deferred is waiting on a submission that will never come, and nothing is still running to need it
+	for(auto& [code, _submission]: queue->code_pending_submission_finished)
+		code();
+	queue->code_pending_submission_finished.clear();
+
 	GPU::semaphore_destroy(queue->current_submission_timeline_semaphore);
+	if(queue->semaphore_bind_group_layout) wgpuBindGroupLayoutRelease(queue->semaphore_bind_group_layout);
+	for(auto pipeline: {queue->semaphore_increment_pipeline, queue->semaphore_set_pipeline, queue->semaphore_set_max_pipeline})
+		if(pipeline) wgpuComputePipelineRelease(pipeline);
+
+	wgpuBufferRelease(queue->empty_buffer);
+	for(auto buffer: queue->monobuffers)
+		wgpuBufferRelease(buffer);
+
+	for(auto monotextures: {&queue->storage_monotextures, &queue->sampled_monotextures})
+		for(auto& [_cap, texture, view, _desc]: *monotextures) {
+			if(view) wgpuTextureViewRelease(view);
+			wgpuTextureRelease(texture);
+		}
+	for(auto view: queue->current_storage_views)
+		wgpuTextureViewRelease(view);
+	for(auto group: {queue->current_compute_bind_group1, queue->current_graphics_bind_group1, queue->current_compute_bind_group2, queue->current_graphics_bind_group2})
+		wgpuBindGroupRelease(group);
+	for(auto layout: {queue->current_compute_bind_group_layout0, queue->current_graphics_bind_group_layout0, queue->current_compute_bind_group_layout1,
+		queue->current_graphics_bind_group_layout1, queue->current_compute_bind_group_layout2, queue->current_graphics_bind_group_layout2})
+		wgpuBindGroupLayoutRelease(layout);
+	wgpuPipelineLayoutRelease(queue->current_compute_pipeline_layout);
+	wgpuPipelineLayoutRelease(queue->current_graphics_pipeline_layout);
 
 	for(auto& [_enabled, set]: queue->sampler_cache)
 		GPU::detail::free_sampler_set(set);
@@ -884,6 +911,7 @@ void gpuFreeQueue(GpuQueue* queue) {
 		if(queue->blit_bind_group_layouts[i]) wgpuBindGroupLayoutRelease(queue->blit_bind_group_layouts[i]);
 	}
 	if(queue->blit_shader) wgpuShaderModuleRelease(queue->blit_shader);
+	wgpuQueueRelease(queue->queue);
 
 	auto allocator = queue->cpu_allocator;
 	queue->~GpuQueue();
@@ -1009,6 +1037,9 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align, MEMORY memory) {
 			queue->monobuffer_sizes[full] = queue->limits.maxStorageBufferBindingSize;
 
 			++queue->active_monobuffer;
+			queue->code_pending_submission_finished.emplace_back([placeholder = queue->monobuffers[queue->active_monobuffer]]() {
+				wgpuBufferRelease(placeholder);
+			}, queue->next_submission_index);
 			WGPUBufferDescriptor d {
 				.label = {"NoAPI Monobuffer", WGPU_STRLEN},
 				.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc | WGPUBufferUsage_Index | WGPUBufferUsage_Indirect,
@@ -1959,6 +1990,17 @@ GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
 }
 
 void gpuFreeCommandBuffer(GpuCommandBuffer* cmd) {
+	// Only a buffer that was never submitted still has a pass open or code pending
+	if(cmd->compute_pass) {
+		wgpuComputePassEncoderEnd(cmd->compute_pass);
+		wgpuComputePassEncoderRelease(cmd->compute_pass);
+	}
+	if(cmd->render_pass) {
+		wgpuRenderPassEncoderEnd(cmd->render_pass);
+		wgpuRenderPassEncoderRelease(cmd->render_pass);
+	}
+	for(auto& code: cmd->code_pending_submission_finished)
+		code(false);
 	wgpuCommandEncoderRelease(cmd->encoder);
 
 	auto allocator = cmd->queue->cpu_allocator;
@@ -2071,9 +2113,11 @@ uint64_t gpuSubmitNoFreeEXT(GpuQueue* queue, GpuCommandBufferSpan command_buffer
 		}
 	);
 
-	for(auto buffer: command_buffers)
-		for(auto code: buffer->code_pending_submission_finished)
-			queue->code_pending_submission_finished.emplace_back(code, queue->next_submission_index);
+	for(auto buffer: command_buffers) {
+		for(auto& code: buffer->code_pending_submission_finished)
+			queue->code_pending_submission_finished.emplace_back([code = std::move(code)] { code(true); }, queue->next_submission_index);
+		buffer->code_pending_submission_finished.clear();
+	}
 
 	return queue->next_submission_index++;
 }
@@ -2667,7 +2711,7 @@ namespace GPU {
 		wgpuBufferUnmap(tmp);
 
 		wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, tmp, 0, cmd->queue->monobuffers[range.buffer], range.start, size);
-		cmd->code_pending_submission_finished.emplace_back([tmp]() {
+		cmd->code_pending_submission_finished.emplace_back([tmp](bool) {
 			wgpuBufferRelease(tmp);
 		});
 	}
@@ -3672,12 +3716,13 @@ namespace GPU {
 		auto tmp = wgpuDeviceCreateBuffer(cmd->queue->device, &d);
 
 		wgpuCommandEncoderCopyBufferToBuffer(cmd->encoder, cmd->queue->monobuffers[range.buffer], range.start, tmp, 0, size);
-		cmd->code_pending_submission_finished.emplace_back([queue = cmd->queue, tmp, cpu, size]() {
-			GPU::wait_for_buffer_map(queue, tmp, WGPUMapMode_Read, 0, size);
+		cmd->code_pending_submission_finished.emplace_back([queue = cmd->queue, tmp, cpu, size](bool submitted) {
+			if(submitted) {
+				GPU::wait_for_buffer_map(queue, tmp, WGPUMapMode_Read, 0, size);
 
-			auto tmp_cpu = wgpuBufferGetConstMappedRange(tmp, 0, size);
-			memcpy(cpu, tmp_cpu, size);
-
+				auto tmp_cpu = wgpuBufferGetConstMappedRange(tmp, 0, size);
+				memcpy(cpu, tmp_cpu, size);
+			}
 			wgpuBufferRelease(tmp);
 		});
 	}
