@@ -11,9 +11,11 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 
 #ifdef __EMSCRIPTEN__
@@ -57,6 +59,14 @@ static bool setup_failed(char* out_error, size_t out_error_capacity, std::string
 		out_error[length] = '\0';
 	}
 	return false;
+}
+
+namespace GPU {
+#ifdef __EMSCRIPTEN__
+	constexpr static WGPUFeatureName optional_features[] = {WGPUFeatureName_Depth32FloatStencil8, WGPUFeatureName_DualSourceBlending};
+#else
+	constexpr static WGPUFeatureName optional_features[] = {WGPUFeatureName_Depth32FloatStencil8, WGPUFeatureName_DualSourceBlending, WGPUFeatureName_TextureFormatsTier1};
+#endif
 }
 
 bool gpuSetupDefaultWebGPUEXT(GpuWebGPUSurfaceLoaderEXT surface_loader, void* surface_loader_userdata,
@@ -119,7 +129,14 @@ bool gpuSetupDefaultWebGPUEXT(GpuWebGPUSurfaceLoaderEXT surface_loader, void* su
 	wgpuAdapterGetLimits(out.adapter, &out.limits);
 
 	{ // Device
+		// The formats compute.h marks EXT and dual source blending; asked for only where the adapter has them, so the queue can tell the difference
+		std::vector<WGPUFeatureName> features;
+		for(auto feature: GPU::optional_features)
+			if(wgpuAdapterHasFeature(out.adapter, feature)) features.push_back(feature);
+
 		WGPUDeviceDescriptor device_desc = {
+			.requiredFeatureCount = features.size(),
+			.requiredFeatures = features.data(),
 			.requiredLimits = &out.limits,
 			.deviceLostCallbackInfo = {
 				.mode = WGPUCallbackMode_AllowSpontaneous,
@@ -376,7 +393,7 @@ namespace GPU::detail {
 		case ADDRESS_MODE_MIRROR_REPEAT: return WGPUAddressMode_MirrorRepeat;
 		case ADDRESS_MODE_REPEAT: return WGPUAddressMode_Repeat;
 		}
-		return WGPUAddressMode_Repeat;
+		std::unreachable();
 	}
 
 	constexpr static WGPUFilterMode filter2wgpu(FILTER filter) {
@@ -456,16 +473,18 @@ namespace GPU::detail {
 namespace GPU {
 	inline WGPUTextureViewDimension texture_view2wgpu(TEXTURE type){
 		switch (type){
+		case TEXTURE_1D: // Never reached: GPU::texture_supported declines 1D textures before any view exists
 		case TEXTURE_2D:
 		case TEXTURE_2D_ARRAY:
 			return WGPUTextureViewDimension_2DArray;
+		// A monotexture packs several cubes, so even a single one is viewed as an array
+		case TEXTURE_CUBE:
 		case TEXTURE_CUBE_ARRAY:
 			return WGPUTextureViewDimension_CubeArray;
 		case TEXTURE_3D:
 			return WGPUTextureViewDimension_3D;
-		default:
-			return WGPUTextureViewDimension_2D;
 		}
+		std::unreachable();
 	}
 
 	inline WGPUTextureFormat format2wgpu(FORMAT format){
@@ -797,9 +816,10 @@ GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limi
 	// Every set resolves unknown descriptions to slot 0, so the default is a set of one.
 	out->default_sampler_set = GPU::detail::ensure_sampler_set(out, {});
 
-	// Properties of WebGPU itself: no mesh shaders, no 64 bit atomics, no waits on memory, and no buffer bound both writable and as a heap.
+	// Properties of WebGPU itself: no mesh shaders, no 64 bit atomics, no waits on memory, and no buffer bound both writable and as a heap. Dual source blending is an optional feature.
 	out->capabilities = GpuCapabilities {
 		.mesh_shaders = false,
+		.dual_source_blending = wgpuDeviceHasFeature(out->device, WGPUFeatureName_DualSourceBlending) != 0,
 		.split_barrier_signals = false,
 		.split_barriers = false,
 		.gpu_writable_texture_heap = false,
@@ -843,6 +863,13 @@ namespace GPU::detail {
 }
 
 void gpuFreeQueue(GpuQueue* queue) {
+	gpuWaitIdleEXT(queue); // As on Vulkan, nothing submitted is still running once the queue is gone
+
+	// Free what the program did not, along with the textures made on it
+	std::vector<gpu*> leftovers;
+	for(auto& [address, _allocation]: queue->allocations) leftovers.push_back(address);
+	for(auto address: leftovers) gpuFreeDevicePointerEXT(queue, address);
+
 	GPU::semaphore_destroy(queue->current_submission_timeline_semaphore);
 
 	for(auto& [_enabled, set]: queue->sampler_cache)
@@ -874,6 +901,16 @@ void gpuSetDiagnosticCallbackEXT(GpuQueue* queue, GpuDiagnosticCallbackEXT callb
 	queue->reported_diagnostics.clear();
 }
 
+namespace GPU::detail {
+	// Kept sorted by monobuffer and then start, which gpuMalloc relies on to join neighbouring holes
+	inline void add_free_range(GpuQueue* queue, GpuQueue::MonobufferRange range) {
+		auto at = std::ranges::upper_bound(queue->buffer_freelist, range, [](const GpuQueue::MonobufferRange& a, const GpuQueue::MonobufferRange& b) {
+			return std::tie(a.buffer, a.start) < std::tie(b.buffer, b.start);
+		});
+		queue->buffer_freelist.insert(at, range);
+	}
+}
+
 void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align, MEMORY memory) {
 	constexpr static auto align_up = [](size_t addr, size_t align) {
 		return (addr + align - 1) & ~(align - 1);
@@ -895,29 +932,32 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align, MEMORY memory) {
 	}
 
 	for(size_t i = 0; i < queue->buffer_freelist.size(); ++i) {
-		auto& [active_buffer, start, end] = queue->buffer_freelist[i];
 		// Strip any empty ranges from the list
-		if(start == end) {
+		if(queue->buffer_freelist[i].start == queue->buffer_freelist[i].end) {
 			queue->buffer_freelist.erase(queue->buffer_freelist.begin() + i);
 			--i;
 			continue;
 		}
 
+		// Sorted by monobuffer then start, so a hole touching or overlapping the one before it joins it, and is tried whole
+		if(i > 0) {
+			auto prev = queue->buffer_freelist[i - 1];
+			auto& hole = queue->buffer_freelist[i];
+			if(prev.buffer == hole.buffer && hole.start <= prev.end) {
+				hole.start = prev.start;
+				hole.end = std::max(hole.end, prev.end);
+				queue->buffer_freelist.erase(queue->buffer_freelist.begin() + (i - 1));
+				--i;
+			}
+		}
+
 		// If we find a free space big enough for the allocation... use that
+		auto& [active_buffer, start, end] = queue->buffer_freelist[i];
 		auto aligned = align_up(start, align);
 		// Aligning up can walk past a small hole's end, which would wrap the unsigned size; >= reuses exactly fitting holes.
 		if(aligned <= end && size_t(end) - aligned >= bytes) {
 			start = aligned + bytes;
 			return allocation_bookkeeping(queue, active_buffer, aligned, bytes, memory);
-		}
-
-		// If each element overlaps with the previous one merge them assumes that the freelist is sorted by buffer index followed by starting value
-		if(i == 0) continue;
-
-		auto [prev_buffer, prev_start, prev_end] = queue->buffer_freelist[i - 1];
-		if(start > prev_start && start < prev_end && prev_buffer == active_buffer) {
-			queue->buffer_freelist.erase(queue->buffer_freelist.begin() + (i - 1));
-			start = prev_start;
 		}
 	}
 
@@ -928,11 +968,10 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align, MEMORY memory) {
 	// Reallocate the monobuffer if necessary
 	bool activate_next_monobuffer = false;
 	if(new_end > queue->active_monobuffer_capacity) {
-		if(queue->monobuffers[queue->active_monobuffer] != queue->empty_buffer)
-			queue->code_pending_submission_finished.emplace_back([buffer = queue->monobuffers[queue->active_monobuffer]]() {
-				wgpuBufferRelease(buffer);
-			}, queue->next_submission_index);
-		else queue->active_monobuffer_capacity = new_end;
+		// Work in flight may still bind the buffer being replaced
+		queue->code_pending_submission_finished.emplace_back([buffer = queue->monobuffers[queue->active_monobuffer]]() {
+			wgpuBufferRelease(buffer);
+		}, queue->next_submission_index);
 
 		queue->active_monobuffer_capacity = std::max(queue->active_monobuffer_capacity * 2, new_end); // Doubles the size of the capacity each time
 		if(queue->active_monobuffer_capacity > queue->limits.maxStorageBufferBindingSize) {
@@ -953,7 +992,7 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align, MEMORY memory) {
 		auto old_monobuffer = queue->monobuffers[queue->active_monobuffer];
 		queue->monobuffers[queue->active_monobuffer] = wgpuDeviceCreateBuffer(queue->device, &d);
 
-		if(old_monobuffer != queue->empty_buffer) {
+		if(queue->active_monobuffer_size > 0) { // What was already allocated moves with it
 			auto cmd = wgpuDeviceCreateCommandEncoder(queue->device, nullptr);
 			wgpuCommandEncoderCopyBufferToBuffer(cmd, old_monobuffer, 0, queue->monobuffers[queue->active_monobuffer], 0, queue->active_monobuffer_size);
 			auto to_submit = wgpuCommandEncoderFinish(cmd, nullptr);
@@ -962,31 +1001,32 @@ void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align, MEMORY memory) {
 			wgpuCommandBufferRelease(to_submit);
 		}
 
-		if(activate_next_monobuffer) {
-			// Add the rest of the old monobuffer to the freelist
-			queue->buffer_freelist.emplace_back(queue->active_monobuffer, queue->active_monobuffer_size, queue->limits.maxStorageBufferBindingSize);
+		// A monobuffer at the binding size limit is full: what is left of it goes on the freelist, where it is bound whole, and allocation moves on to the next
+		if(activate_next_monobuffer && queue->active_monobuffer + 1 < queue->monobuffers.size()) {
+			auto full = queue->active_monobuffer;
+			bool stayed = new_active_monobuffer == full; // The allocation still fit at the end of the full one
+			GPU::detail::add_free_range(queue, {full, uint32_t(stayed ? new_end : queue->active_monobuffer_size), uint32_t(queue->limits.maxStorageBufferBindingSize)});
+			queue->monobuffer_sizes[full] = queue->limits.maxStorageBufferBindingSize;
 
 			++queue->active_monobuffer;
-			if(queue->active_monobuffer >= queue->monobuffers.size()) { // Fail if monobuffer being activated is the 8th monobuffer
-				errno = WGPUErrorType_OutOfMemory;
-				return nullptr;
-			}
-
 			WGPUBufferDescriptor d {
 				.label = {"NoAPI Monobuffer", WGPU_STRLEN},
 				.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc | WGPUBufferUsage_Index | WGPUBufferUsage_Indirect,
 				.size = bytes
 			};
 			queue->monobuffers[queue->active_monobuffer] = wgpuDeviceCreateBuffer(queue->device, &d);
-
-			if(new_start == 0)
-				queue->monobuffer_sizes[queue->active_monobuffer] = queue->active_monobuffer_size = 0;
-			else queue->monobuffer_sizes[queue->active_monobuffer] = queue->active_monobuffer_size = bytes;
+			queue->monobuffer_sizes[queue->active_monobuffer] = queue->active_monobuffer_size = 0;
 			queue->active_monobuffer_capacity = bytes;
+		} else if(new_active_monobuffer != queue->active_monobuffer) {
+			// It needs a monobuffer of its own, and the last one is already in use
+			errno = WGPUErrorType_OutOfMemory;
+			return nullptr;
 		}
 	}
 
-	if(!activate_next_monobuffer) queue->monobuffer_sizes[queue->active_monobuffer] = queue->active_monobuffer_size = new_end;
+	// The allocation is in the active monobuffer unless it fit at the end of one that just filled up
+	if(new_active_monobuffer == queue->active_monobuffer)
+		queue->monobuffer_sizes[queue->active_monobuffer] = queue->active_monobuffer_size = new_end;
 	return allocation_bookkeeping(queue, new_active_monobuffer, new_start, new_end - new_start, memory);
 }
 
@@ -1019,9 +1059,7 @@ namespace GPU {
 
 	inline WGPUTextureDimension texture2wgpu(TEXTURE type){
 		switch (type){
-		case TEXTURE_1D:
-			return WGPUTextureDimension_1D;
-
+		case TEXTURE_1D: // Never reached: GPU::texture_supported declines 1D textures
 		case TEXTURE_2D:
 		case TEXTURE_2D_ARRAY:
 		case TEXTURE_CUBE:
@@ -1030,10 +1068,8 @@ namespace GPU {
 
 		case TEXTURE_3D:
 			return WGPUTextureDimension_3D;
-
-		default:
-			return WGPUTextureDimension_2D;
 		}
+		std::unreachable();
 	}
 
 	inline WGPUTextureDescriptor texture2wgpu(const GpuTextureDesc& src, std::string_view label = "") {
@@ -1079,12 +1115,14 @@ static void collapse_monotexture_if_empty(GpuQueue* queue, const GpuQueue::Monot
 
 	// The stand in keeps the binding's format, view dimension and sample count, so the layout and generated module are unaffected.
 	auto usage = wgpuTextureGetUsage(texture);
+	// A cube array view needs whole cubes
+	const uint32_t layers = GPU::texture_view2wgpu(desc.type) == WGPUTextureViewDimension_CubeArray ? 6 : 1;
 	{
 		WGPUTextureDescriptor d {
 			.label = {"NoAPI Collapsed Monotexture", WGPU_STRLEN},
 			.usage = usage,
 			.dimension = GPU::texture2wgpu(desc.type),
-			.size = {1, 1, 1},
+			.size = {1, 1, layers},
 			.format = GPU::format2wgpu(desc.format),
 			.mipLevelCount = 1,
 			.sampleCount = desc.sampleCount,
@@ -1099,7 +1137,7 @@ static void collapse_monotexture_if_empty(GpuQueue* queue, const GpuQueue::Monot
 			.baseMipLevel = 0,
 			.mipLevelCount = 1,
 			.baseArrayLayer = 0,
-			.arrayLayerCount = 1,
+			.arrayLayerCount = layers,
 			.aspect = WGPUTextureAspect_All,
 			.usage = view_usage,
 		};
@@ -1124,15 +1162,11 @@ void gpuFreeDevicePointerEXT(GpuQueue* queue, gpu* ptr) {
 		auto texture = queue->gpu2textures[ptr];
 		if(texture->range) {
 			auto freed = *texture->range; // A copy, so the monotexture is still named below
-			queue->texture_freelist.emplace_back(freed);
-			// Grouped by monotexture then start, like buffer_freelist, so gpuCreateTexture can merge adjacent ranges.
-			std::sort(queue->texture_freelist.begin(), queue->texture_freelist.end(), [](const GpuQueue::MonotextureRange& a, const GpuQueue::MonotextureRange& b) -> bool {
-				if(a.storage() != b.storage())
-					return a.storage() < b.storage();
-				if(a._index == b._index)
-					return a.start < b.start;
-				return a._index < b._index;
+			// Kept sorted by monotexture (whose _index carries the storage bit) then start, like buffer_freelist, so gpuCreateTexture can join neighbours
+			auto at = std::ranges::upper_bound(queue->texture_freelist, freed, [](const GpuQueue::MonotextureRange& a, const GpuQueue::MonotextureRange& b) {
+				return std::tie(a._index, a.start) < std::tie(b._index, b.start);
 			});
+			queue->texture_freelist.insert(at, freed);
 
 			// That may have been the last texture the monotexture was holding
 			collapse_monotexture_if_empty(queue, freed);
@@ -1153,14 +1187,7 @@ void gpuFreeDevicePointerEXT(GpuQueue* queue, gpu* ptr) {
 		queue->cpu2gpu.erase(cpu);
 	}
 
-	queue->buffer_freelist.push_back(range);
-	// Sort the freelist so buffers are together, and then by start
-	std::sort(queue->buffer_freelist.begin(), queue->buffer_freelist.end(), [](const GpuQueue::MonobufferRange& a, const GpuQueue::MonobufferRange& b) -> bool {
-		if(a.buffer == b.buffer)
-			return a.start < b.start;
-
-		return a.buffer < b.buffer;
-	});
+	GPU::detail::add_free_range(queue, range);
 }
 
 gpu* gpuHostToDevicePointer(GpuQueue* queue, void* ptr) {
@@ -1175,7 +1202,37 @@ void* gpuDeviceToHostPointerEXT(GpuQueue* queue, gpu* ptr) {
 	return std::get<void*>(found->second);
 }
 
+namespace GPU {
+	// WGSL's names for the formats gpuFormatIsStorableEXT accepts, the only ones a storage texture is created in
+	inline const char* storage_format_name(FORMAT format) {
+		switch (format) {
+		case FORMAT_R32_FLOAT: return "r32f";
+		case FORMAT_RG32_FLOAT: return "rg32f";
+		case FORMAT_RGBA8_SNORM: return "rgba8_snorm";
+		case FORMAT_RGBA16_FLOAT: return "rgba16f";
+		case FORMAT_RGBA32_FLOAT: return "rgba32f";
+		default: return "rgba8";
+		}
+	}
+
+	// WebGPU has 1D textures, but not ones that can be arrays, which is how monotextures pack several
+	inline bool texture_supported(GpuQueue* queue, const GpuTextureDesc& desc) {
+		auto format = GPU::format2wgpu(desc.format);
+		if(desc.type == TEXTURE_1D || format == WGPUTextureFormat_Undefined) return false;
+		if((desc.usage & USAGE_STORAGE) && !gpuFormatIsStorableEXT(desc.format)) return false;
+		if(desc.sampleCount != 1 && desc.sampleCount != 4) return false;
+		if(format == WGPUTextureFormat_Depth32FloatStencil8) return wgpuDeviceHasFeature(queue->device, WGPUFeatureName_Depth32FloatStencil8);
+		bool norm16 = desc.format == FORMAT_R16_UNORM || desc.format == FORMAT_R16_SNORM || desc.format == FORMAT_RG16_UNORM
+			|| desc.format == FORMAT_RG16_SNORM || desc.format == FORMAT_RGBA16_UNORM || desc.format == FORMAT_RGBA16_SNORM;
+		return !norm16 || wgpuDeviceHasFeature(queue->device, WGPUFeatureName_TextureFormatsTier1);
+	}
+}
+
 GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue* queue, const GpuTextureDesc& desc) {
+	if(!GPU::texture_supported(queue, desc)) {
+		errno = WGPUErrorType_Validation;
+		return {};
+	}
 	return {16, 16}; // Waste the minimum amount of space dealing with an allocation
 }
 
@@ -1197,9 +1254,47 @@ namespace GPU {
 	}
 }
 
+namespace GPU::detail {
+	// An atlas sized for its shape's bucket, the largest texture that can share it, and copyable so growing can move what it holds.
+	inline std::pair<WGPUTexture, WGPUTextureView> create_monotexture(GpuQueue* queue, const GpuQueue::TextureHash& shape, uint32_t layers) {
+		auto copies = shape.sampleCount == 1 ? WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst : WGPUTextureUsage_None;
+		uint32_t mips = shape.sampleCount == 1 ? std::bit_width(std::max(shape.dimensions.x, shape.dimensions.y)) : 1;
+		WGPUTextureDescriptor d {
+			.usage = GPU::usage2wgpu(shape.usage) | copies,
+			.dimension = GPU::texture2wgpu(shape.type),
+			.size = {shape.dimensions.x, shape.dimensions.y, shape.type == TEXTURE_3D ? shape.dimensions.z : layers},
+			.format = GPU::format2wgpu(shape.format),
+			.mipLevelCount = mips,
+			.sampleCount = shape.sampleCount,
+		};
+		auto texture = wgpuDeviceCreateTexture(queue->device, &d);
+
+		// Everything but storage, which needs a single mip view; update_pipeline_layouts makes that one separately.
+		auto view_usage = GPU::usage2wgpu(shape.usage) & ~WGPUTextureUsage_StorageBinding;
+		WGPUTextureViewDescriptor v {
+			.format = d.format,
+			.dimension = GPU::texture_view2wgpu(shape.type),
+			.baseMipLevel = 0,
+			.mipLevelCount = mips,
+			.baseArrayLayer = 0,
+			.arrayLayerCount = shape.type == TEXTURE_3D ? 1 : layers,
+			.aspect = WGPUTextureAspect_All,
+			.usage = view_usage,
+		};
+		// A storage only texture has no other usage to view it through.
+		return {texture, view_usage ? wgpuTextureCreateView(texture, &v) : nullptr};
+	}
+}
+
 GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* memory) {
 	// Only one texture can be associated with a memory
 	if(queue->gpu2textures.contains(memory) || !queue->allocations.contains(memory)) {
+		errno = WGPUErrorType_Validation;
+		return nullptr;
+	}
+
+	if(!GPU::texture_supported(queue, desc)) {
+		GPU::report(queue, GPU_DIAGNOSTIC_UNSUPPORTED, "gpuCreateTexture: this device can't create this texture (see gpuTextureSizeAlign: no 1D textures, storage only in formats gpuFormatIsStorableEXT accepts, 1 or 4 samples, and some formats need optional features), so it was not created");
 		errno = WGPUErrorType_Validation;
 		return nullptr;
 	}
@@ -1241,21 +1336,17 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 					errno = WGPUErrorType_OutOfMemory;
 					return nullptr;
 				}
-				// Group 2 holds sampled monotextures and then sampleable storage ones, so both share this budget.
+				// Group 2 holds sampled monotextures and then sampleable storage ones, so both share this budget; a storage only one doesn't spend from it.
+				bool sampleable = !is_storage_texture || ((desc.usage & USAGE_SAMPLED) && gpuFormatIsFilterableEXT(desc.format));
 				auto sampled_bindings = queue->sampled_monotextures.size();
 				for(auto binding: storage_sampled_bindings(queue))
 					if(binding >= 0) ++sampled_bindings;
-				if(sampled_bindings >= queue->limits.maxSampledTexturesPerShaderStage) {
+				if(sampleable && sampled_bindings >= queue->limits.maxSampledTexturesPerShaderStage) {
 					errno = WGPUErrorType_OutOfMemory;
 					return nullptr;
 				}
 			}
 
-			// Reported as well as asserted, since asserts are compiled out of release builds.
-			if(desc.type == TEXTURE_1D)
-				GPU::report(queue, GPU_DIAGNOSTIC_UNSUPPORTED,
-					"gpuCreateTexture: WebGPU has no 1D textures, so TEXTURE_1D is created as a 2D texture one texel tall");
-			assert(desc.type != TEXTURE_1D && "1D textures aren't supported by WebGPU");
 			assert(desc.type != TEXTURE_3D || desc.layerCount == 1 && "3D textures can't be arrays in WebGPU");
 
 			size_t slot;
@@ -1278,32 +1369,7 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 			auto& [size, texture, full_view, description] = (*monotextures)[slot];
 			description = hash;
 			size = 0;
-			{
-				WGPUTextureDescriptor d {
-					.usage = GPU::usage2wgpu(desc.usage),
-					.dimension = GPU::texture2wgpu(desc.type),
-					.size = {desc.dimensions.x, desc.dimensions.y, desc.type == TEXTURE_3D ? desc.dimensions.z : desc.layerCount * 2},
-					.format = GPU::format2wgpu(desc.format),
-					.mipLevelCount = static_cast<uint32_t>(std::log2(std::max(desc.dimensions.x, desc.dimensions.y)) + 1),
-					.sampleCount = desc.sampleCount,
-				};
-				texture = wgpuDeviceCreateTexture(queue->device, &d);
-			}{
-				// Everything but storage, which needs a single mip view; update_pipeline_layouts makes that one separately.
-				auto view_usage = GPU::usage2wgpu(desc.usage) & ~WGPUTextureUsage_StorageBinding;
-				WGPUTextureViewDescriptor d {
-					.format = GPU::format2wgpu(desc.format),
-					.dimension = GPU::texture_view2wgpu(desc.type),
-					.baseMipLevel = 0,
-					.mipLevelCount = static_cast<uint32_t>(std::log2(std::max(desc.dimensions.x, desc.dimensions.y)) + 1), // TODO: Does this need a -1
-					.baseArrayLayer = 0,
-					.arrayLayerCount = desc.type == TEXTURE_3D ? 1 : desc.layerCount * 2,
-					.aspect = WGPUTextureAspect_All, // TODO: Do we need to deal with depthonly or stencilonly?
-					.usage = view_usage,
-				};
-				// A storage only texture has no other usage to view it through.
-				full_view = view_usage ? wgpuTextureCreateView(texture, &d) : nullptr;
-			}
+			std::tie(texture, full_view) = GPU::detail::create_monotexture(queue, hash, desc.type == TEXTURE_3D ? 1 : desc.layerCount * 2);
 
 			// We have a new monotexture the pipeline layouts should be aware of
 			update_pipeline_layouts(queue);
@@ -1313,68 +1379,66 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 		auto& [size, texture, full_view, _description] = monotextures->at(texture_index);
 
 		for(size_t i = 0; i < queue->texture_freelist.size(); ++i) {
-			auto& free = queue->texture_freelist[i];
 			// Strip any empty ranges from the list
-			if(free.start == free.end) {
+			if(queue->texture_freelist[i].start == queue->texture_freelist[i].end) {
 				queue->texture_freelist.erase(queue->texture_freelist.begin() + i);
 				--i;
 				continue;
 			}
 
-			// Only consider free ranges belonging to this exact monotexture atlas
-			if(free.storage() != is_storage_texture || free.index() != texture_index) continue;
+			// Sorted by monotexture then start, so layers touching or overlapping the hole before them join it, and are tried whole
+			if(i > 0) {
+				auto prev = queue->texture_freelist[i - 1];
+				auto& hole = queue->texture_freelist[i];
+				if(prev._index == hole._index && hole.start <= prev.end) {
+					hole.start = prev.start;
+					hole.end = std::max(hole.end, prev.end);
+					queue->texture_freelist.erase(queue->texture_freelist.begin() + (i - 1));
+					--i;
+				}
+			}
 
-			// If we find a free space big enough for the allocation... use that
-			if(free.end - free.start >= desc.layerCount) {
+			// Only free layers of this exact monotexture atlas will do, and only enough of them
+			auto& free = queue->texture_freelist[i];
+			if(free.storage() == is_storage_texture && free.index() == texture_index && free.end - free.start >= desc.layerCount) {
 				range = {._index = free._index, .start = free.start, .end = free.start + desc.layerCount};
 				free.start += desc.layerCount;
 				break;
-			}
-
-			// If each element overlaps with the previous one merge them assumes that the freelist is sorted by storage then index then starting value
-			if(i == 0) continue;
-
-			auto prev = queue->texture_freelist[i - 1];
-			if(free.start > prev.start && free.start < prev.end && prev._index == free._index) {
-				queue->texture_freelist.erase(queue->texture_freelist.begin() + (i - 1));
-				free.start = prev.start;
 			}
 		}
 
 		if(!range) {
 			auto capacity = desc.type == TEXTURE_3D ? 1 : wgpuTextureGetDepthOrArrayLayers(texture);
 			if(size + desc.layerCount > capacity) {
-				{
-					queue->code_pending_submission_finished.emplace_back([texture]() {
-						wgpuTextureRelease(texture);
-					}, queue->next_submission_index);
+				auto [grown, grown_view] = GPU::detail::create_monotexture(queue, hash, std::max(size * 2, size + desc.layerCount));
 
-					WGPUTextureDescriptor d {
-						.usage = GPU::usage2wgpu(desc.usage),
-						.dimension = GPU::texture2wgpu(desc.type),
-						.size = {desc.dimensions.x, desc.dimensions.y, desc.type == TEXTURE_3D ? desc.dimensions.z : size * 2},
-						.format = GPU::format2wgpu(desc.format),
-						.mipLevelCount = static_cast<uint32_t>(std::log2(std::max(desc.dimensions.x, desc.dimensions.y)) + 1),
-						.sampleCount = desc.sampleCount,
-					};
-					texture = wgpuDeviceCreateTexture(queue->device, &d);
-				}{
-					queue->code_pending_submission_finished.emplace_back([full_view]() {
-						wgpuTextureViewRelease(full_view);
-					}, queue->next_submission_index);
-
-					WGPUTextureViewDescriptor d {
-						.format = GPU::format2wgpu(desc.format),
-						.dimension = GPU::texture_view2wgpu(desc.type),
-						.baseMipLevel = 0,
-						.mipLevelCount = static_cast<uint32_t>(std::log2(std::max(desc.dimensions.x, desc.dimensions.y)) + 1), // TODO: Does this need a -1
-						.baseArrayLayer = 0,
-						.arrayLayerCount = static_cast<uint32_t>(size * 2),
-						.aspect = WGPUTextureAspect_All, // TODO: Do we need to deal with depthonly or stencilonly?
-						.usage = GPU::usage2wgpu(desc.usage),
-					};
-					full_view = wgpuTextureCreateView(texture, &d);
+				// What the atlas already holds moves with it, every mip of it; a multisampled one can't be copied
+				if(size && desc.sampleCount == 1) {
+					auto encoder = wgpuDeviceCreateCommandEncoder(queue->device, nullptr);
+					for(uint32_t mip = 0; mip < wgpuTextureGetMipLevelCount(texture); ++mip) {
+						WGPUTexelCopyTextureInfo from {.texture = texture, .mipLevel = mip}, to {.texture = grown, .mipLevel = mip};
+						WGPUExtent3D extent {std::max(wgpuTextureGetWidth(texture) >> mip, 1u), std::max(wgpuTextureGetHeight(texture) >> mip, 1u), size};
+						wgpuCommandEncoderCopyTextureToTexture(encoder, &from, &to, &extent);
+					}
+					auto commands = wgpuCommandEncoderFinish(encoder, nullptr);
+					wgpuQueueSubmit(queue->queue, 1, &commands);
+					wgpuCommandBufferRelease(commands);
+					wgpuCommandEncoderRelease(encoder);
 				}
+
+				// Work in flight may still bind the old atlas
+				queue->code_pending_submission_finished.emplace_back([texture, full_view]() {
+					if(full_view) wgpuTextureViewRelease(full_view);
+					wgpuTextureRelease(texture);
+				}, queue->next_submission_index);
+				texture = grown;
+				full_view = grown_view;
+
+				// Handles made before the move still name the old atlas, and so do the bind groups
+				for(auto& [_memory, handle]: queue->gpu2textures)
+					if(handle->range && handle->range->storage() == is_storage_texture && handle->range->index() == texture_index)
+						handle->texture = texture;
+				update_pipeline_layouts(queue);
 			}
 
 			range = {.start = size};
@@ -1396,7 +1460,7 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 			.dimension = GPU::texture2wgpu(desc.type),
 			.size = {desc.dimensions.x, desc.dimensions.y, desc.type == TEXTURE_3D ? desc.dimensions.z : desc.layerCount},
 			.format = GPU::format2wgpu(desc.format),
-			.mipLevelCount = static_cast<uint32_t>(std::log2(std::max(desc.dimensions.x, desc.dimensions.y)) + 1),
+			.mipLevelCount = desc.mipCount,
 			.sampleCount = desc.sampleCount,
 		};
 		out->texture = wgpuDeviceCreateTexture(queue->device, &d);
@@ -1468,72 +1532,35 @@ constexpr static uint32_t gpu_address_tag_shift = gpu_address_bits - 32;
 
 // Regenerated whenever the monobuffer, monotexture or sampler counts change, since WGSL can only reach those through switches. Bindings must match the layouts above.
 std::string generate_backend_module(GpuQueue* queue, bool compute) {
-	// Must match GPU::texture_view2wgpu; a plain 2D texture is still an array view, since monotextures pack several.
+	// Must match GPU::texture_view2wgpu, which only hands out 2D array, cube array and 3D views, since monotextures pack several textures.
 	constexpr static auto sampled_type = [](TEXTURE type) {
 		switch (GPU::texture_view2wgpu(type)) {
-		case WGPUTextureViewDimension_1D: return "Texture1D";
 		case WGPUTextureViewDimension_3D: return "Texture3D";
-		case WGPUTextureViewDimension_Cube: return "TextureCube";
 		case WGPUTextureViewDimension_CubeArray: return "TextureCubeArray";
-		case WGPUTextureViewDimension_2DArray: return "Texture2DArray";
-		default: return "Texture2D";
+		default: return "Texture2DArray";
 		}
 	};
 	// Write only (Slang's W prefix) to match the bind group layout; see update_pipeline_layouts.
 	constexpr static auto storage_type = [](TEXTURE type) {
 		switch (GPU::texture_view2wgpu(type)) {
-		case WGPUTextureViewDimension_1D: return "WTexture1D";
 		case WGPUTextureViewDimension_3D: return "WTexture3D";
-		case WGPUTextureViewDimension_2DArray: return "WTexture2DArray";
-		default: return "WTexture2D";
+		default: return "WTexture2DArray";
 		}
 	};
 
 	// A store takes a texel position, not a normalized coordinate, and WGSL has no storage cube textures.
 	constexpr static auto store_coordinate = [](TEXTURE type) {
 		switch (GPU::texture_view2wgpu(type)) {
-		case WGPUTextureViewDimension_1D: return "texel.x";
 		case WGPUTextureViewDimension_3D: return "texel";
-		case WGPUTextureViewDimension_2DArray: return "uint3(texel.xy, layer)";
-		default: return "texel.xy";
-		}
-	};
-
-	// Exactly the formats WGSL can name for storage; sRGB, bgra8unorm and the narrow formats would need features this backend never asks for.
-	constexpr static auto slang_format = [](FORMAT f) {
-		switch (f) {
-		case FORMAT_R32_UINT: return "r32ui";
-		case FORMAT_R32_SINT: return "r32i";
-		case FORMAT_R32_FLOAT: return "r32f";
-		case FORMAT_RGBA8_UNORM: return "rgba8";
-		case FORMAT_RGBA8_SNORM: return "rgba8_snorm";
-		case FORMAT_RGBA8_UINT: return "rgba8ui";
-		case FORMAT_RGBA8_SINT: return "rgba8i";
-		case FORMAT_RG32_UINT: return "rg32ui";
-		case FORMAT_RG32_SINT: return "rg32i";
-		case FORMAT_RG32_FLOAT: return "rg32f";
-		case FORMAT_RGBA16_UINT: return "rgba16ui";
-		case FORMAT_RGBA16_SINT: return "rgba16i";
-		case FORMAT_RGBA16_FLOAT: return "rgba16f";
-		case FORMAT_RGBA32_UINT: return "rgba32ui";
-		case FORMAT_RGBA32_SINT: return "rgba32i";
-		case FORMAT_RGBA32_FLOAT: return "rgba32f";
-		default:
-			// Only reached by a texture the validation layer would reject anyway; naming the most common storage format keeps the generated module parseable
-			assert(false && "Unsupported storage texture format");
-			return "rgba8";
+		default: return "uint3(texel.xy, layer)";
 		}
 	};
 
 	// Coordinates are scaled onto the texture's share of the atlas and pinned half a texel inside it (see GpuTextureDescriptorImpl).
 	constexpr static auto sample_remap = [](TEXTURE type) {
 		switch (GPU::texture_view2wgpu(type)) {
-		case WGPUTextureViewDimension_1D:
-			return "\t\tlet at = min(uv.x * scale.x, limit.x);\n";
 		case WGPUTextureViewDimension_3D:
 			return "\t\tlet at = min(uv * scale, limit);\n";
-		case WGPUTextureViewDimension_Cube:
-			return "\t\tlet at = uv;\n";
 		case WGPUTextureViewDimension_CubeArray:
 			return "\t\tlet at = uv;\n";
 		default:
@@ -1628,7 +1655,7 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 	if(compute)
 		for (auto const& [_cap, texture, view, desc] : queue->storage_monotextures) {
 			out += std::format("[[vk::binding({}, 1)]] [format(\"{}\")] public {}<float4> storage_tex_{};\n",
-				binding, slang_format(desc.format), storage_type(desc.type), binding);
+				binding, GPU::storage_format_name(desc.format), storage_type(desc.type), binding);
 			++binding;
 		}
 
@@ -1802,7 +1829,24 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 	return out;
 }
 
-WGPUShaderModule create_shader_module(GpuQueue* queue, std::string_view IR, GPU::shaders::SHADER_STAGE stage) {
+namespace GPU::detail {
+	// Slang has no WGSL spelling for a second blend source, and emits SV_Target1 as @location(1); dual source blending wants both outputs at location 0
+	inline std::string dual_source_outputs(std::string_view wgsl) {
+		auto arrow = wgsl.find("->", wgsl.find("@fragment"));
+		auto name_start = wgsl.find_first_not_of(' ', arrow + 2);
+		auto name = std::string(wgsl.substr(name_start, wgsl.find_first_of(" \n{", name_start) - name_start));
+		auto start = wgsl.find("struct " + name);
+		auto end = wgsl.find('}', start);
+		assert(start != std::string_view::npos && "A dual source fragment shader returns a struct with SV_Target0 and SV_Target1");
+
+		auto outputs = std::string(wgsl.substr(start, end - start));
+		for(auto [from, to]: {std::pair{"@location(0) ", "@location(0) @blend_src(0) "}, {"@location(1) ", "@location(0) @blend_src(1) "}})
+			if(auto at = outputs.find(from); at != std::string::npos) outputs.replace(at, strlen(from), to);
+		return "enable dual_source_blending;\n" + std::string(wgsl.substr(0, start)) + outputs + std::string(wgsl.substr(end));
+	}
+}
+
+WGPUShaderModule create_shader_module(GpuQueue* queue, std::string_view IR, GPU::shaders::SHADER_STAGE stage, bool dual_source = false) {
 	auto compute = stage == GPU::shaders::SHADER_STAGE::COMPUTE;
 
 	std::string error;
@@ -1821,6 +1865,7 @@ WGPUShaderModule create_shader_module(GpuQueue* queue, std::string_view IR, GPU:
 		return nullptr;
 	}
 
+	if(dual_source) wgsl = GPU::detail::dual_source_outputs(*wgsl);
 	WGPUShaderSourceWGSL source {
 		.chain {.sType = WGPUSType_ShaderSourceWGSL },
 		.code = {wgsl->data(), wgsl->size()}
@@ -1981,7 +2026,7 @@ void endCurrentPass(GpuCommandBuffer* cmd) {
 }
 
 uint64_t gpuSubmitNoFreeEXT(GpuQueue* queue, GpuCommandBufferSpan command_buffers, GpuSemaphore* semaphore, uint64_t signal_value) {
-	std::vector<WGPUCommandBuffer> buffers; buffers.reserve(command_buffers.size() + 1);
+	std::vector<WGPUCommandBuffer> buffers; buffers.reserve(command_buffers.size());
 	for(auto buffer: command_buffers) {
 		endCurrentPass(buffer);
 		buffers.emplace_back(wgpuCommandEncoderFinish(buffer->encoder, nullptr));
@@ -1995,12 +2040,15 @@ uint64_t gpuSubmitNoFreeEXT(GpuQueue* queue, GpuCommandBufferSpan command_buffer
 	if(semaphore)
 		GPU::semaphore_gpu_set_max(&cmd, *semaphore, signal_value);
 
-	buffers.emplace_back(wgpuCommandEncoderFinish(cmd.encoder, nullptr));
+	auto signal = wgpuCommandEncoderFinish(cmd.encoder, nullptr);
 	wgpuCommandEncoderRelease(cmd.encoder);
 
+	// Separate submits, still in queue order: an invalid command buffer fails its whole submit, and taking the signal with it would hang every later wait
 	wgpuQueueSubmit(queue->queue, buffers.size(), buffers.data());
+	wgpuQueueSubmit(queue->queue, 1, &signal);
 	for(auto buffer: buffers)
 		wgpuCommandBufferRelease(buffer);
+	wgpuCommandBufferRelease(signal);
 
 	// Lets process_pending_code reclaim without reading the semaphore back; the index rides in userdata, which is 64 bits on every target (see gpu_address_max).
 	wgpuQueueOnSubmittedWorkDone(
@@ -2125,21 +2173,14 @@ namespace GPU::detail {
 	// Addresses order as (monobuffer, offset), so upper_bound lands one past the holding allocation; an unowned address returns null rather than inserting.
 	inline BufferLocation closest_buffer(GpuQueue* queue, gpu* addr) {
 		auto after = queue->allocations.upper_bound(addr);
-		if(after == queue->allocations.begin()) { // Below every allocation
-			assert(false && "The address doesn't lie inside any allocation");
-			return {};
-		}
+		// Below every allocation, or past the end of the nearest one below it
+		bool inside = after != queue->allocations.begin()
+			&& (uintptr_t)addr - (uintptr_t)std::prev(after)->first < std::get<GpuQueue::MonobufferRange>(std::prev(after)->second).size();
+		assert(inside && "The address doesn't lie inside any allocation");
+		if(!inside) return {};
+
 		auto found = std::prev(after);
-
-		auto address = (uintptr_t)addr;
-		auto base = (uintptr_t)found->first;
-		const auto& range = std::get<GpuQueue::MonobufferRange>(found->second);
-		if(address - base >= range.size()) { // The nearest one ends before the address
-			assert(false && "The address doesn't lie inside any allocation");
-			return {};
-		}
-
-		return {range, ptrdiff_t(address - base), found->first};
+		return {std::get<GpuQueue::MonobufferRange>(found->second), ptrdiff_t((uintptr_t)addr - (uintptr_t)found->first), found->first};
 	}
 
 	inline std::array<BufferLocation, 2> closest_buffer(GpuQueue* queue, gpu* addrA, gpu* addrB) {
@@ -2148,6 +2189,7 @@ namespace GPU::detail {
 }
 
 void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, size_t bytes) {
+	endCurrentPass(cmd); // A copy is not something a pass can hold, and a dispatch may have opened one
 	auto [dest, src] = GPU::detail::closest_buffer(cmd->queue, dest_, src_);
 	auto [dest_range, dest_offset, dest_addr] = dest; auto [src_range, src_offset, src_addr] = src;
 
@@ -2206,8 +2248,8 @@ namespace GPU::detail {
 		case FORMAT_RGB10_A2_UNORM:
 		case FORMAT_RG11B10_UFLOAT:
 		case FORMAT_RGB9E5_UFLOAT:
-		case FORMAT_D24_PLUS_S8_UINT:
-		case FORMAT_D32_FLOAT: return 4;
+		case FORMAT_D32_FLOAT:
+		case FORMAT_D32_FLOAT_S8_UINT: return 4; // Only the depth of a combined format is copied
 
 		case FORMAT_RG32_UINT:
 		case FORMAT_RG32_SINT:
@@ -2216,16 +2258,53 @@ namespace GPU::detail {
 		case FORMAT_RGBA16_SNORM:
 		case FORMAT_RGBA16_UINT:
 		case FORMAT_RGBA16_SINT:
-		case FORMAT_RGBA16_FLOAT:
-		case FORMAT_D32_FLOAT_S8_UINT: return 8;
+		case FORMAT_RGBA16_FLOAT: return 8;
 
 		case FORMAT_RGBA32_UINT:
 		case FORMAT_RGBA32_SINT:
 		case FORMAT_RGBA32_FLOAT: return 16;
 
-		// FORMAT_D24_PLUS lands here with FORMAT_NONE: its texels have no size anyone can name, which is also why WebGPU refuses to copy it
+		// The 24 bit depth formats land here with FORMAT_NONE: their texels have no size anyone can name, which is also why WebGPU refuses to copy them
 		default: return 0;
 		}
+	}
+}
+
+namespace GPU::detail {
+	// WebGPU wants the rows of a copy 256 byte aligned, but takes a single row with no pitch at all, so tightly packed rows that aren't are copied one at a time.
+	inline void copy_texture_rows(GpuCommandBuffer* cmd, WGPUBuffer buffer, uint64_t base, const GpuTexture* texture, bool to_texture) {
+		auto [width, height, depth] = texture->descriptor.dimensions;
+		uint32_t row_bytes = width * format_bytes(texture->descriptor.format);
+		uint32_t first_layer = texture->range ? texture->range->start : 0;
+		uint32_t layers = texture->range ? texture->range->end - texture->range->start
+			: texture->descriptor.type == TEXTURE_3D ? depth : texture->descriptor.layerCount;
+		bool aligned = row_bytes % 256 == 0;
+		if(row_bytes == 0 || (!aligned && gpuFormatIsDepthStencilEXT(texture->descriptor.format))) {
+			GPU::report(cmd, GPU_DIAGNOSTIC_UNSUPPORTED, "gpuCopyToTexture/gpuCopyFromTexture: WebGPU can't copy the 24 bit depth formats, and copies other depth or stencil textures only whole, so with rows a multiple of 256 bytes; nothing is copied");
+			return;
+		}
+
+		for(uint32_t layer = 0; layer < (aligned ? 1 : layers); ++layer)
+			for(uint32_t row = 0; row < (aligned ? 1 : height); ++row) {
+				WGPUTexelCopyBufferInfo linear {
+					.layout = {
+						.offset = base + (uint64_t(layer) * height + row) * row_bytes,
+						.bytesPerRow = aligned ? row_bytes : WGPU_COPY_STRIDE_UNDEFINED,
+						.rowsPerImage = aligned ? height : WGPU_COPY_STRIDE_UNDEFINED,
+					},
+					.buffer = buffer,
+				};
+				WGPUTexelCopyTextureInfo image {
+					.texture = texture->texture,
+					.mipLevel = 0, // TODO: How do we allow more control over this?
+					.origin = {0, row, first_layer + layer},
+					// Combined formats copy their depth, as on Vulkan
+					.aspect = gpuFormatIsDepthEXT(texture->descriptor.format) && gpuFormatIsStencilEXT(texture->descriptor.format) ? WGPUTextureAspect_DepthOnly : WGPUTextureAspect_All
+				};
+				WGPUExtent3D size {width, aligned ? height : 1, aligned ? layers : 1};
+				if(to_texture) wgpuCommandEncoderCopyBufferToTexture(cmd->encoder, &linear, &image, &size);
+				else wgpuCommandEncoderCopyTextureToBuffer(cmd->encoder, &image, &linear, &size);
+			}
 	}
 }
 
@@ -2235,30 +2314,7 @@ void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, GpuTexture* 
 	auto [dest_range, dest_offset, dest_addr] = dest; auto [src_range, src_offset, src_addr] = src;
 
 	assert(cmd->queue->gpu2textures[dest_addr] == texture);
-
-	auto base = static_cast<uint64_t>(src_range.start + src_offset);
-	WGPUTexelCopyBufferInfo source {
-		.layout = {
-			.offset = base,
-			.bytesPerRow = texture->descriptor.dimensions.x * GPU::detail::format_bytes(texture->descriptor.format),
-			.rowsPerImage = texture->descriptor.dimensions.y,
-		},
-		.buffer = cmd->queue->monobuffers[src_range.buffer],
-	};
-	WGPUTexelCopyTextureInfo destination = {
-		.texture = texture->texture,
-		.mipLevel = 0, // TODO: How do we allow more control over this?
-		.origin = {0, 0, 0},
-		.aspect = WGPUTextureAspect_All
-	};
-	if(texture->range) destination.origin = {0, 0, texture->range->start};
-	WGPUExtent3D size {
-		.width = texture->descriptor.dimensions.x,
-		.height = texture->descriptor.dimensions.y,
-		.depthOrArrayLayers = texture->range ? texture->range->end - texture->range->start : texture->descriptor.dimensions.z
-	};
-	wgpuCommandEncoderCopyBufferToTexture(cmd->encoder, &source, &destination, &size);
-
+	GPU::detail::copy_texture_rows(cmd, cmd->queue->monobuffers[src_range.buffer], src_range.start + src_offset, texture, true);
 }
 
 void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuTexture* texture) {
@@ -2267,29 +2323,7 @@ void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest_, gpu* src_, const GpuT
 	auto [dest_range, dest_offset, dest_addr] = dest; auto [src_range, src_offset, src_addr] = src;
 
 	assert(cmd->queue->gpu2textures[src_addr] == texture);
-
-	WGPUTexelCopyTextureInfo source = {
-		.texture = texture->texture,
-		.mipLevel = 0, // TODO: How do we allow more control over this?
-		.origin = {0, 0, 0},
-		.aspect = WGPUTextureAspect_All
-	};
-	if(texture->range) source.origin = {0, 0, texture->range->start};
-	// The texture is what is being read here, so the buffer half of the copy is the destination
-	WGPUTexelCopyBufferInfo destination {
-		.layout = {
-			.offset = static_cast<uint64_t>(dest_range.start + dest_offset),
-			.bytesPerRow = texture->descriptor.dimensions.x * GPU::detail::format_bytes(texture->descriptor.format),
-			.rowsPerImage = texture->descriptor.dimensions.y,
-		},
-		.buffer = cmd->queue->monobuffers[dest_range.buffer],
-	};
-	WGPUExtent3D size {
-		.width = texture->descriptor.dimensions.x,
-		.height = texture->descriptor.dimensions.y,
-		.depthOrArrayLayers = texture->range ? texture->range->end - texture->range->start : texture->descriptor.dimensions.z
-	};
-	wgpuCommandEncoderCopyTextureToBuffer(cmd->encoder, &source, &destination, &size);
+	GPU::detail::copy_texture_rows(cmd, cmd->queue->monobuffers[dest_range.buffer], dest_range.start + dest_offset, texture, false);
 }
 
 namespace GPU::detail {
@@ -2654,7 +2688,15 @@ void gpuSignalAfter(GpuCommandBuffer* cmd, STAGE before, gpu* ptr, uint64_t valu
 		return;
 	}
 
+	// The counter is written by a copy, and the command encoder can't record one while a render pass is open
+	if(cmd->render_pass) {
+		GPU::report(cmd, GPU_DIAGNOSTIC_UNSUPPORTED,
+			"gpuSignalAfter: writing the counter needs a copy, which can't be recorded inside a render pass, so nothing is signalled");
+		return;
+	}
+
 	// Ordered in the command stream, so the counter lands after whatever was recorded before it.
+	endComputePass(cmd);
 	auto counter = GPU::detail::closest_buffer(cmd->queue, ptr);
 	if(!counter.base) return;
 
@@ -2785,7 +2827,9 @@ void bindComputeGroups(GpuCommandBuffer* cmd, gpu* data) {
 }
 
 void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions) {
-	assert(cmd->compute_pass);
+	assert(cmd->bound_pipeline);
+	// A copy or signal since gpuSetPipeline ended the pass, which Vulkan has no equivalent of, so it is reopened with the pipeline still bound
+	if(!cmd->compute_pass) gpuSetPipeline(cmd, cmd->bound_pipeline);
 
 	bindComputeGroups(cmd, data);
 
@@ -2793,7 +2837,7 @@ void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions) {
 }
 
 void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* data, gpu* grid_dimensions_gpu) {
-	assert(cmd->compute_pass && cmd->bound_pipeline);
+	assert(cmd->bound_pipeline);
 	assert(grid_dimensions_gpu);
 
 	auto [grid_range, grid_offset, grid_addr] = GPU::detail::closest_buffer(cmd->queue, grid_dimensions_gpu);
@@ -2815,6 +2859,13 @@ void gpuDispatchIndirect(GpuCommandBuffer* cmd, gpu* data, gpu* grid_dimensions_
 }
 
 GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, GpuByteSpan fragmentIR, const GpuRasterDesc& desc) {
+	if(desc.supportDualSourceBlending && !queue->capabilities.dual_source_blending) {
+		GPU::report(queue, GPU_DIAGNOSTIC_UNSUPPORTED,
+			"gpuCreateGraphicsPipeline: this device was created without dual-source-blending, so a pipeline with supportDualSourceBlending is not created");
+		errno = WGPUErrorType_Validation;
+		return nullptr;
+	}
+
 	auto out = (GpuPipeline*)queue->cpu_allocator(nullptr, sizeof(GpuPipeline));
 	new(out) GpuPipeline{
 		.reference_layout = nullptr,
@@ -2877,6 +2928,9 @@ void gpuFreeBlendState(GpuQueue* queue, GpuBlendState* state) {
 void gpuSetDepthStencilState(GpuCommandBuffer* cmd, const GpuDepthStencilState* state) {
 	// WebGPU bakes all but the stencil reference into the pipeline, so this is recorded for bindRenderPipeline to match.
 	cmd->depth_stencil = state ? std::optional{state->descriptor} : std::nullopt;
+	if(state && state->descriptor.stencilFront.reference != state->descriptor.stencilBack.reference)
+		GPU::report(cmd, GPU_DIAGNOSTIC_UNSUPPORTED,
+			"gpuSetDepthStencilState: WebGPU has one stencil reference for both faces, so back faces are tested against the front's");
 
 	if(cmd->render_pass && cmd->depth_stencil)
 		wgpuRenderPassEncoderSetStencilReference(cmd->render_pass, cmd->depth_stencil->stencilFront.reference);
@@ -2905,7 +2959,7 @@ namespace GPU {
 		case LOAD_OP_CLEAR:
 		case LOAD_OP_DONT_CARE: return WGPULoadOp_Clear;
 		}
-		return WGPULoadOp_Load;
+		std::unreachable();
 	}
 
 	inline WGPUStoreOp store2wgpu(STORE_OP op) {
@@ -2913,7 +2967,7 @@ namespace GPU {
 		case STORE_OP_STORE: return WGPUStoreOp_Store;
 		case STORE_OP_DONT_CARE: return WGPUStoreOp_Discard;
 		}
-		return WGPUStoreOp_Store;
+		std::unreachable();
 	}
 }
 
@@ -3003,7 +3057,7 @@ namespace GPU {
 		case OP_GREATER_EQUAL: return WGPUCompareFunction_GreaterEqual;
 		case OP_ALWAYS: return WGPUCompareFunction_Always;
 		}
-		return WGPUCompareFunction_Always;
+		std::unreachable();
 	}
 
 	inline WGPUStencilOperation stencil2wgpu(STENCIL_OP op) {
@@ -3017,7 +3071,7 @@ namespace GPU {
 		case STENCIL_OP_INCR_WRAP: return WGPUStencilOperation_IncrementWrap;
 		case STENCIL_OP_DECR_WRAP: return WGPUStencilOperation_DecrementWrap;
 		}
-		return WGPUStencilOperation_Keep;
+		std::unreachable();
 	}
 
 	inline WGPUBlendOperation blend2wgpu(BLEND op) {
@@ -3028,7 +3082,7 @@ namespace GPU {
 		case BLEND_MIN: return WGPUBlendOperation_Min;
 		case BLEND_MAX: return WGPUBlendOperation_Max;
 		}
-		return WGPUBlendOperation_Add;
+		std::unreachable();
 	}
 
 	inline WGPUBlendFactor factor2wgpu(FACTOR factor) {
@@ -3048,7 +3102,7 @@ namespace GPU {
 		case FACTOR_SRC1_ALPHA: return WGPUBlendFactor_Src1Alpha;
 		case FACTOR_ONE_MINUS_SRC1_ALPHA: return WGPUBlendFactor_OneMinusSrc1Alpha;
 		}
-		return WGPUBlendFactor_One;
+		std::unreachable();
 	}
 
 	inline WGPUColorWriteMask mask2wgpu(uint8_t mask) {
@@ -3065,7 +3119,7 @@ namespace GPU {
 		case TOPOLOGY_TRIANGLE_LIST: return WGPUPrimitiveTopology_TriangleList;
 		case TOPOLOGY_TRIANGLE_STRIP: return WGPUPrimitiveTopology_TriangleStrip;
 		}
-		return WGPUPrimitiveTopology_TriangleList;
+		std::unreachable();
 	}
 
 	// We define counter clockwise triangles as front facing (matching the Vulkan backend)
@@ -3073,23 +3127,20 @@ namespace GPU {
 		switch (cull) {
 		case CULL_NONE: return WGPUCullMode_None;
 		case CULL_CCW: return WGPUCullMode_Front;
-		case CULL_CW: return WGPUCullMode_Back;
-		case CULL_ALL:
-			assert(false && "WebGPU can't cull both faces at once, use an empty color target list instead");
+		case CULL_CW:
+		case CULL_ALL: // Never built: WebGPU can't cull both faces, so the draws skip a CULL_ALL pipeline instead (see skips_draw)
 			return WGPUCullMode_Back;
 		}
-		return WGPUCullMode_None;
+		std::unreachable();
 	}
 
 	inline WGPUIndexFormat index2wgpu(INDEX_TYPE_EXT type) {
 		switch (type) {
+		case INDEX_TYPE_UINT8: // Never reached: the draws skip 8 bit indices, which WebGPU has no format for (see skips_draw)
 		case INDEX_TYPE_UINT16: return WGPUIndexFormat_Uint16;
 		case INDEX_TYPE_UINT32: return WGPUIndexFormat_Uint32;
-		case INDEX_TYPE_UINT8:
-			assert(false && "8 bit indices aren't supported by WebGPU");
-			return WGPUIndexFormat_Uint16;
 		}
-		return WGPUIndexFormat_Uint32;
+		std::unreachable();
 	}
 }
 
@@ -3102,17 +3153,19 @@ void update_render_pipeline(GpuQueue* queue, const GpuPipeline* pipeline, const 
 
 	// A dynamically applied blend state takes precedence over one baked into the rasterizer description
 	auto effective_blend = blend ? blend : std::optional<GpuBlendDesc>(desc.blendstate);
+	// MIN and MAX ignore the factors, which WebGPU insists are then ONE
+	constexpr static auto component = [](BLEND op, FACTOR src, FACTOR dst) {
+		bool ignored = op == BLEND_MIN || op == BLEND_MAX;
+		return WGPUBlendComponent{
+			.operation = GPU::blend2wgpu(op),
+			.srcFactor = GPU::factor2wgpu(ignored ? FACTOR_ONE : src),
+			.dstFactor = GPU::factor2wgpu(ignored ? FACTOR_ONE : dst),
+		};
+	};
+	auto chosen = effective_blend.value_or(GpuBlendDesc{});
 	WGPUBlendState blend_state {
-		.color = {
-			.operation = GPU::blend2wgpu(effective_blend.value_or(GpuBlendDesc{}).colorOp),
-			.srcFactor = GPU::factor2wgpu(effective_blend.value_or(GpuBlendDesc{}).srcColorFactor),
-			.dstFactor = GPU::factor2wgpu(effective_blend.value_or(GpuBlendDesc{}).dstColorFactor),
-		},
-		.alpha = {
-			.operation = GPU::blend2wgpu(effective_blend.value_or(GpuBlendDesc{}).alphaOp),
-			.srcFactor = GPU::factor2wgpu(effective_blend.value_or(GpuBlendDesc{}).srcAlphaFactor),
-			.dstFactor = GPU::factor2wgpu(effective_blend.value_or(GpuBlendDesc{}).dstAlphaFactor),
-		},
+		.color = component(chosen.colorOp, chosen.srcColorFactor, chosen.dstColorFactor),
+		.alpha = component(chosen.alphaOp, chosen.srcAlphaFactor, chosen.dstAlphaFactor),
 	};
 
 	std::vector<WGPUColorTargetState> targets; targets.reserve(desc.colorTargets.size());
@@ -3162,7 +3215,7 @@ void update_render_pipeline(GpuQueue* queue, const GpuPipeline* pipeline, const 
 
 	auto vertex_module = create_shader_module(queue, cache.vertexIR, GPU::shaders::SHADER_STAGE::VERTEX);
 	auto fragment_module = cache.fragmentIR.empty() ? nullptr
-		: create_shader_module(queue, cache.fragmentIR, GPU::shaders::SHADER_STAGE::FRAGMENT);
+		: create_shader_module(queue, cache.fragmentIR, GPU::shaders::SHADER_STAGE::FRAGMENT, desc.supportDualSourceBlending);
 
 	WGPUFragmentState fragment {
 		.module = fragment_module,
@@ -3261,9 +3314,22 @@ namespace GPU::detail {
 	}
 }
 
+namespace GPU::detail {
+	// CULL_ALL leaves a draw nothing to rasterize, which is exactly what skipping it does; 8 bit indices can't be drawn at all.
+	inline bool skips_draw(GpuCommandBuffer* cmd, INDEX_TYPE_EXT index_type, const char* function) {
+		if(index_type == INDEX_TYPE_UINT8) {
+			GPU::report(cmd, GPU_DIAGNOSTIC_UNSUPPORTED, std::string(function) + ": WebGPU has no 8 bit indices, so nothing is drawn");
+			return true;
+		}
+		auto render = cmd->bound_pipeline ? std::get_if<GpuPipeline::RenderCache>(&cmd->bound_pipeline->cache) : nullptr;
+		return render && render->descriptor.cull == CULL_ALL;
+	}
+}
+
 void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data, gpu* indices, uint32_t index_count, uint32_t instance_count, INDEX_TYPE_EXT index_type) {
 	assert(cmd->render_pass);
 	assert(indices);
+	if(GPU::detail::skips_draw(cmd, index_type, "gpuDrawIndexedInstanced")) return;
 
 	cmd->index_type = index_type;
 	bindRenderPipeline(cmd);
@@ -3286,6 +3352,7 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd, gpu* vertex_data, gp
 	assert(cmd->render_pass);
 	assert(indices);
 	assert(args);
+	if(GPU::detail::skips_draw(cmd, index_type, "gpuDrawIndexedInstancedIndirect")) return;
 
 	cmd->index_type = index_type;
 	bindRenderPipeline(cmd);
@@ -3339,83 +3406,11 @@ void gpuFreeSurfaceEXT(GpuQueue* queue, GpuSurface* surface) {
 }
 
 namespace GPU {
-	// Only needed where WebGPU picks the format, which today means a surface reporting its preferred formats.
+	// Only needed where WebGPU picks the format, which today means a surface reporting its preferred formats. Inverting format2wgpu keeps the two from drifting apart.
 	inline FORMAT wgpu2format(WGPUTextureFormat format) {
-		switch (format) {
-		case WGPUTextureFormat_R8Unorm: return FORMAT_R8_UNORM;
-		case WGPUTextureFormat_R8Snorm: return FORMAT_R8_SNORM;
-		case WGPUTextureFormat_R8Uint: return FORMAT_R8_UINT;
-		case WGPUTextureFormat_R8Sint: return FORMAT_R8_SINT;
-
-		// Dawn-only 16-bit normalized formats; see format2wgpu
-#ifndef __EMSCRIPTEN__
-		case WGPUTextureFormat_R16Unorm: return FORMAT_R16_UNORM;
-		case WGPUTextureFormat_R16Snorm: return FORMAT_R16_SNORM;
-#endif
-		case WGPUTextureFormat_R16Uint: return FORMAT_R16_UINT;
-		case WGPUTextureFormat_R16Sint: return FORMAT_R16_SINT;
-		case WGPUTextureFormat_R16Float: return FORMAT_R16_FLOAT;
-		case WGPUTextureFormat_RG8Unorm: return FORMAT_RG8_UNORM;
-		case WGPUTextureFormat_RG8Snorm: return FORMAT_RG8_SNORM;
-		case WGPUTextureFormat_RG8Uint: return FORMAT_RG8_UINT;
-		case WGPUTextureFormat_RG8Sint: return FORMAT_RG8_SINT;
-
-		case WGPUTextureFormat_R32Uint: return FORMAT_R32_UINT;
-		case WGPUTextureFormat_R32Sint: return FORMAT_R32_SINT;
-		case WGPUTextureFormat_R32Float: return FORMAT_R32_FLOAT;
-#ifndef __EMSCRIPTEN__
-		case WGPUTextureFormat_RG16Unorm: return FORMAT_RG16_UNORM;
-		case WGPUTextureFormat_RG16Snorm: return FORMAT_RG16_SNORM;
-#endif
-		case WGPUTextureFormat_RG16Uint: return FORMAT_RG16_UINT;
-		case WGPUTextureFormat_RG16Sint: return FORMAT_RG16_SINT;
-		case WGPUTextureFormat_RG16Float: return FORMAT_RG16_FLOAT;
-		case WGPUTextureFormat_RGBA8Unorm: return FORMAT_RGBA8_UNORM;
-		case WGPUTextureFormat_RGBA8UnormSrgb: return FORMAT_RGBA8_SRGB;
-		case WGPUTextureFormat_RGBA8Snorm: return FORMAT_RGBA8_SNORM;
-		case WGPUTextureFormat_RGBA8Uint: return FORMAT_RGBA8_UINT;
-		case WGPUTextureFormat_RGBA8Sint: return FORMAT_RGBA8_SINT;
-		case WGPUTextureFormat_BGRA8Unorm: return FORMAT_BGRA8_UNORM;
-		case WGPUTextureFormat_BGRA8UnormSrgb: return FORMAT_BGRA8_SRGB;
-
-		case WGPUTextureFormat_RGB10A2Uint: return FORMAT_RGB10_A2_UINT;
-		case WGPUTextureFormat_RGB10A2Unorm: return FORMAT_RGB10_A2_UNORM;
-		case WGPUTextureFormat_RG11B10Ufloat: return FORMAT_RG11B10_UFLOAT;
-		case WGPUTextureFormat_RGB9E5Ufloat: return FORMAT_RGB9E5_UFLOAT;
-
-		case WGPUTextureFormat_RG32Uint: return FORMAT_RG32_UINT;
-		case WGPUTextureFormat_RG32Sint: return FORMAT_RG32_SINT;
-		case WGPUTextureFormat_RG32Float: return FORMAT_RG32_FLOAT;
-#ifndef __EMSCRIPTEN__
-		case WGPUTextureFormat_RGBA16Unorm: return FORMAT_RGBA16_UNORM;
-		case WGPUTextureFormat_RGBA16Snorm: return FORMAT_RGBA16_SNORM;
-#endif
-		case WGPUTextureFormat_RGBA16Uint: return FORMAT_RGBA16_UINT;
-		case WGPUTextureFormat_RGBA16Sint: return FORMAT_RGBA16_SINT;
-		case WGPUTextureFormat_RGBA16Float: return FORMAT_RGBA16_FLOAT;
-
-		case WGPUTextureFormat_RGBA32Uint: return FORMAT_RGBA32_UINT;
-		case WGPUTextureFormat_RGBA32Sint: return FORMAT_RGBA32_SINT;
-		case WGPUTextureFormat_RGBA32Float: return FORMAT_RGBA32_FLOAT;
-
-		case WGPUTextureFormat_Stencil8: return FORMAT_S8_UINT;
-		case WGPUTextureFormat_Depth16Unorm: return FORMAT_D16_UNORM;
-		case WGPUTextureFormat_Depth24Plus: return FORMAT_D24_PLUS;
-		case WGPUTextureFormat_Depth24PlusStencil8: return FORMAT_D24_PLUS_S8_UINT;
-		case WGPUTextureFormat_Depth32Float: return FORMAT_D32_FLOAT;
-		case WGPUTextureFormat_Depth32FloatStencil8: return FORMAT_D32_FLOAT_S8_UINT;
-
-		default: return FORMAT_NONE;
-		}
-	}
-
-	inline PRESENT_MODE wgpu2present(WGPUPresentMode mode) {
-		switch (mode) {
-		case WGPUPresentMode_Immediate: return PRESENT_MODE_IMMEDIATE;
-		case WGPUPresentMode_FifoRelaxed: return PRESENT_MODE_FIFO_RELAXED;
-		case WGPUPresentMode_Mailbox: return PRESENT_MODE_MAILBOX;
-		default: return PRESENT_MODE_FIFO;
-		}
+		for(int named = FORMAT_NONE + 1; named <= FORMAT_D32_FLOAT_S8_UINT; ++named)
+			if(GPU::format2wgpu((FORMAT)named) == format) return (FORMAT)named;
+		return FORMAT_NONE;
 	}
 
 	// PRESENT_MODE_BEST_AVAILABLE has no WebGPU spelling, so it is resolved against what the surface supports before this is reached (see GPU::detail::pick_present_mode)
@@ -3427,24 +3422,34 @@ namespace GPU {
 		default: return WGPUPresentMode_Fifo;
 		}
 	}
+
+	// Best first, so presentModes[0] of gpuGetSurfaceCapabilitiesEXT is what BEST_AVAILABLE resolves to; immediate trails the tear free modes.
+	constexpr static PRESENT_MODE PRESENT_MODE_PREFERENCE[] = {
+		PRESENT_MODE_MAILBOX, PRESENT_MODE_FIFO_RELAXED, PRESENT_MODE_FIFO, PRESENT_MODE_IMMEDIATE
+	};
+
+	// The surface was configured with one of these, by pick_present_mode
+	inline PRESENT_MODE wgpu2present(WGPUPresentMode mode) {
+		auto named = std::ranges::find_if(PRESENT_MODE_PREFERENCE, [mode](PRESENT_MODE named) { return present2wgpu(named) == mode; });
+		return named != std::ranges::end(PRESENT_MODE_PREFERENCE) ? *named : PRESENT_MODE_FIFO;
+	}
 }
 
 namespace GPU::detail {
-	// Otherwise the best supported: mailbox, then relaxed fifo, then the fifo every surface has.
+	// Otherwise the best supported, in GPU::PRESENT_MODE_PREFERENCE's order.
 	inline WGPUPresentMode pick_present_mode(PRESENT_MODE requested, const WGPUSurfaceCapabilities& caps) {
 		auto supported = [&caps](WGPUPresentMode mode) {
-			for(size_t i = 0; i < caps.presentModeCount; ++i)
-				if(caps.presentModes[i] == mode) return true;
-			return false;
+			auto modes = std::span(caps.presentModes, caps.presentModeCount);
+			return std::ranges::find(modes, mode) != modes.end();
 		};
 
 		if(requested != PRESENT_MODE_BEST_AVAILABLE)
 			if(auto wanted = GPU::present2wgpu(requested); supported(wanted))
 				return wanted;
 
-		if(supported(WGPUPresentMode_Mailbox)) return WGPUPresentMode_Mailbox;
-		if(supported(WGPUPresentMode_FifoRelaxed)) return WGPUPresentMode_FifoRelaxed;
-		return WGPUPresentMode_Fifo; // Guaranteed to be supported
+		// Fifo is in the list and guaranteed to be supported, so the fallback is never needed
+		auto best = std::ranges::find_if(GPU::PRESENT_MODE_PREFERENCE, [&](PRESENT_MODE mode) { return supported(GPU::present2wgpu(mode)); });
+		return best != std::ranges::end(GPU::PRESENT_MODE_PREFERENCE) ? GPU::present2wgpu(*best) : WGPUPresentMode_Fifo;
 	}
 
 	// FORMAT_NONE takes the surface's preference, BGRA8 on most platforms and the only one on some.
@@ -3460,11 +3465,9 @@ namespace GPU::detail {
 
 	inline WGPUCompositeAlphaMode pick_alpha_mode(bool opaque, const WGPUSurfaceCapabilities& caps) {
 		auto wanted = opaque ? WGPUCompositeAlphaMode_Opaque : WGPUCompositeAlphaMode_Premultiplied;
-		for(size_t i = 0; i < caps.alphaModeCount; ++i)
-			if(caps.alphaModes[i] == wanted) return wanted;
-
 		// Auto aliases the surface's first supported mode and is never listed as one itself
-		return WGPUCompositeAlphaMode_Auto;
+		auto modes = std::span(caps.alphaModes, caps.alphaModeCount);
+		return std::ranges::find(modes, wanted) != modes.end() ? wanted : WGPUCompositeAlphaMode_Auto;
 	}
 }
 
@@ -3540,8 +3543,7 @@ GpuSurfaceCapabilities gpuGetSurfaceCapabilitiesEXT(GpuQueue* queue, GpuSurface*
 			out.formats[out.formatCount++] = format;
 	}
 
-	// pick_present_mode's order, so presentModes[0] is what BEST_AVAILABLE resolves to.
-	for(auto mode: {PRESENT_MODE_MAILBOX, PRESENT_MODE_FIFO_RELAXED, PRESENT_MODE_FIFO, PRESENT_MODE_IMMEDIATE}) {
+	for(auto mode: GPU::PRESENT_MODE_PREFERENCE) {
 		if(out.presentModeCount >= GPU_MAX_SURFACE_PRESENT_MODES) break;
 
 		auto wanted = GPU::present2wgpu(mode);
@@ -3567,8 +3569,12 @@ GpuSurfaceDescriptor gpuSurfaceGetConfigurationEXT(const GpuSurface* surface) {
 }
 
 const GpuTexture* gpuSurfaceNextTextureEXT(GpuQueue* queue, GpuSurface* surface) {
-	// Acquiring twice without presenting in between is a mistake, but it shouldn't leak the texture
-	GPU::detail::release_surface_texture(surface);
+	if(surface->acquired) {
+		GPU::report(queue, GPU_DIAGNOSTIC_UNSUPPORTED,
+			"gpuSurfaceNextTextureEXT: a texture is already acquired and not yet presented, so no new one is handed out; present the one you have first");
+		errno = WGPUErrorType_Validation;
+		return nullptr;
+	}
 
 	WGPUSurfaceTexture acquired = {};
 	wgpuSurfaceGetCurrentTexture(surface->surface, &acquired);
@@ -3603,7 +3609,11 @@ const GpuTexture* gpuSurfaceNextTextureEXT(GpuQueue* queue, GpuSurface* surface)
 }
 
 void gpuSurfacePresentEXT(GpuQueue* queue, GpuSurface* surface, uint64_t wait_submission_index) {
-	assert(surface->acquired && "gpuSurfaceNextTextureEXT has to succeed before the frame can be presented");
+	if(!surface->acquired) {
+		GPU::report(queue, GPU_DIAGNOSTIC_UNSUPPORTED,
+			"gpuSurfacePresentEXT: no texture is currently acquired, so nothing is presented; call gpuSurfaceNextTextureEXT first");
+		return;
+	}
 
 	// One queue, presenting behind everything submitted, so there is nothing to wait for; the index is only checked.
 	assert((wait_submission_index == NO_SUBMISSION_WAIT || wait_submission_index < queue->next_submission_index)

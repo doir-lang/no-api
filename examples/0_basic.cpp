@@ -380,7 +380,9 @@ int real_main() {
 #ifdef __EMSCRIPTEN__
 	emscripten_set_main_loop_arg(emscripten_frame, &state, 0, true);
 #else
-	while (!glfwWindowShouldClose(state.window)) {
+	// tools/coverage.py sets NOAPI_EXAMPLE_FRAMES so each example renders that many frames and exits instead of waiting for its window to close
+	const char *frame_limit = getenv("NOAPI_EXAMPLE_FRAMES");
+	for (long frames = 0; !glfwWindowShouldClose(state.window) && (!frame_limit || frames < atol(frame_limit)); ++frames) {
 		glfwPollEvents();
 		render_frame(&state);
 	}

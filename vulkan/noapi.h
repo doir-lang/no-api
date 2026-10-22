@@ -113,13 +113,15 @@ bool gpuSetupDefaultVulkanEXT(GpuVulkanSurfaceLoaderEXT surface_loader, void* su
 /**
  * gpuEnableRequiredVulkanFeaturesEXT – Turns on the core features this backend needs in a feature struct of your own, so that a hand rolled device creation enables them too.
  *
+ * imageCubeArray is what TEXTURE_CUBE_ARRAY costs: without it a view of several cubes can't be made.
+ *
  * shaderStorageImageWriteWithoutFormat is what gpuStoreTexture costs: a shader reaches a texture by a heap index, so the format of the one it is writing is not knowable where the image is declared, and an unformatted storage image write is the feature that covers exactly that. Its read counterpart is not asked for, and gpuStoreTexture has no load beside it, because shaderStorageImageReadWithoutFormat is a feature devices in circulation decline.
  *
  * @code
  * VkPhysicalDeviceFeatures features;
  * memset(&features, 0, sizeof(features));
  * features = gpuEnableRequiredVulkanFeaturesEXT(features);
- * assert(features.shaderInt64 && features.shaderStorageImageWriteWithoutFormat);
+ * assert(features.shaderInt64 && features.imageCubeArray && features.shaderStorageImageWriteWithoutFormat);
  * @endcode
  *
  * @param features The features the program wants for its own sake.
@@ -127,6 +129,7 @@ bool gpuSetupDefaultVulkanEXT(GpuVulkanSurfaceLoaderEXT surface_loader, void* su
  */
 NOAPI_INLINE VkPhysicalDeviceFeatures gpuEnableRequiredVulkanFeaturesEXT(VkPhysicalDeviceFeatures features) {
 	features.shaderInt64 = true;
+	features.imageCubeArray = true;
 	features.shaderStorageImageWriteWithoutFormat = true;
 	return features;
 }
@@ -219,10 +222,7 @@ NOAPI_INLINE VkPhysicalDeviceVulkan14Features gpuEnableRequiredVulkan14FeaturesE
  *
  * @code
  * GpuCStringSpan required = gpuRequiredVulkanDeviceExtensionsEXT();
- * bool has_descriptor_heap = false;
- * for(size_t i = 0; i < required.count; ++i)
- * 	has_descriptor_heap |= strcmp(required.ptr[i], "VK_EXT_descriptor_heap") == 0;
- * assert(has_descriptor_heap);
+ * assert(required.count > 0); // Enable each of required.ptr on a device of the program's own
  * @endcode
  */
 NOAPI_INLINE GpuCStringSpan gpuRequiredVulkanDeviceExtensionsEXT(void) {
@@ -298,6 +298,8 @@ NOAPI_INLINE void* gpuRequiredVulkanDeviceCreateInfoPnextEXT(void) {
 /**
  * gpuCreateQueue – Wrap an existing Vulkan device and queue as a GpuQueue.
  *
+ * The device may be one of the program's own, made with the requirements above, and works alongside the devices other queues are on.
+ *
  * @code
  * GpuQueue* second = gpuCreateQueue(backend.instance, backend.gpu, backend.device, backend.graphics_queue, backend.graphics_queue_family, true, gpuDefaultCpuAllocator, NULL);
  * assert(second);
@@ -305,17 +307,17 @@ NOAPI_INLINE void* gpuRequiredVulkanDeviceCreateInfoPnextEXT(void) {
  * @endcode
  *
  * @note Command buffers created from a queue may internally store pointers to it, so it is unsafe to move a queue after sub objects have been created.
- * @note The backend reaches Vulkan through volk, which this loads for \p instance and \p device; every queue in a program has to be created on the same device.
+ * @note The backend reaches Vulkan through volk, which this loads for \p instance, through the loader's entry points that dispatch on whichever device they are handed, so queues on any number of devices can coexist. Create them all from the one instance.
  *
  * @param instance The instance the device came from.
  * @param gpu The physical device the device was created on.
  * @param device Device all GPU objects are created on.
- * @param queue The queue work is submitted to, or VK_NULL_HANDLE to look one up.
- * @param queue_family The family that queue belongs to, or -1 to look one up.
- * @param is_graphics_queue False for a compute only queue.
+ * @param queue The queue work is submitted to, or VK_NULL_HANDLE to look one up (along with its family).
+ * @param queue_family The family that queue belongs to; ignored when the queue is looked up.
+ * @param is_graphics_queue False for a compute only queue. Looking one up needs a queue family that does compute without graphics.
  * @param allocator Host allocation hook (gpuDefaultCpuAllocator by default).
  * @param callbacks Vulkan allocation callbacks, or NULL.
- * @return The queue, or NULL if the device lacks something the backend needs or an object could not be created, with errno set to the VkResult.
+ * @return The queue, or NULL if no queue could be looked up (errno VK_ERROR_FEATURE_NOT_PRESENT), the device lacks something the backend needs or an object could not be created, with errno set to the VkResult.
  */
 GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device,
 	VkQueue queue NOAPI_DEFAULT(VK_NULL_HANDLE), uint32_t queue_family NOAPI_DEFAULT(-1),

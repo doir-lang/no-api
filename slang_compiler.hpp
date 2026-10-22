@@ -14,12 +14,14 @@
 #include <slang-com-ptr.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace GPU::shaders {
@@ -600,11 +602,13 @@ inline slang::ISession* get_session(SlangCompileTarget target, std::string_view 
 		&& cache.backend_module == backend_module && cache.macro_key == macro_key)
 		return cache.session.get();
 
-	auto* global = global_session();
-	if(!global) {
-		out_error = "the Slang global session is unavailable";
+	// Either way the compiler can't run: Slang never started (reported once, by global_session), or won't open a session
+	auto unavailable = [&out_error]() -> slang::ISession* {
+		out_error = "the Slang compiler is unavailable";
 		return nullptr;
-	}
+	};
+	auto* global = global_session();
+	if(!global) return unavailable();
 
 	// Snapshot the registry so the session can be built without holding its lock
 	std::vector<std::string> search_paths;
@@ -657,10 +661,7 @@ inline slang::ISession* get_session(SlangCompileTarget target, std::string_view 
 	};
 
 	Slang::ComPtr<slang::ISession> session;
-	if(SLANG_FAILED(global->createSession(session_desc, session.writeRef())) || !session) {
-		out_error = "failed to create a Slang session";
-		return nullptr;
-	}
+	if(SLANG_FAILED(global->createSession(session_desc, session.writeRef())) || !session) return unavailable();
 
 	// The API's modules load first: a module compiles as it loads, so a registered one importing noapi needs it already present.
 	auto load = [&](const char* name, std::string_view source) -> bool {
@@ -696,24 +697,17 @@ inline slang::ISession* get_session(SlangCompileTarget target, std::string_view 
 // Compilation
 // ---------------------------------------------------------------------------
 
+// Indexed by SHADER_STAGE, in its order
 inline SlangStage to_slang_stage(SHADER_STAGE stage) {
-	switch(stage) {
-	case SHADER_STAGE::COMPUTE: return SLANG_STAGE_COMPUTE;
-	case SHADER_STAGE::VERTEX: return SLANG_STAGE_VERTEX;
-	case SHADER_STAGE::FRAGMENT: return SLANG_STAGE_FRAGMENT;
-	case SHADER_STAGE::MESH: return SLANG_STAGE_MESH;
-	}
-	return SLANG_STAGE_NONE;
+	constexpr static SlangStage stages[] = {SLANG_STAGE_COMPUTE, SLANG_STAGE_VERTEX, SLANG_STAGE_FRAGMENT, SLANG_STAGE_MESH};
+	static_assert(std::size(stages) == (int)SHADER_STAGE::MESH + 1, "One entry per SHADER_STAGE");
+	return stages[(int)stage];
 }
 
 inline const char* stage_name(SHADER_STAGE stage) {
-	switch(stage) {
-	case SHADER_STAGE::COMPUTE: return "compute";
-	case SHADER_STAGE::VERTEX: return "vertex";
-	case SHADER_STAGE::FRAGMENT: return "fragment";
-	case SHADER_STAGE::MESH: return "mesh";
-	}
-	return "unknown";
+	constexpr static const char* names[] = {"compute", "vertex", "fragment", "mesh"};
+	static_assert(std::size(names) == (int)SHADER_STAGE::MESH + 1, "One entry per SHADER_STAGE");
+	return names[(int)stage];
 }
 
 inline std::optional<std::string> compile(SlangCompileTarget target, std::string_view backend_module,
@@ -747,61 +741,43 @@ inline std::optional<std::string> compile(SlangCompileTarget target, std::string
 
 	// Entry points are found by stage, so one module can supply both halves of a graphics pipeline; two of one stage is an error.
 	auto wanted = to_slang_stage(stage);
-	Slang::ComPtr<slang::IEntryPoint> found;
+	Slang::ComPtr<slang::IComponentType> composed; // The module with the one entry point of the wanted stage
 	for(SlangInt32 i = 0; i < module->getDefinedEntryPointCount(); ++i) {
+		// The stage is only reachable through a composed layout. Neither call fails for an index in range; a null result just skips it.
 		Slang::ComPtr<slang::IEntryPoint> candidate;
-		if(SLANG_FAILED(module->getDefinedEntryPoint(i, candidate.writeRef())) || !candidate)
-			continue;
-
-		// The stage is only reachable through a layout, and a module's own layout lists no entry points.
+		Slang::ComPtr<slang::IComponentType> candidate_composed;
+		(void)module->getDefinedEntryPoint(i, candidate.writeRef());
 		slang::IComponentType* parts[] = {module, candidate.get()};
-		Slang::ComPtr<slang::IComponentType> composed;
-		if(SLANG_FAILED(session->createCompositeComponentType(parts, 2, composed.writeRef())) || !composed)
-			continue;
+		if(candidate) (void)session->createCompositeComponentType(parts, 2, candidate_composed.writeRef());
+		auto* layout = candidate_composed ? candidate_composed->getLayout(0, diagnostics.writeRef()) : nullptr;
+		if(!layout || layout->getEntryPointCount() == 0 || layout->getEntryPointByIndex(0)->getStage() != wanted) continue;
 
-		auto* layout = composed->getLayout(0, diagnostics.writeRef());
-		if(!layout || layout->getEntryPointCount() == 0) continue;
-		if(layout->getEntryPointByIndex(0)->getStage() != wanted) continue;
-
-		if(found) {
+		if(composed) {
 			out_error = std::string("the shader defines more than one ") + stage_name(stage) + " entry point";
 			return std::nullopt;
 		}
-		found = candidate;
+		composed = candidate_composed;
 	}
 
-	if(!found) {
+	if(!composed) {
 		out_error = std::string("the shader defines no ") + stage_name(stage)
 			+ " entry point (mark one with [shader(\"" + stage_name(stage) + "\")])";
 		return std::nullopt;
 	}
 
-	slang::IComponentType* parts[] = {module, found.get()};
-	Slang::ComPtr<slang::IComponentType> composed;
-	if(SLANG_FAILED(session->createCompositeComponentType(parts, 2, composed.writeRef())) || !composed) {
-		out_error = "failed to compose the shader with its modules";
-		return std::nullopt;
-	}
-
+	// A caller can't tell a failed link from failed code generation, so they share a path; warnings and errors from both are reported first
 	Slang::ComPtr<slang::IComponentType> linked;
-	diagnostics = nullptr;
-	if(SLANG_FAILED(composed->link(linked.writeRef(), diagnostics.writeRef())) || !linked) {
-		if(diagnostics && diagnostics->getBufferSize())
-			report_diagnostic({(const char*)diagnostics->getBufferPointer(), diagnostics->getBufferSize()});
-		out_error = "failed to link the shader";
-		return std::nullopt;
-	}
-
 	Slang::ComPtr<slang::IBlob> code;
-	diagnostics = nullptr;
-	if(SLANG_FAILED(linked->getEntryPointCode(0, 0, code.writeRef(), diagnostics.writeRef())) || !code) {
-		if(diagnostics && diagnostics->getBufferSize())
-			report_diagnostic({(const char*)diagnostics->getBufferPointer(), diagnostics->getBufferSize()});
-		out_error = "failed to generate code for the shader";
+	std::array<Slang::ComPtr<slang::IBlob>, 2> reports;
+	auto result = composed->link(linked.writeRef(), reports[0].writeRef());
+	if(SLANG_SUCCEEDED(result)) result = linked->getEntryPointCode(0, 0, code.writeRef(), reports[1].writeRef());
+	for(auto& report: reports)
+		if(report && report->getBufferSize())
+			report_diagnostic({(const char*)report->getBufferPointer(), report->getBufferSize()});
+	if(SLANG_FAILED(result) || !code) {
+		out_error = "failed to link or generate code for the shader";
 		return std::nullopt;
 	}
-	if(diagnostics && diagnostics->getBufferSize())
-		report_diagnostic({(const char*)diagnostics->getBufferPointer(), diagnostics->getBufferSize()});
 
 	return cache.code.emplace(std::move(cache_key),
 		std::string((const char*)code->getBufferPointer(), code->getBufferSize())).first->second;

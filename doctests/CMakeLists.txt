@@ -36,9 +36,27 @@ add_custom_command(
 	COMMENT "Extracting the header examples"
 )
 
-add_executable(noapi-doctests harness.cpp ${NOAPI_DOCTEST_GENERATED})
+add_executable(noapi-doctests harness.cpp tests.cpp ${NOAPI_DOCTEST_GENERATED})
 target_include_directories(noapi-doctests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(noapi-doctests PRIVATE noapi::noapi doctest::doctest)
+# Fault injection: on Linux the linker redirects the backends' calls into Slang and Dawn through wrappers in tests.cpp, which can make them fail on demand
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+	set(NOAPI_DOCTEST_WRAPPED slang_createGlobalSession2)
+	if(NOAPI_DOCTEST_BACKEND STREQUAL "webgpu")
+		list(APPEND NOAPI_DOCTEST_WRAPPED wgpuInstanceRequestAdapter wgpuAdapterRequestDevice wgpuInstanceProcessEvents
+			wgpuSurfaceGetCapabilities wgpuSurfaceGetCurrentTexture wgpuSurfacePresent)
+	endif()
+	list(TRANSFORM NOAPI_DOCTEST_WRAPPED PREPEND "LINKER:--wrap=")
+	target_link_options(noapi-doctests PRIVATE ${NOAPI_DOCTEST_WRAPPED})
+	target_compile_definitions(noapi-doctests PRIVATE NOAPI_DOCTEST_FAULTS)
+endif()
+
+# WebGPU has no headless surface, so where the examples brought GLFW along the harness presents to a hidden window instead (see harness.cpp)
+if(TARGET glfw3webgpu)
+	target_link_libraries(noapi-doctests PRIVATE glfw3webgpu)
+	target_include_directories(noapi-doctests PRIVATE ${PROJECT_SOURCE_DIR}/examples)
+	target_compile_definitions(noapi-doctests PRIVATE NOAPI_DOCTEST_WINDOW)
+endif()
 set_target_properties(noapi-doctests PROPERTIES CXX_STANDARD 26 C_STANDARD 11 C_STANDARD_REQUIRED ON)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 	set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/generated/examples_${NOAPI_DOCTEST_BACKEND}.c PROPERTIES COMPILE_OPTIONS -fexceptions)

@@ -184,8 +184,10 @@ The examples in the headers' documentation are the unit tests. `tools/doctest.py
 ```sh
 python3 tools/doctest.py build build-vk   # build and run the examples in each build directory
 python3 tools/doctest.py --check          # only check the documentation
-python3 tools/coverage.py -v vulkan       # line coverage of a backend from those examples
+python3 tools/coverage.py -v vulkan       # line coverage of a backend from those examples and the example programs
 ```
+
+`coverage.py` also runs each program in `examples/` for a fixed number of frames (it sets `NOAPI_EXAMPLE_FRAMES`), which needs a display; pass `--doctests-only` to measure the header examples alone.
 
 ## Examples
 
@@ -196,7 +198,8 @@ python3 tools/coverage.py -v vulkan       # line coverage of a backend from thos
 | `2_compute_texture` | Generating a texture in a compute shader, then displaying it |
 | `3_meshlet` | Mesh shader pipelines with direct and indirect meshlet draws |
 | `4_pbr` | Image-based PBR lighting of the Utah teapot, using an HDR environment map |
-| `5_raytrace` | A compute shader ray tracer |
+| `5_msaa_stencil_outline` | 4x MSAA resolved into the surface, a stencil outline around the teapot, and a culled triangle strip floor |
+| `6_raytrace` | A compute shader ray tracer |
 
 Asset credits are listed in [`examples/credits.txt`](examples/credits.txt).
 

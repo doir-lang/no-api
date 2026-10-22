@@ -21,6 +21,7 @@ void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data);
 void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data) {
 	GpuCapabilities capabilities = gpuGetCapabilitiesEXT(queue);
 	(void)capabilities.mesh_shaders;
+	(void)capabilities.dual_source_blending;
 	(void)capabilities.split_barrier_signals;
 	(void)capabilities.split_barriers;
 	(void)capabilities.gpu_writable_texture_heap;

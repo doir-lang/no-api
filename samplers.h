@@ -148,46 +148,12 @@ NOAPI_EXTERN_C_BEGIN
  * Shaders select a sampler by its description (gpuGetSamplerIndex in the `noapi` module) rather than binding a separate sampler object, avoiding per-material sampler management. A description that was not enabled gets the default sampler, linear and repeating.
  *
  * @code{.cpp}
- * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_SAMPLED | USAGE_TRANSFER_DST)};
- * auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
- * auto texture = gpuCreateTexture(queue, desc, memory);
- * auto texels = gpuMalloc<uint32_t>(queue, 64 * 64);
- * for(uint32_t i = 0; i < 64 * 64; ++i) texels[i] = i % 64 < 32 ? 0xff0000ff : 0xff00ff00; // Red on the left, green on the right
- * auto texels_gpu = gpuHostToDevicePointer(queue, texels);
- * auto heap = gpuMalloc<GpuTextureDescriptor>(queue, 1, MEMORY_DESCRIPTOR_HEAP);
- * heap[0] = gpuTextureViewDescriptor(queue, texture, {});
- * auto heap_gpu = gpuHostToDevicePointer(queue, heap);
- *
- * auto pipeline = gpuCreateComputePipeline(queue, string_to_bytes(R"slang(
- * 	import noapi;
- * 	[shader("compute")] [numthreads(1, 1, 1)]
- * 	void main() {
- * 		let clamp = GpuSamplerDesc(ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, FILTER_NEAREST, FILTER_NEAREST, FILTER_NEAREST);
- * 		gpuComputeData<float4>()[0] = gpuSample2D(0, gpuGetSamplerIndex(clamp), float2(1.25, 0.5));
- * 	}
- * )slang"));
- * auto color = gpuMalloc<float>(queue, 4, MEMORY_READBACK);
- * auto color_gpu = gpuHostToDevicePointer(queue, color);
- *
- * GpuSamplerDesc clamp = {ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, FILTER_NEAREST, FILTER_NEAREST, FILTER_NEAREST};
+ * GpuSamplerDesc samplers[] = {
+ * 	{ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, FILTER_NEAREST, FILTER_NEAREST, FILTER_NEAREST},
+ * };
  * auto cmd = gpuStartCommandRecording(queue);
- * gpuSyncMemoryEXT(cmd, texels_gpu);
- * gpuCopyToTexture(cmd, memory, texels_gpu, texture);
- * gpuBarrier(cmd, STAGE_TRANSFER, STAGE_COMPUTE);
- * gpuSyncMemoryEXT(cmd, heap_gpu);
- * gpuSetActiveTextureHeapPtr(cmd, heap_gpu);
- * gpuSetEnabledSamplersEXT(cmd, {&clamp, 1});
- * gpuSetPipeline(cmd, pipeline);
- * gpuDispatch(cmd, color_gpu, {1, 1, 1});
- * gpuSyncMemoryEXT(cmd, color_gpu);
- * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * assert(color[0] == 0.0f && color[1] == 1.0f); // Clamped to the green edge, where repeating would have wrapped round to red
- *
- * gpuFreePipeline(queue, pipeline);
- * gpuFree(queue, color);
- * gpuFree(queue, heap);
- * gpuFree(queue, texels);
- * gpuFree(queue, memory);
+ * gpuSetEnabledSamplersEXT(cmd, samplers); // A shader asking for this description now gets it
+ * gpuFreeCommandBuffer(cmd);
  * @endcode
  *
  * @note On WebGPU at most gpu_sampler_slot_count - 1 samplers can be enabled at once, since the default sampler takes a slot too.

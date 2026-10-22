@@ -51,6 +51,8 @@ typedef struct GpuBlendState GpuBlendState;
  * CULL_CW – Cull clockwise triangles.
  * CULL_ALL – Cull all triangles (useful for depth-only / shadow-map prepass that only needs depth from the rasterizer's early-Z).
  * CULL_NONE – No culling; both faces are rasterized.
+ *
+ * Winding is judged in clip space with Y pointing up, as both backends present it. WebGPU has no way to cull both faces, so there a draw with a CULL_ALL pipeline is skipped, which leaves the same result.
  */
 typedef enum CULL { CULL_CCW, CULL_CW, CULL_ALL, CULL_NONE } CULL;
 
@@ -120,6 +122,8 @@ typedef enum TOPOLOGY {
 
 /**
  * INDEX_TYPE_EXT – The width of each entry in an index buffer.
+ *
+ * WebGPU has no 8 bit indices, so there a draw given them reports itself unsupported and draws nothing.
  */
 typedef enum INDEX_TYPE_EXT {
 	INDEX_TYPE_UINT8, ///< Not supported on WebGPU.
@@ -177,6 +181,8 @@ typedef struct GpuDepthStencilDesc {
  * Default values implement opaque (no-blending) output: src * 1 + dst * 0 = src. A standard "over" alpha-blend sets srcColorFactor = FACTOR_SRC_ALPHA and dstColorFactor = FACTOR_ONE_MINUS_SRC_ALPHA.
  *
  * On desktop GPUs with fixed-function blend hardware this state can be applied dynamically via gpuSetBlendState. On mobile TBDR GPUs it is typically compiled into the pixel shader; consider framebuffer-fetch + a parametrized blend formula instead to avoid PSO permutations.
+ *
+ * @note The FACTOR_SRC1_* factors read a second fragment output, so they are only valid with a pipeline created with GpuRasterDesc::supportDualSourceBlending; see gpuGetCapabilitiesEXT().dual_source_blending.
  */
 typedef struct GpuBlendDesc {
 	BLEND colorOp NOAPI_DEFAULT(BLEND_ADD); ///< Blend equation for RGB channels.
@@ -235,7 +241,7 @@ typedef struct GpuRasterDesc {
 	/** When true, MSAA coverage is derived from the pixel shader's output alpha. Useful for alpha-tested foliage rendered into an MSAA buffer. */
 	bool alphaToCoverage NOAPI_DEFAULT(false);
 
-	/** When true, the shader compiler enables the second pixel-shader color output (SV_Color1) for use as the second blend source. Only valid when a single color target is used. Requires blendstate to reference FACTOR_SRC1_* blend factors. */
+	/** When true, the fragment shader's second output becomes the second blend source the FACTOR_SRC1_* factors read. The shader declares both halves of target 0, `[[vk::location(0), vk::index(0)]]` for the color and `[[vk::location(0), vk::index(1)]]` for the second source, and there is a single color target. Only where gpuGetCapabilitiesEXT().dual_source_blending is true; otherwise the pipeline is reported unsupported and not created. */
 	bool supportDualSourceBlending NOAPI_DEFAULT(false);
 
 	/** MSAA sample count (1, 2, 4, 8). Must match the resolve and depth targets. */
@@ -423,16 +429,13 @@ NOAPI_EXTERN_C_BEGIN
  * @code{.cpp}
  * auto shader = string_to_bytes(R"slang(
  * 	import noapi;
+ * 	// One triangle that covers the whole target
  * 	[shader("vertex")] float4 vertexMain(uint index : SV_VertexID) : SV_Position { return float4(float2((index << 1) & 2, index & 2) * 2 - 1, 0, 1); }
- * 	[shader("fragment")] float4 fragmentMain() : SV_Target { return gpuFragmentData<float4>()[0]; }
+ * 	[shader("fragment")] float4 fragmentMain() : SV_Target { return float4(1, 0, 0, 1); }
  * )slang");
  * GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
- * auto pipeline = gpuCreateGraphicsPipeline(queue, shader, shader, {
- * 	.colorTargets = {&target, 1},
- * 	.blendstate = GpuBlendDesc{.srcColorFactor = FACTOR_SRC_ALPHA, .dstColorFactor = FACTOR_ONE_MINUS_SRC_ALPHA},
- * });
+ * auto pipeline = gpuCreateGraphicsPipeline(queue, shader, shader, {.colorTargets = {&target, 1}});
  * assert(pipeline);
- * assert(!gpuCreateGraphicsPipeline(queue, string_to_bytes("not a shader"), shader, {.colorTargets = {&target, 1}}));
  * gpuFreePipeline(queue, pipeline);
  * @endcode
  *
@@ -465,8 +468,7 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
  * )slang");
  * GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
  * auto pipeline = gpuCreateGraphicsMeshletPipeline(queue, shader, shader, {.colorTargets = {&target, 1}});
- * assert((pipeline != nullptr) == gpuGetCapabilitiesEXT(queue).mesh_shaders);
- * if(pipeline) gpuFreePipeline(queue, pipeline);
+ * if(pipeline) gpuFreePipeline(queue, pipeline); // NULL where gpuGetCapabilitiesEXT(queue).mesh_shaders is false
  * @endcode
  *
  * @note This is an optional feature. It is available only where gpuGetCapabilitiesEXT().mesh_shaders is true -- a Vulkan device with VK_EXT_mesh_shader, and never on WebGPU, which has no mesh shaders in any form. Where it is false this reports through the diagnostic callback and returns NULL, without compiling anything, so a program can either branch on the capability or branch on the NULL.
@@ -551,49 +553,14 @@ void gpuFreeBlendState(GpuQueue* queue, GpuBlendState* state);
  * gpuSetDepthStencilState – Apply a pre-baked GpuDepthStencilState for subsequent draw calls. Emits a small hardware command packet to configure the depth/stencil unit without touching the shader microcode or requiring a PSO recompile.
  *
  * @code{.cpp}
- * auto shader = string_to_bytes(R"slang(
- * 	import noapi;
- * 	[shader("vertex")] float4 vertexMain(uint index : SV_VertexID) : SV_Position { return float4(float2((index << 1) & 2, index & 2) * 2 - 1, 0.5, 1); }
- * 	[shader("fragment")] float4 fragmentMain() : SV_Target { return float4(1, 1, 1, 1); }
- * )slang");
- * GpuTextureDesc color_desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
- * GpuTextureDesc depth_desc = {.dimensions = {64, 64, 1}, .format = FORMAT_D32_FLOAT, .usage = USAGE_DEPTH_STENCIL_ATTACHMENT};
- * auto color_memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, color_desc));
- * auto depth_memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, depth_desc));
- * auto color = gpuCreateTexture(queue, color_desc, color_memory);
- * auto depth = gpuCreateTexture(queue, depth_desc, depth_memory);
- * GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
- * auto pipeline = gpuCreateGraphicsPipeline(queue, shader, shader, {.depthFormat = FORMAT_D32_FLOAT, .colorTargets = {&target, 1}});
- * auto closer = gpuCreateDepthStencilState(queue, {.depthMode = DEPTH_READ, .depthTest = OP_LESS}); // 0.5 is not closer than the 0.25 cleared
- * auto indices = gpuMalloc<uint32_t>(queue, 3);
- * for(uint32_t i = 0; i < 3; ++i) indices[i] = i;
- * auto indices_gpu = gpuHostToDevicePointer(queue, indices);
- * auto pixels = gpuMalloc<uint32_t>(queue, 64 * 64, MEMORY_READBACK);
- * auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
- *
- * GpuColorAttachment color_attachment = {.texture = color, .loadOp = LOAD_OP_CLEAR};
+ * auto state = gpuCreateDepthStencilState(queue, {.depthMode = DEPTH_FLAGS(DEPTH_READ | DEPTH_WRITE), .depthTest = OP_LESS});
  * auto cmd = gpuStartCommandRecording(queue);
- * gpuSyncMemoryEXT(cmd, indices_gpu);
- * gpuBeginRenderPass(cmd, {.depthAttachment = GpuDepthStencilAttachment{.texture = depth, .loadOp = LOAD_OP_CLEAR, .clearValue = 0.25}, .colorAttachments = {&color_attachment, 1}});
- * gpuSetPipeline(cmd, pipeline);
- * gpuSetDepthStencilState(cmd, closer);
- * gpuDrawIndexedInstanced(cmd, indices_gpu, indices_gpu, indices_gpu, 3, 1);
- * gpuEndRenderPass(cmd);
- * gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
- * gpuCopyFromTexture(cmd, pixels_gpu, color_memory, color);
- * gpuSyncMemoryEXT(cmd, pixels_gpu);
- * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * assert(pixels[0] == 0xff000000); // Still the clear color: the triangle failed the depth test
- *
- * gpuFreeDepthStencilState(queue, closer);
- * gpuFreePipeline(queue, pipeline);
- * gpuFree(queue, pixels);
- * gpuFree(queue, indices);
- * gpuFree(queue, depth_memory);
- * gpuFree(queue, color_memory);
+ * gpuSetDepthStencilState(cmd, state); // The draws that follow test and write depth
+ * gpuFreeCommandBuffer(cmd);
+ * gpuFreeDepthStencilState(queue, state);
  * @endcode
  *
- * @note On WebGPU the depth/stencil state is part of the pipeline, so the next draw may compile a new variant of the bound one.
+ * @note On WebGPU the depth/stencil state is part of the pipeline, so the next draw may compile a new variant of the bound one. WebGPU also has a single stencil reference, so where stencilFront and stencilBack name different ones, back faces use the front's and this reports it as unsupported.
  *
  * @param cmd Command buffer to record into.
  * @param state Depth/stencil state object to apply, created by gpuCreateDepthStencilState.
@@ -604,42 +571,11 @@ void gpuSetDepthStencilState(GpuCommandBuffer* cmd, const GpuDepthStencilState* 
  * gpuSetBlendState – Apply a pre-baked GpuBlendState for subsequent draw calls, overriding the blend state the bound pipeline was created with for as long as it is set.
  *
  * @code{.cpp}
- * auto shader = string_to_bytes(R"slang(
- * 	import noapi;
- * 	[shader("vertex")] float4 vertexMain(uint index : SV_VertexID) : SV_Position { return float4(float2((index << 1) & 2, index & 2) * 2 - 1, 0, 1); }
- * 	[shader("fragment")] float4 fragmentMain() : SV_Target { return float4(1, 0, 0, 1); }
- * )slang");
- * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
- * auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
- * auto texture = gpuCreateTexture(queue, desc, memory);
- * GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
- * auto pipeline = gpuCreateGraphicsPipeline(queue, shader, shader, {.colorTargets = {&target, 1}});
  * auto additive = gpuCreateBlendState(queue, {.srcColorFactor = FACTOR_ONE, .dstColorFactor = FACTOR_ONE});
- * auto indices = gpuMalloc<uint32_t>(queue, 3);
- * for(uint32_t i = 0; i < 3; ++i) indices[i] = i;
- * auto indices_gpu = gpuHostToDevicePointer(queue, indices);
- * auto pixels = gpuMalloc<uint32_t>(queue, 64 * 64, MEMORY_READBACK);
- * auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
- *
- * GpuColorAttachment attachment = {.texture = texture, .loadOp = LOAD_OP_CLEAR, .clearValue = {0, 0, 1, 1}};
  * auto cmd = gpuStartCommandRecording(queue);
- * gpuSyncMemoryEXT(cmd, indices_gpu);
- * gpuBeginRenderPass(cmd, {.colorAttachments = {&attachment, 1}});
- * gpuSetPipeline(cmd, pipeline);
- * gpuSetBlendState(cmd, additive);
- * gpuDrawIndexedInstanced(cmd, indices_gpu, indices_gpu, indices_gpu, 3, 1);
- * gpuEndRenderPass(cmd);
- * gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
- * gpuCopyFromTexture(cmd, pixels_gpu, memory, texture);
- * gpuSyncMemoryEXT(cmd, pixels_gpu);
- * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * assert(pixels[0] == 0xffff00ff); // Red added onto the blue it was cleared to
- *
+ * gpuSetBlendState(cmd, additive); // The draws that follow add onto what is there
+ * gpuFreeCommandBuffer(cmd);
  * gpuFreeBlendState(queue, additive);
- * gpuFreePipeline(queue, pipeline);
- * gpuFree(queue, pixels);
- * gpuFree(queue, indices);
- * gpuFree(queue, memory);
  * @endcode
  *
  * @note On WebGPU the blend state is part of the pipeline, so the next draw may compile a new variant of the bound one.
@@ -653,39 +589,16 @@ void gpuSetBlendState(GpuCommandBuffer* cmd, const GpuBlendState* state);
  * gpuSetViewportEXT – Set the viewport transform used to map clip-space coordinates onto the render target.
  *
  * @code{.cpp}
- * auto shader = string_to_bytes(R"slang(
- * 	import noapi;
- * 	[shader("vertex")] float4 vertexMain(uint index : SV_VertexID) : SV_Position { return float4(float2((index << 1) & 2, index & 2) * 2 - 1, 0, 1); }
- * 	[shader("fragment")] float4 fragmentMain() : SV_Target { return float4(1, 1, 1, 1); }
- * )slang");
- * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
+ * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_COLOR_ATTACHMENT};
  * auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
- * auto texture = gpuCreateTexture(queue, desc, memory);
- * GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
- * auto pipeline = gpuCreateGraphicsPipeline(queue, shader, shader, {.colorTargets = {&target, 1}});
- * auto indices = gpuMalloc<uint32_t>(queue, 3);
- * for(uint32_t i = 0; i < 3; ++i) indices[i] = i;
- * auto indices_gpu = gpuHostToDevicePointer(queue, indices);
- * auto pixels = gpuMalloc<uint32_t>(queue, 64 * 64, MEMORY_READBACK);
- * auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
+ * GpuColorAttachment attachment = {.texture = gpuCreateTexture(queue, desc, memory), .loadOp = LOAD_OP_CLEAR};
  *
- * GpuColorAttachment attachment = {.texture = texture, .loadOp = LOAD_OP_CLEAR};
  * auto cmd = gpuStartCommandRecording(queue);
- * gpuSyncMemoryEXT(cmd, indices_gpu);
  * gpuBeginRenderPass(cmd, {.colorAttachments = {&attachment, 1}});
- * gpuSetViewportEXT(cmd, {32, 64}); // The left half
- * gpuSetPipeline(cmd, pipeline);
- * gpuDrawIndexedInstanced(cmd, indices_gpu, indices_gpu, indices_gpu, 3, 1);
+ * gpuSetViewportEXT(cmd, {32, 64}); // The draws that follow land in the left half
  * gpuEndRenderPass(cmd);
- * gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
- * gpuCopyFromTexture(cmd, pixels_gpu, memory, texture);
- * gpuSyncMemoryEXT(cmd, pixels_gpu);
  * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * assert(pixels[0] == 0xffffffff && pixels[63] == 0xff000000);
  *
- * gpuFreePipeline(queue, pipeline);
- * gpuFree(queue, pixels);
- * gpuFree(queue, indices);
  * gpuFree(queue, memory);
  * @endcode
  *
@@ -703,39 +616,16 @@ void gpuSetViewportEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin NOAPI_D
  * gpuSetScissorRectEXT – Set the scissor rectangle that clips rasterizer output.
  *
  * @code{.cpp}
- * auto shader = string_to_bytes(R"slang(
- * 	import noapi;
- * 	[shader("vertex")] float4 vertexMain(uint index : SV_VertexID) : SV_Position { return float4(float2((index << 1) & 2, index & 2) * 2 - 1, 0, 1); }
- * 	[shader("fragment")] float4 fragmentMain() : SV_Target { return float4(1, 1, 1, 1); }
- * )slang");
- * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
+ * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_COLOR_ATTACHMENT};
  * auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
- * auto texture = gpuCreateTexture(queue, desc, memory);
- * GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
- * auto pipeline = gpuCreateGraphicsPipeline(queue, shader, shader, {.colorTargets = {&target, 1}});
- * auto indices = gpuMalloc<uint32_t>(queue, 3);
- * for(uint32_t i = 0; i < 3; ++i) indices[i] = i;
- * auto indices_gpu = gpuHostToDevicePointer(queue, indices);
- * auto pixels = gpuMalloc<uint32_t>(queue, 64 * 64, MEMORY_READBACK);
- * auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
+ * GpuColorAttachment attachment = {.texture = gpuCreateTexture(queue, desc, memory), .loadOp = LOAD_OP_CLEAR};
  *
- * GpuColorAttachment attachment = {.texture = texture, .loadOp = LOAD_OP_CLEAR};
  * auto cmd = gpuStartCommandRecording(queue);
- * gpuSyncMemoryEXT(cmd, indices_gpu);
  * gpuBeginRenderPass(cmd, {.colorAttachments = {&attachment, 1}});
- * gpuSetScissorRectEXT(cmd, {32, 64}, {32, 0}); // Only the right half is drawn
- * gpuSetPipeline(cmd, pipeline);
- * gpuDrawIndexedInstanced(cmd, indices_gpu, indices_gpu, indices_gpu, 3, 1);
+ * gpuSetScissorRectEXT(cmd, {32, 64}, {32, 0}); // The draws that follow are clipped to the right half
  * gpuEndRenderPass(cmd);
- * gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
- * gpuCopyFromTexture(cmd, pixels_gpu, memory, texture);
- * gpuSyncMemoryEXT(cmd, pixels_gpu);
  * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * assert(pixels[0] == 0xff000000 && pixels[63] == 0xffffffff);
  *
- * gpuFreePipeline(queue, pipeline);
- * gpuFree(queue, pixels);
- * gpuFree(queue, indices);
  * gpuFree(queue, memory);
  * @endcode
  *
@@ -759,26 +649,16 @@ void gpuSetScissorRectEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin NOAP
  * Does NOT insert an automatic barrier before the pass. If a previous pass wrote to any of these targets via compute shaders, the user must call gpuBarrier with appropriate HAZARD_DEPTH_STENCIL or HAZARD_DESCRIPTORS flags beforehand.
  *
  * @code{.cpp}
- * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
+ * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_COLOR_ATTACHMENT};
  * auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
- * auto texture = gpuCreateTexture(queue, desc, memory);
- * auto pixels = gpuMalloc<uint32_t>(queue, 64 * 64, MEMORY_READBACK);
- * auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
+ * GpuColorAttachment red = {.texture = gpuCreateTexture(queue, desc, memory), .loadOp = LOAD_OP_CLEAR, .clearValue = {1, 0, 0, 1}};
  *
- * GpuColorAttachment clear = {.texture = texture, .loadOp = LOAD_OP_CLEAR, .clearValue = {1, 0, 0, 1}};
- * GpuColorAttachment keep = {.texture = texture, .loadOp = LOAD_OP_LOAD};
  * auto cmd = gpuStartCommandRecording(queue);
- * gpuBeginRenderPass(cmd, {.colorAttachments = {&clear, 1}});
+ * gpuBeginRenderPass(cmd, {.colorAttachments = {&red, 1}});
+ * // ... draws ...
  * gpuEndRenderPass(cmd);
- * gpuBeginRenderPass(cmd, {.colorAttachments = {&keep, 1}}); // Picks up where the last pass left off
- * gpuEndRenderPass(cmd);
- * gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
- * gpuCopyFromTexture(cmd, pixels_gpu, memory, texture);
- * gpuSyncMemoryEXT(cmd, pixels_gpu);
  * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * assert(pixels[0] == 0xff0000ff);
  *
- * gpuFree(queue, pixels);
  * gpuFree(queue, memory);
  * @endcode
  *
@@ -824,41 +704,33 @@ void gpuEndRenderPass(GpuCommandBuffer* cmd, GpuOptionalRenderPassDesc desc NOAP
  * @code{.cpp}
  * auto shader = string_to_bytes(R"slang(
  * 	import noapi;
+ * 	// One triangle that covers the whole target
  * 	[shader("vertex")] float4 vertexMain(uint index : SV_VertexID) : SV_Position { return float4(float2((index << 1) & 2, index & 2) * 2 - 1, 0, 1); }
  * 	[shader("fragment")] float4 fragmentMain() : SV_Target { return gpuFragmentData<float4>()[0]; }
  * )slang");
- * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
- * auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
- * auto texture = gpuCreateTexture(queue, desc, memory);
  * GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
  * auto pipeline = gpuCreateGraphicsPipeline(queue, shader, shader, {.colorTargets = {&target, 1}});
+ * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_COLOR_ATTACHMENT};
+ * auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
+ * GpuColorAttachment attachment = {.texture = gpuCreateTexture(queue, desc, memory), .loadOp = LOAD_OP_CLEAR};
  *
- * struct Color { float r, g, b, a; };
- * auto color = gpuMalloc<Color>(queue);
- * *color = {1, 0, 1, 1};
- * auto indices = gpuMalloc<uint16_t>(queue, 4);
- * for(uint16_t i = 0; i < 3; ++i) indices[i] = i;
+ * auto color = gpuMalloc<float>(queue, 4);
+ * color[0] = 1, color[1] = 0, color[2] = 1, color[3] = 1;
+ * auto indices = gpuMalloc<uint32_t>(queue, 3);
+ * indices[0] = 0, indices[1] = 1, indices[2] = 2;
  * auto color_gpu = gpuHostToDevicePointer(queue, color);
  * auto indices_gpu = gpuHostToDevicePointer(queue, indices);
- * auto pixels = gpuMalloc<uint32_t>(queue, 64 * 64, MEMORY_READBACK);
- * auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
  *
- * GpuColorAttachment attachment = {.texture = texture, .loadOp = LOAD_OP_CLEAR};
  * auto cmd = gpuStartCommandRecording(queue);
  * gpuSyncMemoryEXT(cmd, color_gpu);
  * gpuSyncMemoryEXT(cmd, indices_gpu);
  * gpuBeginRenderPass(cmd, {.colorAttachments = {&attachment, 1}});
  * gpuSetPipeline(cmd, pipeline);
- * gpuDrawIndexedInstanced(cmd, color_gpu, color_gpu, indices_gpu, 3, 1, INDEX_TYPE_UINT16);
+ * gpuDrawIndexedInstanced(cmd, color_gpu, color_gpu, indices_gpu, 3, 1); // The fragment shader reads the color
  * gpuEndRenderPass(cmd);
- * gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
- * gpuCopyFromTexture(cmd, pixels_gpu, memory, texture);
- * gpuSyncMemoryEXT(cmd, pixels_gpu);
  * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * assert(pixels[0] == 0xffff00ff);
  *
  * gpuFreePipeline(queue, pipeline);
- * gpuFree(queue, pixels);
  * gpuFree(queue, indices);
  * gpuFree(queue, color);
  * gpuFree(queue, memory);
@@ -885,41 +757,34 @@ void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd,
  * @code{.cpp}
  * auto shader = string_to_bytes(R"slang(
  * 	import noapi;
+ * 	// One triangle that covers the whole target
  * 	[shader("vertex")] float4 vertexMain(uint index : SV_VertexID) : SV_Position { return float4(float2((index << 1) & 2, index & 2) * 2 - 1, 0, 1); }
  * 	[shader("fragment")] float4 fragmentMain() : SV_Target { return float4(0, 0, 1, 1); }
  * )slang");
- * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
- * auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
- * auto texture = gpuCreateTexture(queue, desc, memory);
  * GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
  * auto pipeline = gpuCreateGraphicsPipeline(queue, shader, shader, {.colorTargets = {&target, 1}});
+ * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_COLOR_ATTACHMENT};
+ * auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
+ * GpuColorAttachment attachment = {.texture = gpuCreateTexture(queue, desc, memory), .loadOp = LOAD_OP_CLEAR};
  *
  * struct DrawArguments { uint32_t index_count, instance_count, first_index; int32_t vertex_offset; uint32_t first_instance; };
  * auto arguments = gpuMalloc<DrawArguments>(queue);
- * *arguments = {3, 1, 0, 0, 0};
+ * *arguments = {3, 1, 0, 0, 0}; // Usually written by a culling shader instead
  * auto indices = gpuMalloc<uint32_t>(queue, 3);
- * for(uint32_t i = 0; i < 3; ++i) indices[i] = i;
+ * indices[0] = 0, indices[1] = 1, indices[2] = 2;
  * auto arguments_gpu = gpuHostToDevicePointer(queue, arguments);
  * auto indices_gpu = gpuHostToDevicePointer(queue, indices);
- * auto pixels = gpuMalloc<uint32_t>(queue, 64 * 64, MEMORY_READBACK);
- * auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
  *
- * GpuColorAttachment attachment = {.texture = texture, .loadOp = LOAD_OP_CLEAR};
  * auto cmd = gpuStartCommandRecording(queue);
  * gpuSyncMemoryEXT(cmd, arguments_gpu);
  * gpuSyncMemoryEXT(cmd, indices_gpu);
  * gpuBeginRenderPass(cmd, {.colorAttachments = {&attachment, 1}});
  * gpuSetPipeline(cmd, pipeline);
- * gpuDrawIndexedInstancedIndirect(cmd, indices_gpu, indices_gpu, indices_gpu, arguments_gpu);
+ * gpuDrawIndexedInstancedIndirect(cmd, indices_gpu, indices_gpu, indices_gpu, arguments_gpu); // The shaders read no root data
  * gpuEndRenderPass(cmd);
- * gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
- * gpuCopyFromTexture(cmd, pixels_gpu, memory, texture);
- * gpuSyncMemoryEXT(cmd, pixels_gpu);
  * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * assert(pixels[0] == 0xffff0000);
  *
  * gpuFreePipeline(queue, pipeline);
- * gpuFree(queue, pixels);
  * gpuFree(queue, indices);
  * gpuFree(queue, arguments);
  * gpuFree(queue, memory);
@@ -958,27 +823,19 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd,
  * )slang");
  * GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
  * auto pipeline = gpuCreateGraphicsMeshletPipeline(queue, shader, shader, {.colorTargets = {&target, 1}});
- * if(pipeline) {
- * 	GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
+ * if(pipeline) { // Only where gpuGetCapabilitiesEXT(queue).mesh_shaders is true
+ * 	GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_COLOR_ATTACHMENT};
  * 	auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
- * 	auto texture = gpuCreateTexture(queue, desc, memory);
- * 	auto pixels = gpuMalloc<uint32_t>(queue, 64 * 64, MEMORY_READBACK);
- * 	auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
+ * 	GpuColorAttachment attachment = {.texture = gpuCreateTexture(queue, desc, memory), .loadOp = LOAD_OP_CLEAR};
  *
- * 	GpuColorAttachment attachment = {.texture = texture, .loadOp = LOAD_OP_CLEAR};
  * 	auto cmd = gpuStartCommandRecording(queue);
  * 	gpuBeginRenderPass(cmd, {.colorAttachments = {&attachment, 1}});
  * 	gpuSetPipeline(cmd, pipeline);
- * 	gpuDrawMeshlets(cmd, pixels_gpu, pixels_gpu, {1, 1, 1});
+ * 	gpuDrawMeshlets(cmd, nullptr, nullptr, {1, 1, 1}); // One meshlet, whose shaders read no root data
  * 	gpuEndRenderPass(cmd);
- * 	gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
- * 	gpuCopyFromTexture(cmd, pixels_gpu, memory, texture);
- * 	gpuSyncMemoryEXT(cmd, pixels_gpu);
  * 	gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * 	assert(pixels[0] == 0xffffffff);
  *
  * 	gpuFreePipeline(queue, pipeline);
- * 	gpuFree(queue, pixels);
  * 	gpuFree(queue, memory);
  * }
  * @endcode
@@ -1011,31 +868,23 @@ void gpuDrawMeshlets(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_dat
  * )slang");
  * GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
  * auto pipeline = gpuCreateGraphicsMeshletPipeline(queue, shader, shader, {.colorTargets = {&target, 1}});
- * if(pipeline) {
- * 	GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
+ * if(pipeline) { // Only where gpuGetCapabilitiesEXT(queue).mesh_shaders is true
+ * 	GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_COLOR_ATTACHMENT};
  * 	auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
- * 	auto texture = gpuCreateTexture(queue, desc, memory);
+ * 	GpuColorAttachment attachment = {.texture = gpuCreateTexture(queue, desc, memory), .loadOp = LOAD_OP_CLEAR};
  * 	auto grid = gpuMalloc<uvec3>(queue);
- * 	*grid = {1, 1, 1};
+ * 	*grid = {1, 1, 1}; // Usually written by a culling shader instead
  * 	auto grid_gpu = gpuHostToDevicePointer(queue, grid);
- * 	auto pixels = gpuMalloc<uint32_t>(queue, 64 * 64, MEMORY_READBACK);
- * 	auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
  *
- * 	GpuColorAttachment attachment = {.texture = texture, .loadOp = LOAD_OP_CLEAR};
  * 	auto cmd = gpuStartCommandRecording(queue);
  * 	gpuSyncMemoryEXT(cmd, grid_gpu);
  * 	gpuBeginRenderPass(cmd, {.colorAttachments = {&attachment, 1}});
  * 	gpuSetPipeline(cmd, pipeline);
- * 	gpuDrawMeshletsIndirect(cmd, grid_gpu, grid_gpu, grid_gpu);
+ * 	gpuDrawMeshletsIndirect(cmd, nullptr, nullptr, grid_gpu); // The shaders read no root data
  * 	gpuEndRenderPass(cmd);
- * 	gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
- * 	gpuCopyFromTexture(cmd, pixels_gpu, memory, texture);
- * 	gpuSyncMemoryEXT(cmd, pixels_gpu);
  * 	gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * 	assert(pixels[0] == 0xffffffff);
  *
  * 	gpuFreePipeline(queue, pipeline);
- * 	gpuFree(queue, pixels);
  * 	gpuFree(queue, grid);
  * 	gpuFree(queue, memory);
  * }

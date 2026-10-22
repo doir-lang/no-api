@@ -46,10 +46,11 @@
   ```
 
 - An example is the body of a function that is handed a headless `GpuQueue* queue`, and the backend objects it was created from as `backend` (a `GpuVulkanDefault` or `GpuWebGPUDefault`); it frees whatever it creates, and checks results with `assert`.
-  There is no surface, so an example that draws renders into a texture it creates.
+  `backend.surface` is a headless surface on Vulkan where the driver offers `VK_EXT_headless_surface`, and on WebGPU one for a hidden window where there is a display; otherwise there is none, so an example that draws renders into a texture it creates and a surface example handles a NULL surface.
 - A plain `@code` block must compile as both C and C++; mark one that uses C++ only API (templates, overloads, `string_to_bytes`, `auto`) as `@code{.cpp}`.
   An example in a backend's `noapi.h` / `noapi.hpp` is only compiled against that backend.
 - Keep examples short, and make them correct against the current API: they must compile and pass on both backends.
+  An example shows the typical call, once; it does not loop over every enumerator, read results back to check them, or exercise failure cases. Those are tests and belong in `doctests/tests.cpp`.
   Check them with `python3 tools/doctest.py build build-vk`, which builds and runs every example in each build directory and reports public definitions missing documentation or an example (`--check` reports without building).
 - When the two backends behave differently (for example `gpuSyncMemoryEXT` being a no-op except on WebGPU), say so in the documentation.
 - A documentation comment is not a free-standing comment, so the 25-word cap does not apply to it, but keep it as brief as the definition allows.
@@ -90,11 +91,11 @@
 
 ## Tests
 
-- The header examples are the unit tests.
-  A change to a function's behaviour comes with an example, or a change to its existing one, that shows it.
-- `doctests/` holds the harness that runs them: a headless device, and an `assert` that fails one example without stopping the rest.
+- The header examples and `doctests/tests.cpp` are the unit tests: the examples cover the typical use of each definition, and `tests.cpp` covers edge cases, failure modes and exhaustive checks.
+  A change to a function's behaviour comes with a test that shows it, and with a change to its example if the typical use changes.
+- `doctests/` holds the harness that runs them both: a headless device, and an `assert` that fails one test case without stopping the rest.
   Do not edit the generated sources in the build directory; edit the header.
-- `python3 tools/coverage.py [-v] [vulkan] [webgpu]` builds an instrumented copy of each backend, runs the examples, and reports per-file line coverage (`-v` lists the uncovered lines).
+- `python3 tools/coverage.py [-v] [--doctests-only] [vulkan] [webgpu]` builds an instrumented copy of each backend, runs the header examples and then each program in `examples/` for a fixed number of frames, and reports per-file line coverage (`-v` lists the uncovered lines).
   Use it to find backend code no example reaches.
 - The programs in `examples/` are standalone samples that open a window; they assert on results and should run cleanly on both backends.
   Prefer extending an existing one over adding a new program; add one only when no existing program fits, and list it in the README's Examples table.

@@ -100,7 +100,8 @@ option(NOAPI_ENABLE_COVERAGE "Instrument the backends for gcov line coverage" OF
 if(NOAPI_ENABLE_COVERAGE)
 	foreach(backend noapi-vulkan noapi-webgpu)
 		if(TARGET ${backend})
-			target_compile_options(${backend} PRIVATE --coverage -O0)
+			# Nothing in the backends throws, and without unwinding paths gcov stops reporting cleanup-only blocks as unexecuted lines.
+			target_compile_options(${backend} PRIVATE --coverage -O0 -fno-exceptions)
 			target_link_options(${backend} PUBLIC --coverage)
 		endif()
 	endforeach()
@@ -210,6 +211,10 @@ else()
 		# libslang-glslang.so ready built, so NOAPI_SLANG_ROOT does not have this problem -- which
 		# is the reason to prefer it for anything but a source build.
 		set(SLANG_ENABLE_SLANG_GLSLANG OFF CACHE BOOL "" FORCE)
+		# Emscripten makes a shared library a side module the page fetches at runtime, which nothing deploys beside it
+		if(EMSCRIPTEN)
+			set(SLANG_LIB_TYPE STATIC CACHE STRING "" FORCE)
+		endif()
 		add_subdirectory(external/slang EXCLUDE_FROM_ALL)
 	endif()
 

@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -272,6 +273,10 @@ struct App {
 	FORMAT depth_format = FORMAT_NONE;
 	Texture depth = {};
 
+	// Above 1, frames render into a multisampled `color` that color_attachment resolves into the surface texture
+	uint32_t sample_count = 1;
+	Texture color = {};
+
 	float aspect() const { return height ? float(width) / float(height) : 1.0f; }
 };
 
@@ -328,26 +333,48 @@ inline void create_device(App& app) {
 	std::println("{}: {}x{}, surface format {}", backend_name, app.width, app.height, (int)app.surface_format);
 }
 
+// The color attachment for a frame: the surface texture itself, or the multisampled target resolving into it.
+inline GpuColorAttachment color_attachment(const App& app, const GpuTexture* backbuffer, LOAD_OP load = LOAD_OP_CLEAR, ClearColor clear = {}) {
+	if(app.sample_count == 1) return {.texture = backbuffer, .loadOp = load, .clearValue = clear};
+	return {.texture = app.color.texture, .resolveTexture = backbuffer, .loadOp = load, .storeOp = STORE_OP_DONT_CARE, .clearValue = clear};
+}
+
 namespace detail {
+	// Recreates `target` at the window's size, if it is needed and isn't that size already.
+	inline void resize_target(App& app, Texture& target, bool needed, FORMAT format, TEXTURE_USAGE_FLAGS usage) {
+		bool current = target.texture && target.desc.dimensions.x == app.width && target.desc.dimensions.y == app.height;
+		if(!needed || current) return;
+
+		if(target.texture) {
+			gpuWaitIdleEXT(app.queue);
+			gpuFree(app.queue, target.memory);
+		}
+		target = create_texture(app.queue, GpuTextureDesc{
+			.dimensions = {app.width, app.height, 1},
+			.sampleCount = app.sample_count,
+			.format = format,
+			.usage = usage,
+		});
+	}
+
 	inline void resize(App& app) {
 		auto desc = gpuSurfaceGetConfigurationEXT(app.surface);
 		desc.texture.dimensions = {app.width, app.height, 1};
 		gpuSurfaceReconfigureEXT(app.queue, app.surface, desc);
 
-		if(app.depth_format == FORMAT_NONE) return;
-		if(app.depth.texture && app.depth.desc.dimensions.x == app.width && app.depth.desc.dimensions.y == app.height)
-			return;
+		resize_target(app, app.depth, app.depth_format != FORMAT_NONE, app.depth_format, USAGE_DEPTH_STENCIL_ATTACHMENT);
+		resize_target(app, app.color, app.sample_count > 1, app.surface_format, USAGE_COLOR_ATTACHMENT);
+	}
 
-		if(app.depth.texture) {
-			gpuWaitIdleEXT(app.queue);
-			gpuFree(app.queue, app.depth.memory);
-		}
-
-		app.depth = create_texture(app.queue, GpuTextureDesc{
-			.dimensions = {app.width, app.height, 1},
-			.format = app.depth_format,
-			.usage = USAGE_DEPTH_STENCIL_ATTACHMENT,
-		});
+	// Moves to the next present mode the surface supports, wrapping around
+	inline void cycle_present_mode(App& app) {
+		auto caps = gpuGetSurfaceCapabilitiesEXT(app.queue, app.surface);
+		auto modes = std::span(caps.presentModes, caps.presentModeCount);
+		auto desc = gpuSurfaceGetConfigurationEXT(app.surface);
+		auto current = std::ranges::find(modes, desc.presentMode);
+		desc.presentMode = current == modes.end() || current + 1 == modes.end() ? modes.front() : *(current + 1);
+		gpuSurfaceReconfigureEXT(app.queue, app.surface, desc);
+		std::println("present mode {}", (int)gpuSurfaceGetConfigurationEXT(app.surface).presentMode);
 	}
 
 	using FrameFn = std::function_ref<void(App&, GpuCommandBuffer*, const GpuTexture*)>;
@@ -356,7 +383,8 @@ namespace detail {
 		if(app.width == 0 || app.height == 0) return;
 
 		auto configured = gpuSurfaceGetConfigurationEXT(app.surface).texture.dimensions;
-		if(configured.x != app.width || configured.y != app.height || (app.depth_format != FORMAT_NONE && !app.depth.texture))
+		bool missing = (app.depth_format != FORMAT_NONE && !app.depth.texture) || (app.sample_count > 1 && !app.color.texture);
+		if(configured.x != app.width || configured.y != app.height || missing)
 			resize(app);
 
 		auto target = gpuSurfaceNextTextureEXT(app.queue, app.surface);
@@ -384,8 +412,19 @@ inline void run(App& app, detail::FrameFn draw, const std::function_ref<void(App
 		detail::frame(*detail::loop_app, detail::loop_draw);
 	}, 0, true);
 #else
-	while(!glfwWindowShouldClose(app.window)) {
+	// tools/coverage.py sets NOAPI_EXAMPLE_FRAMES so each example renders that many frames and exits; on the way it resizes and presses V, as a user would
+	const char* frame_limit = std::getenv("NOAPI_EXAMPLE_FRAMES");
+	long limit = frame_limit ? std::atol(frame_limit) : 0;
+	bool v_held = false;
+	std::println("controls: V cycles the present mode");
+	for(long frames = 0; !glfwWindowShouldClose(app.window) && (!limit || frames < limit); ++frames) {
 		glfwPollEvents();
+		if(limit && frames == limit / 3) glfwSetWindowSize(app.window, 960, 540);
+
+		bool v_down = glfwGetKey(app.window, GLFW_KEY_V) == GLFW_PRESS;
+		if((v_down && !v_held) || (limit && frames == limit * 2 / 3)) detail::cycle_present_mode(app);
+		v_held = v_down;
+
 		detail::frame(app, draw);
 	}
 
@@ -393,6 +432,7 @@ inline void run(App& app, detail::FrameFn draw, const std::function_ref<void(App
 	teardown(app);
 
 	if(app.depth.texture) gpuFree(app.queue, app.depth.memory);
+	if(app.color.texture) gpuFree(app.queue, app.color.memory);
 	gpuFreeSurfaceEXT(app.queue, app.surface);
 	gpuFreeQueue(app.queue);
 	shutdown_backend(app.backend);

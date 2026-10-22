@@ -137,7 +137,14 @@ typedef enum OP {
 } OP;
 
 /**
- * TEXTURE – Texture dimensionality / view type.
+ * TEXTURE – Texture dimensionality / view type. A cube has six layers per cube, so TEXTURE_CUBE takes a layerCount of 6 and TEXTURE_CUBE_ARRAY a multiple of 6.
+ *
+ * @code{.cpp}
+ * GpuTextureDesc desc = {.type = TEXTURE_CUBE, .dimensions = {16, 16, 1}, .layerCount = 6, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_SAMPLED};
+ * auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
+ * assert(gpuCreateTexture(queue, desc, memory));
+ * gpuFree(queue, memory);
+ * @endcode
  */
 typedef enum TEXTURE {
 	TEXTURE_1D, ///< Not supported on WebGPU.
@@ -151,7 +158,16 @@ typedef enum TEXTURE {
 /**
  * FORMAT – Pixel / texel formats. The set is the one WebGPU names, since that is the narrowest of the backends; every entry has a Vulkan equivalent. FORMAT_NONE is used to indicate "no attachment" (e.g. no depth buffer).
  *
- * The entries marked EXT ride on an optional WebGPU feature, so a device is free to reject them: the 16 bit unorm/snorm ones need `texture-formats-tier1` and FORMAT_D32_FLOAT_S8_UINT needs `depth32float-stencil8`.
+ * The entries marked EXT ride on an optional WebGPU feature, so a device is free to reject them: the 16 bit unorm/snorm ones need `texture-formats-tier1` and FORMAT_D32_FLOAT_S8_UINT needs `depth32float-stencil8`. A Vulkan device may lack some too (FORMAT_D24_PLUS is optional there). gpuTextureSizeAlign reports a size of 0 for a format the device can't make.
+ *
+ * @code
+ * GpuTextureDesc desc = GPU_TEXTURE_DESC_DEFAULT;
+ * desc.dimensions.x = desc.dimensions.y = 64;
+ * desc.format = FORMAT_R16_UNORM;
+ * desc.usage = USAGE_SAMPLED;
+ * if(gpuTextureSizeAlign(queue, NOAPI_REF(desc)).size == 0) desc.format = FORMAT_R16_FLOAT; // An optional format this device lacks
+ * assert(gpuTextureSizeAlign(queue, NOAPI_REF(desc)).size > 0);
+ * @endcode
  */
 typedef enum FORMAT {
 	FORMAT_NONE,
@@ -332,6 +348,29 @@ NOAPI_INLINE bool gpuFormatIsFilterableEXT(FORMAT format) {
 	}
 }
 
+/**
+ * gpuFormatIsStorableEXT – Returns true if a texture of `format` can be created with USAGE_STORAGE and written by gpuStoreTexture. The store takes a float4, which only float, unorm and snorm formats accept, and WGSL names storage for just these of them.
+ *
+ * @code
+ * assert(gpuFormatIsStorableEXT(FORMAT_RGBA16_FLOAT));
+ * assert(!gpuFormatIsStorableEXT(FORMAT_R32_UINT));
+ * @endcode
+ *
+ * @param format Format to test.
+ */
+NOAPI_INLINE bool gpuFormatIsStorableEXT(FORMAT format) {
+	switch (format) {
+	case FORMAT_R32_FLOAT:
+	case FORMAT_RG32_FLOAT:
+	case FORMAT_RGBA8_UNORM:
+	case FORMAT_RGBA8_SNORM:
+	case FORMAT_RGBA16_FLOAT:
+	case FORMAT_RGBA32_FLOAT:
+		return true;
+	default: return false;
+	}
+}
+
 NOAPI_EXTERN_C_END
 
 /**
@@ -339,7 +378,7 @@ NOAPI_EXTERN_C_END
  */
 typedef enum TEXTURE_USAGE_FLAGS {
 	USAGE_SAMPLED = 0x01, ///< Readable by texture samplers.
-	USAGE_STORAGE = 0x02, ///< Read/write access from compute shaders.
+	USAGE_STORAGE = 0x02, ///< Read/write access from compute shaders. Only for formats gpuFormatIsStorableEXT accepts.
 	USAGE_COLOR_ATTACHMENT = 0x04, ///< Rasterizer color render target.
 	USAGE_DEPTH_STENCIL_ATTACHMENT = 0x08, ///< Rasterizer depth/stencil target.
 	USAGE_TRANSFER_SRC = 0x10, ///< Source of copy operations.
@@ -473,13 +512,13 @@ NOAPI_EXTERN_C_BEGIN
 // gpuCreateQueue is declared by each backend (vulkan/noapi.h, webgpu/noapi.h), since what it is built from is the backend's own device.
 
 /**
- * gpuFreeQueue – Destroy every object the queue allocated internally. Free everything created from the queue (memory, textures, pipelines, semaphores, surfaces) before calling it.
+ * gpuFreeQueue – Destroy every object the queue allocated internally. Memory still allocated from it is freed with it, along with the textures created on that memory; free everything else created from the queue (pipelines, state objects, semaphores, surfaces) before calling it.
  *
  * @code{.cpp}
  * GpuQueue* second = gpuCreateQueue(backend);
  * assert(second);
  * void* memory = gpuMalloc(second, 64);
- * gpuFree(second, memory);
+ * assert(memory); // Freed along with the queue
  * gpuFreeQueue(second);
  * @endcode
  *
@@ -507,7 +546,12 @@ typedef struct GpuCapabilities {
 	bool mesh_shaders;
 
 	/**
-	 * gpuSignalAfter writes the counter it is given, so a shader or the CPU can read it back. When false the call does nothing and the counter never changes.
+	 * A pipeline can be created with GpuRasterDesc::supportDualSourceBlending, so its fragment shader's second output can feed the FACTOR_SRC1_* blend factors. Needs Vulkan's dualSrcBlend feature or WebGPU's `dual-source-blending`; where it is false such a pipeline is reported unsupported and not created.
+	 */
+	bool dual_source_blending;
+
+	/**
+	 * gpuSignalAfter can apply SIGNAL_ATOMIC_MAX and SIGNAL_ATOMIC_OR, which need 64 bit buffer atomics. When false those two report themselves unsupported and leave the counter alone; SIGNAL_ATOMIC_SET writes it either way.
 	 */
 	bool split_barrier_signals;
 
@@ -711,7 +755,6 @@ NOAPI_EXTERN_C_END
  * auto values = gpuMalloc<float>(queue, 4);
  * gpu* device = gpuHostToDevicePointer(queue, values);
  * gpuFree(queue, device);
- * assert(!gpuHostToDevicePointer(queue, values));
  * @endcode
  *
  * @param queue The GPU queue (device) the memory was allocated on.
@@ -779,6 +822,8 @@ void* gpuDeviceToHostPointerEXT(GpuQueue* queue, gpu* ptr);
  * gpuFree(queue, memory);
  * @endcode
  *
+ * @note A USAGE_STORAGE texture has to be in a format gpuFormatIsStorableEXT accepts. WebGPU also has no 1D textures and offers only 1 and 4 samples. For anything else this reports a size of 0.
+ *
  * @param queue The GPU queue (device) on which the texture will be created.
  * @param desc Texture description used to determine size.
  * @return The size and alignment, or a size of 0 if the device cannot create such a texture, with errno set.
@@ -795,12 +840,11 @@ GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue* queue, NOAPI_CONST_REF(GpuText
  * auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
  * GpuTexture* texture = gpuCreateTexture(queue, desc, memory);
  * assert(texture);
- * assert(!gpuCreateTexture(queue, desc, memory)); // One texture per allocation
  * gpuFree(queue, memory); // Frees the texture with it
  * @endcode
  *
  * @note Only a single texture can be created on each allocation, and the texture is freed by freeing that memory.
- * @note On WebGPU a texture created with USAGE_SAMPLED must have a format gpuFormatIsFilterableEXT accepts; any other is reported as unsupported and not created.
+ * @note A description gpuTextureSizeAlign gives a size of 0 for is not created. On WebGPU a texture created with USAGE_SAMPLED must also have a format gpuFormatIsFilterableEXT accepts; any other is reported as unsupported and not created.
  *
  * @param queue The GPU queue (device) on which the texture will be created.
  * @param desc Texture description matching the one passed to gpuTextureSizeAlign.
@@ -840,34 +884,11 @@ GpuTextureDescriptor gpuTextureViewDescriptor(GpuQueue* queue, const GpuTexture*
  * Only a single mip level can be bound as an RW target at once. Usage flag USAGE_STORAGE must have been specified at texture creation time.
  *
  * @code{.cpp}
- * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_STORAGE | USAGE_TRANSFER_SRC)};
+ * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_STORAGE};
  * auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
  * auto texture = gpuCreateTexture(queue, desc, memory);
  * auto heap = gpuMalloc<GpuTextureDescriptor>(queue, 1, MEMORY_DESCRIPTOR_HEAP);
- * heap[0] = gpuRWTextureViewDescriptor(queue, texture, {});
- * auto heap_gpu = gpuHostToDevicePointer(queue, heap);
- *
- * auto pipeline = gpuCreateComputePipeline(queue, string_to_bytes(R"slang(
- * 	import noapi;
- * 	[shader("compute")] [numthreads(8, 8, 1)]
- * 	void main(uint3 thread : SV_DispatchThreadID) { gpuStoreTexture2D(0, thread.xy, float4(0, 0, 1, 1)); }
- * )slang"));
- * auto pixels = gpuMalloc<uint32_t>(queue, 64 * 64, MEMORY_READBACK);
- * auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
- *
- * auto cmd = gpuStartCommandRecording(queue);
- * gpuSyncMemoryEXT(cmd, heap_gpu);
- * gpuSetActiveTextureHeapPtr(cmd, heap_gpu);
- * gpuSetPipeline(cmd, pipeline);
- * gpuDispatch(cmd, heap_gpu, {8, 8, 1});
- * gpuBarrier(cmd, STAGE_COMPUTE, STAGE_TRANSFER);
- * gpuCopyFromTexture(cmd, pixels_gpu, memory, texture);
- * gpuSyncMemoryEXT(cmd, pixels_gpu);
- * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * assert(pixels[64 * 64 - 1] == 0xffff0000); // Opaque blue, as RGBA bytes
- *
- * gpuFreePipeline(queue, pipeline);
- * gpuFree(queue, pixels);
+ * heap[0] = gpuRWTextureViewDescriptor(queue, texture, {}); // Written by shaders with gpuStoreTexture2D(0, ...)
  * gpuFree(queue, heap);
  * gpuFree(queue, memory);
  * @endcode
@@ -895,7 +916,6 @@ GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuQueue* queue, const GpuTextur
  * 	void main(uint3 thread : SV_DispatchThreadID) { gpuComputeData<uint>()[thread.x] = 0; }
  * )slang"));
  * assert(pipeline);
- * assert(!gpuCreateComputePipeline(queue, string_to_bytes("not a shader"))); // Reported through the shader diagnostic callback
  * gpuFreePipeline(queue, pipeline);
  * @endcode
  *
@@ -1039,6 +1059,7 @@ GpuSemaphore* gpuCreateSemaphore(GpuQueue* queue, uint64_t initial_value);
  * GpuSemaphore* semaphore = gpuCreateSemaphore(queue, 3);
  * assert(gpuWaitSemaphore(queue, semaphore, 2, UINT64_MAX) == 2); // Already reached
  * assert(gpuWaitSemaphore(queue, semaphore, 4, 0) == 0); // Never signalled, so the wait times out
+ * assert(gpuWaitSemaphore(queue, semaphore, 4, 2000000) == 0); // Even given 2 ms
  * assert(gpuWaitSemaphore(queue, semaphore, GPU_GET_VALUE, UINT64_MAX) == 3);
  * gpuFreeSemaphore(queue, semaphore);
  * @endcode
@@ -1077,7 +1098,7 @@ void gpuFreeSemaphore(GpuQueue* queue, GpuSemaphore* semaphore);
  * @code
  * uint32_t* source = (uint32_t*)gpuMalloc(queue, 4 * sizeof(uint32_t), 16, MEMORY_DEFAULT);
  * uint32_t* destination = (uint32_t*)gpuMalloc(queue, 4 * sizeof(uint32_t), 16, MEMORY_READBACK);
- * for(uint32_t i = 0; i < 4; ++i) source[i] = i + 1;
+ * source[3] = 4;
  * gpu* source_gpu = gpuHostToDevicePointer(queue, source);
  * gpu* destination_gpu = gpuHostToDevicePointer(queue, destination);
  *
@@ -1086,8 +1107,7 @@ void gpuFreeSemaphore(GpuQueue* queue, GpuSemaphore* semaphore);
  * gpuMemCpy(cmd, destination_gpu, source_gpu, 4 * sizeof(uint32_t));
  * gpuSyncMemoryEXT(cmd, destination_gpu);
  * GpuCommandBufferSpan buffers = {&cmd, 1};
- * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, buffers, NULL, 0), UINT64_MAX);
- * assert(destination[3] == 4);
+ * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, buffers, NULL, 0), UINT64_MAX); // destination[3] is now 4
  *
  * gpuFree(queue, source);
  * gpuFree(queue, destination);
@@ -1108,30 +1128,23 @@ void gpuMemCpy(GpuCommandBuffer* cmd, gpu* dest, gpu* src, size_t bytes);
  * The staging data is the first mip level's texels in rows, tightly packed. The other mip levels are filled by rendering, or by gpuBlitTextureEXT from the level above.
  *
  * @code{.cpp}
- * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_R32_UINT, .usage = TEXTURE_USAGE_FLAGS(USAGE_TRANSFER_SRC | USAGE_TRANSFER_DST)};
+ * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_SAMPLED | USAGE_TRANSFER_DST)};
  * auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
  * auto texture = gpuCreateTexture(queue, desc, memory);
- * auto upload = gpuMalloc<uint32_t>(queue, 64 * 64);
- * auto download = gpuMalloc<uint32_t>(queue, 64 * 64, MEMORY_READBACK);
- * for(uint32_t i = 0; i < 64 * 64; ++i) upload[i] = i;
- * auto upload_gpu = gpuHostToDevicePointer(queue, upload);
- * auto download_gpu = gpuHostToDevicePointer(queue, download);
+ * auto texels = gpuMalloc<uint32_t>(queue, 64 * 64);
+ * for(uint32_t i = 0; i < 64 * 64; ++i) texels[i] = 0xff0000ff; // Opaque red, as RGBA bytes
+ * auto texels_gpu = gpuHostToDevicePointer(queue, texels);
  *
  * auto cmd = gpuStartCommandRecording(queue);
- * gpuSyncMemoryEXT(cmd, upload_gpu);
- * gpuCopyToTexture(cmd, memory, upload_gpu, texture);
- * gpuBarrier(cmd, STAGE_TRANSFER, STAGE_TRANSFER);
- * gpuCopyFromTexture(cmd, download_gpu, memory, texture);
- * gpuSyncMemoryEXT(cmd, download_gpu);
+ * gpuSyncMemoryEXT(cmd, texels_gpu);
+ * gpuCopyToTexture(cmd, memory, texels_gpu, texture);
  * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * assert(download[64 * 64 - 1] == 64 * 64 - 1);
  *
- * gpuFree(queue, upload);
- * gpuFree(queue, download);
+ * gpuFree(queue, texels);
  * gpuFree(queue, memory);
  * @endcode
  *
- * @note On WebGPU a row (width × texel size) must be a multiple of 256 bytes.
+ * @note Every array layer is copied, or the whole volume of a 3D texture, layer after layer in the staging data.
  *
  * @param cmd Command buffer to record into.
  * @param dest The texture's memory (from gpuMalloc with MEMORY_TEXTURE).
@@ -1160,14 +1173,13 @@ void gpuCopyToTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, GpuTexture* te
  * gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
  * gpuCopyFromTexture(cmd, pixels_gpu, memory, texture);
  * gpuSyncMemoryEXT(cmd, pixels_gpu);
- * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * assert(pixels[0] == 0xff00ff00); // Opaque green, as RGBA bytes
+ * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1})); // pixels now holds opaque green
  *
  * gpuFree(queue, pixels);
  * gpuFree(queue, memory);
  * @endcode
  *
- * @note On WebGPU a row (width × texel size) must be a multiple of 256 bytes.
+ * @note Depth reads back as the values the depth test compares, and a stencil as its bytes. A texture with both depth and stencil copies only its depth. WebGPU can't copy out of FORMAT_D24_PLUS or FORMAT_D24_PLUS_S8_UINT at all, since how many bits those hold is up to the implementation, and copies any other depth or stencil texture only whole, so there its rows have to be a multiple of 256 bytes; anything else is reported unsupported and not copied.
  *
  * @param cmd Command buffer to record into.
  * @param dest GPU address of a MEMORY_READBACK region (CPU can read after the submission has finished).
@@ -1188,32 +1200,22 @@ void gpuCopyFromTexture(GpuCommandBuffer* cmd, gpu* dest, gpu* src, const GpuTex
  * Does NOT insert an automatic barrier on either side. If the source was just written by a compute pass, or the destination is about to be sampled, call gpuBarrier as usual.
  *
  * @code{.cpp}
- * GpuTextureDesc source_desc = {.dimensions = {128, 128, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_SAMPLED | USAGE_COLOR_ATTACHMENT)};
- * GpuTextureDesc destination_desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA16_FLOAT, .usage = TEXTURE_USAGE_FLAGS(USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
+ * GpuTextureDesc source_desc = {.dimensions = {128, 128, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_SAMPLED};
+ * GpuTextureDesc destination_desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA16_FLOAT, .usage = USAGE_COLOR_ATTACHMENT};
  * auto source_memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, source_desc));
  * auto destination_memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, destination_desc));
  * auto source = gpuCreateTexture(queue, source_desc, source_memory);
  * auto destination = gpuCreateTexture(queue, destination_desc, destination_memory);
- * auto pixels = gpuMalloc<uint16_t>(queue, 64 * 64 * 4, MEMORY_READBACK);
- * auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
  *
- * GpuColorAttachment color = {.texture = source, .loadOp = LOAD_OP_CLEAR, .clearValue = {1, 1, 1, 1}};
- * GpuRenderPassDesc pass = {.colorAttachments = {&color, 1}};
  * auto cmd = gpuStartCommandRecording(queue);
- * gpuBeginRenderPass(cmd, pass);
- * gpuEndRenderPass(cmd);
- * gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_PIXEL_SHADER);
  * gpuBlitTextureEXT(cmd, destination, source); // Half the size, and converted to half floats
- * gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
- * gpuCopyFromTexture(cmd, pixels_gpu, destination_memory, destination);
- * gpuSyncMemoryEXT(cmd, pixels_gpu);
  * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * assert(pixels[0] == 0x3c00); // 1.0 as a half float
  *
- * gpuFree(queue, pixels);
  * gpuFree(queue, destination_memory);
  * gpuFree(queue, source_memory);
  * @endcode
+ *
+ * @note A 32 bit float source can't be filtered, so it is blitted with nearest sampling whatever was asked; WebGPU doesn't sample those formats at all.
  *
  * @param cmd Command buffer to record into.
  * @param destination Texture rendered into.
@@ -1240,44 +1242,21 @@ void gpuBlitTextureEXT(GpuCommandBuffer* cmd, GpuTexture* destination, const Gpu
  *
  * Changing the heap pointer may cause an internal pipeline flush on older hardware. On modern GPUs the base address is embedded per sample instruction and multiple heaps can be sampled seamlessly.
  *
- * Allocate the heap as MEMORY_DESCRIPTOR_HEAP. Where the device allows it that lets the heap be bound where it lies, which is both cheaper (nothing is copied) and what makes a descriptor written by a shader visible; see GpuTextureDescriptor. Any other memory still works, at the cost of a snapshot per call, and the backend reports that through the diagnostic callback the first time it has to take one.
+ * Allocate the heap as MEMORY_DESCRIPTOR_HEAP. Where the device allows it that lets the heap be bound where it lies, which is both cheaper (nothing is copied) and what makes a descriptor written by a shader visible; see GpuTextureDescriptor. Any other memory still works, at the cost of a snapshot per call, and the backend reports that through the diagnostic callback the first time it has to take one. Because the snapshot is retaken every time the heap is set, a CPU write between two command buffers is still seen.
  *
  * @code{.cpp}
- * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_SAMPLED | USAGE_TRANSFER_DST)};
+ * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_SAMPLED};
  * auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
- * auto texture = gpuCreateTexture(queue, desc, memory);
- * auto texels = gpuMalloc<uint32_t>(queue, 64 * 64);
- * for(uint32_t i = 0; i < 64 * 64; ++i) texels[i] = 0xff0000ff; // Opaque red, as RGBA bytes
- * auto texels_gpu = gpuHostToDevicePointer(queue, texels);
- *
  * auto heap = gpuMalloc<GpuTextureDescriptor>(queue, 1, MEMORY_DESCRIPTOR_HEAP);
- * heap[0] = gpuTextureViewDescriptor(queue, texture, {});
+ * heap[0] = gpuTextureViewDescriptor(queue, gpuCreateTexture(queue, desc, memory), {});
  * auto heap_gpu = gpuHostToDevicePointer(queue, heap);
  *
- * auto pipeline = gpuCreateComputePipeline(queue, string_to_bytes(R"slang(
- * 	import noapi;
- * 	[shader("compute")] [numthreads(1, 1, 1)]
- * 	void main() { gpuComputeData<float4>()[0] = gpuSample2D(0, gpuGetSamplerIndex(gpuDefaultSampler()), float2(0.5, 0.5)); }
- * )slang"));
- * auto color = gpuMalloc<float>(queue, 4, MEMORY_READBACK);
- * auto color_gpu = gpuHostToDevicePointer(queue, color);
- *
  * auto cmd = gpuStartCommandRecording(queue);
- * gpuSyncMemoryEXT(cmd, texels_gpu);
- * gpuCopyToTexture(cmd, memory, texels_gpu, texture);
- * gpuBarrier(cmd, STAGE_TRANSFER, STAGE_COMPUTE);
  * gpuSyncMemoryEXT(cmd, heap_gpu);
- * gpuSetActiveTextureHeapPtr(cmd, heap_gpu);
- * gpuSetPipeline(cmd, pipeline);
- * gpuDispatch(cmd, color_gpu, {1, 1, 1});
- * gpuSyncMemoryEXT(cmd, color_gpu);
+ * gpuSetActiveTextureHeapPtr(cmd, heap_gpu); // Shaders now sample the texture as gpuSample2D(0, ...)
  * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * assert(color[0] == 1.0f && color[1] == 0.0f && color[3] == 1.0f);
  *
- * gpuFreePipeline(queue, pipeline);
- * gpuFree(queue, color);
  * gpuFree(queue, heap);
- * gpuFree(queue, texels);
  * gpuFree(queue, memory);
  * @endcode
  *
@@ -1300,6 +1279,7 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer* cmd, gpu* texture_heap);
  * gpuBarrier(cmd, STAGE_COMPUTE, STAGE_COMPUTE, (HAZARD_FLAGS)0); // One dispatch reads what the last one wrote
  * gpuBarrier(cmd, STAGE_COMPUTE, STAGE_PIXEL_SHADER, HAZARD_DESCRIPTORS); // A dispatch rewrote texture heap entries
  * gpuBarrier(cmd, (STAGE)(STAGE_RASTER_COLOR_OUT | STAGE_RASTER_DEPTH_OUT), STAGE_PIXEL_SHADER, (HAZARD_FLAGS)0); // Render targets are sampled next
+ * gpuBarrier(cmd, STAGE_COMPUTE, STAGE_RASTER_DEPTH_OUT, HAZARD_DEPTH_STENCIL); // A dispatch wrote what is about to be a depth buffer
  * gpuFreeCommandBuffer(cmd);
  * @endcode
  *
@@ -1317,7 +1297,7 @@ void gpuBarrier(GpuCommandBuffer* cmd, STAGE before, STAGE after, HAZARD_FLAGS h
  *
  * Combine with gpuWaitBefore to implement split barriers that allow independent work to be inserted between the producer and consumer, avoiding GPU stalls. Timeline semaphore semantics (monotonic counter) are the recommended pattern, as in the example.
  *
- * The counter is real memory and the write really happens, so a shader or the CPU can read it to observe the producer's progress -- as long as gpuGetCapabilitiesEXT().split_barrier_signals says so. Where it is false the call does nothing and reports itself once through the diagnostic callback.
+ * The counter is real memory and the write really happens, so a shader or the CPU can read it to observe the producer's progress. SIGNAL_ATOMIC_MAX and SIGNAL_ATOMIC_OR need 64 bit buffer atomics, so they only apply where gpuGetCapabilitiesEXT().split_barrier_signals is true; elsewhere they report themselves through the diagnostic callback and leave the counter alone.
  *
  * Whether the paired wait is a true split barrier is a separate question, answered by gpuGetCapabilitiesEXT().split_barriers; see gpuWaitBefore.
  *
@@ -1330,17 +1310,18 @@ void gpuBarrier(GpuCommandBuffer* cmd, STAGE before, STAGE after, HAZARD_FLAGS h
  * // ... work that does not depend on the dispatches before the signal ...
  * gpuWaitBefore(cmd, STAGE_PIXEL_SHADER, counter_gpu, 7, OP_GREATER_EQUAL);
  * gpuSyncMemoryEXT(cmd, counter_gpu);
- * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * if(gpuGetCapabilitiesEXT(queue).split_barrier_signals) assert(*counter == 7);
+ * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1})); // *counter is now 7
  *
  * gpuFree(queue, counter);
  * @endcode
+ *
+ * What can't be honored falls back and says so: a signal inside a render pass has nothing to write the counter with, a wait there can't be split, and a signal no wait pairs with ordered nothing.
  *
  * @param cmd Command buffer to record into.
  * @param before Producer stage; signal fires after this stage completes.
  * @param ptr GPU virtual address of a 64-bit counter value in GPU memory.
  * @param value Value to write / OR / max into the counter.
- * @param signal Atomic operation to apply. WebGPU only supports SIGNAL_ATOMIC_SET, and reports the other two as unsupported.
+ * @param signal Atomic operation to apply. Only SIGNAL_ATOMIC_SET is available everywhere; the other two need split_barrier_signals, which WebGPU never has.
  */
 void gpuSignalAfter(GpuCommandBuffer* cmd, STAGE before, gpu* ptr, uint64_t value, SIGNAL signal);
 
@@ -1351,6 +1332,8 @@ void gpuSignalAfter(GpuCommandBuffer* cmd, STAGE before, gpu* ptr, uint64_t valu
  *
  * - A wait that pairs with an earlier gpuSignalAfter in the same command buffer, on the same \p ptr and \p value, recorded outside a render pass, becomes a real split barrier: work recorded between the two halves is not stalled by the pair. This is the pattern the example uses, and the one to write.
  * - Anything else -- a \p mask, an \p op other than OP_GREATER_EQUAL or OP_EQUAL, a counter written by a shader rather than by gpuSignalAfter, or a signal that is in another command buffer -- cannot be expressed. The wait then becomes a full barrier from every stage, which is a superset of the dependency asked for (so correct on one queue) but gives up the independent work in between. Each such fallback reports itself once through the diagnostic callback.
+ *
+ * - Inside a render pass Vulkan can record neither the wait nor a barrier, so there the call reports itself unsupported and does nothing; record waits before gpuBeginRenderPass. WebGPU's pass boundaries already order everything a wait could ask for.
  *
  * gpuGetCapabilitiesEXT().split_barriers is false on a backend where even the paired form cannot be split, in which case every wait is the full barrier above.
  *
@@ -1408,35 +1391,24 @@ void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline);
 /**
  * gpuDispatch – Launch a compute shader. The shader receives `data` as its single root pointer (cast to the matching shader-side struct). Thread groups are spawned in a 3D grid of `grid_dimensions` groups.
  *
- * @code{.cpp}
- * struct Root { gpu* values; };
- * auto values = gpuMalloc<uint32_t>(queue, 16, MEMORY_READBACK);
- * auto root = gpuMalloc<Root>(queue);
- * root->values = gpuHostToDevicePointer(queue, values);
- * auto root_gpu = gpuHostToDevicePointer(queue, root);
+ * The bound pipeline stays bound across copies recorded between dispatches.
  *
+ * @code{.cpp}
+ * auto values = gpuMalloc<uint32_t>(queue, 64, MEMORY_READBACK);
+ * auto values_gpu = gpuHostToDevicePointer(queue, values);
  * auto pipeline = gpuCreateComputePipeline(queue, string_to_bytes(R"slang(
  * 	import noapi;
- * 	struct Root : IGpuLoadable {
- * 		GpuPtr<uint> values;
- * 		static const uint gpuStride = 8;
- * 		static Root gpuLoad(GpuAddress at) { var from = GpuReader(at); Root out; out.values = from.next<GpuPtr<uint> >(); return out; }
- * 	}
- * 	[shader("compute")] [numthreads(16, 1, 1)]
- * 	void main(uint3 thread : SV_DispatchThreadID) { let root = *gpuComputeData<Root>(); root.values[thread.x] = thread.x * 2; }
+ * 	[shader("compute")] [numthreads(64, 1, 1)]
+ * 	void main(uint3 thread : SV_DispatchThreadID) { gpuComputeData<uint>()[thread.x] = thread.x * 2; }
  * )slang"));
- * assert(pipeline);
  *
  * auto cmd = gpuStartCommandRecording(queue);
- * gpuSyncMemoryEXT(cmd, root_gpu);
  * gpuSetPipeline(cmd, pipeline);
- * gpuDispatch(cmd, root_gpu, {1, 1, 1});
- * gpuSyncMemoryEXT(cmd, root->values);
- * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * assert(values[5] == 10);
+ * gpuDispatch(cmd, values_gpu, {1, 1, 1});
+ * gpuSyncMemoryEXT(cmd, values_gpu);
+ * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1})); // values[5] is now 10
  *
  * gpuFreePipeline(queue, pipeline);
- * gpuFree(queue, root);
  * gpuFree(queue, values);
  * @endcode
  *
@@ -1466,8 +1438,7 @@ void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions);
  * gpuSetPipeline(cmd, pipeline);
  * gpuDispatchIndirect(cmd, values_gpu, grid_gpu);
  * gpuSyncMemoryEXT(cmd, values_gpu);
- * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
- * assert(values[63] == 1);
+ * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1})); // All 64 values are now 1
  *
  * gpuFreePipeline(queue, pipeline);
  * gpuFree(queue, grid);

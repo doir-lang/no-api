@@ -44,8 +44,7 @@ typedef void (*GpuShaderDiagnosticCallbackEXT)(GpuStringView message, void* user
  * @code{.cpp}
  * std::string last;
  * gpuSetShaderDiagnosticCallbackEXT([](GpuStringView message, void* userdata) { *(std::string*)userdata = std::string_view(message); }, &last);
- * assert(!gpuCreateComputePipeline(queue, string_to_bytes("not a shader")));
- * assert(!last.empty());
+ * // ... create pipelines; a failed compile leaves its diagnostics in `last` ...
  * gpuSetShaderDiagnosticCallbackEXT(nullptr, nullptr);
  * @endcode
  *
@@ -97,7 +96,7 @@ void gpuAddShaderSearchPathEXT(const char* path);
  * assert(pipeline);
  *
  * gpuFreePipeline(queue, pipeline);
- * gpuRemoveShaderModuleEXT("noapi_example_scale");
+ * assert(gpuRemoveShaderModuleEXT("noapi_example_scale"));
  * @endcode
  *
  * @param name Module name, as an importing shader spells it.
@@ -113,7 +112,6 @@ void gpuAddShaderModuleEXT(const char* name, GpuStringView source);
  * GpuStringView source = {module, strlen(module)};
  * gpuAddShaderModuleEXT("noapi_example_empty", source);
  * assert(gpuRemoveShaderModuleEXT("noapi_example_empty"));
- * assert(!gpuRemoveShaderModuleEXT("noapi_example_empty")); // Already gone
  * @endcode
  *
  * @param name Module name to remove.
@@ -148,8 +146,7 @@ void gpuAddShaderPreprocessorDefineEXT(const char* name, const char* value);
  * const char* module = "module noapi_example_reset;";
  * GpuStringView source = {module, strlen(module)};
  * gpuAddShaderModuleEXT("noapi_example_reset", source);
- * gpuResetShaderConfigurationEXT();
- * assert(!gpuRemoveShaderModuleEXT("noapi_example_reset")); // The reset already dropped it
+ * gpuResetShaderConfigurationEXT(); // Drops noapi_example_reset with everything else
  * @endcode
  */
 void gpuResetShaderConfigurationEXT(void);

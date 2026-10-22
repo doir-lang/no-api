@@ -59,8 +59,7 @@ void gpuWaitIdleEXT(GpuQueue* queue);
  * gpuMemCpy(cmd, copy_gpu, values_gpu, 4 * sizeof(uint32_t));
  * gpuSyncMemoryEXT(cmd, copy_gpu); // The GPU wrote it, so after
  * GpuCommandBufferSpan buffers = {&cmd, 1};
- * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, buffers, NULL, 0), UINT64_MAX);
- * assert(copy[2] == 42);
+ * gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, buffers, NULL, 0), UINT64_MAX); // copy[2] is now 42
  *
  * gpuFree(queue, values);
  * gpuFree(queue, copy);

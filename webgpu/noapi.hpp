@@ -119,9 +119,11 @@ struct GpuQueue {
 		uvec3 dimensions = {1, 1, 1}; ///< Dimensions in texels.
 		uint32_t sampleCount = 1; ///< MSAA sample count.
 		FORMAT format = FORMAT_NONE; ///< Texel format.
+		TEXTURE_USAGE_FLAGS usage = (TEXTURE_USAGE_FLAGS)0; ///< What the atlas has to be created for.
 
+		// Dimensions round up to a power of two: textures up to that size share the atlas, each in the top left of its layers.
 		static TextureHash from_descriptor(const GpuTextureDesc& desc) {
-			auto out = GpuQueue::TextureHash{desc.type, desc.dimensions, desc.sampleCount, desc.format};
+			auto out = GpuQueue::TextureHash{desc.type, desc.dimensions, desc.sampleCount, desc.format, desc.usage};
 			out.dimensions.x = std::bit_ceil(desc.dimensions.x);
 			out.dimensions.y = std::bit_ceil(desc.dimensions.y);
 			out.dimensions.z = std::bit_ceil(desc.dimensions.z);
@@ -129,13 +131,13 @@ struct GpuQueue {
 		}
 
 		bool operator==(const TextureHash& o) const {
-			return type == o.type && dimensions.x == o.dimensions.x && dimensions.y == o.dimensions.y && dimensions.z == o.dimensions.z && sampleCount == o.sampleCount && format == o.format;
+			return type == o.type && dimensions.x == o.dimensions.x && dimensions.y == o.dimensions.y && dimensions.z == o.dimensions.z && sampleCount == o.sampleCount && format == o.format && usage == o.usage;
 		}
 
 		struct Hasher {
 			uint64_t operator()(const TextureHash& t) const {
 				return std::hash<size_t>{}(t.type) ^ std::hash<size_t>{}(t.dimensions.x) ^ std::hash<size_t>{}(t.dimensions.y) ^ std::hash<size_t>{}(t.dimensions.z)
-					^ std::hash<size_t>{}(t.sampleCount) ^ std::hash<size_t>{}(t.format);
+					^ std::hash<size_t>{}(t.sampleCount) ^ std::hash<size_t>{}(t.format) ^ std::hash<size_t>{}(t.usage);
 			}
 		};
 	};

@@ -99,7 +99,7 @@ struct GpuQueue {
 	uint32_t heap_stride_ratio = 1;
 	std::unordered_map<void*, VkDeviceAddress> host2gpu;
 	std::unordered_map<VkDeviceAddress, void*> gpu2host;
-	std::unordered_map<VkDeviceAddress, VkImage> gpu2image;
+	std::unordered_map<VkDeviceAddress, GpuTexture*> gpu2texture; // The texture created on each allocation, which goes when the allocation does
 	// Still VK_IMAGE_LAYOUT_UNDEFINED; the next command buffer started moves them to GENERAL (see gpuStartCommandRecording).
 	std::vector<GpuTexture*> textures_pending_initial_layout;
 

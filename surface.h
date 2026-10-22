@@ -93,13 +93,20 @@ NOAPI_EXTERN_C_BEGIN
 /**
  * gpuFreeSurfaceEXT – Destroy a presentation surface and release all associated swapchain resources.
  *
- * The caller must ensure the GPU is no longer rendering to any acquired surface textures before destroying the surface.
+ * Frames still in flight are waited for (on WebGPU the implementation keeps their textures alive itself), so a surface can be freed straight after its last present.
  *
  * @code{.cpp}
  * GpuSurface* surface = gpuCreateSurfaceEXT(queue, backend, {.texture = {.dimensions = {640, 480, 1}, .usage = USAGE_COLOR_ATTACHMENT}});
  * if(surface) { // NULL without a window, as on a headless device
- * 	gpuWaitIdleEXT(queue);
- * 	gpuFreeSurfaceEXT(queue, surface);
+ * 	if(auto target = gpuSurfaceNextTextureEXT(queue, surface)) {
+ * 		GpuColorAttachment color = {.texture = target, .loadOp = LOAD_OP_CLEAR};
+ * 		GpuRenderPassDesc pass = {.colorAttachments = {&color, 1}};
+ * 		auto cmd = gpuStartCommandRecording(queue);
+ * 		gpuBeginRenderPass(cmd, pass);
+ * 		gpuEndRenderPass(cmd, pass);
+ * 		gpuSurfacePresentEXT(queue, surface, gpuSubmit(queue, {&cmd, 1}));
+ * 	}
+ * 	gpuFreeSurfaceEXT(queue, surface); // Waits for the frame still in flight itself
  * }
  * @endcode
  *
@@ -130,6 +137,8 @@ void gpuFreeSurfaceEXT(GpuQueue* queue, GpuSurface* surface);
  * 	gpuFreeSurfaceEXT(queue, surface);
  * }
  * @endcode
+ *
+ * @note A configuration the surface can't take at all leaves it as it was, with errno set; gpuSurfaceGetConfigurationEXT always reports what was granted.
  *
  * @param queue GPU queue/device the surface was created against.
  * @param surface Surface to reconfigure.
@@ -205,6 +214,8 @@ GpuSurfaceDescriptor gpuSurfaceGetConfigurationEXT(const GpuSurface* surface);
  * }
  * @endcode
  *
+ * @note Only one texture is acquired at a time: asking again before presenting the last one reports itself unsupported and returns NULL.
+ *
  * @param queue GPU queue/device the surface was created against.
  * @param surface Surface to acquire the next presentable texture from.
  * @return The texture, or NULL if none could be acquired, typically because the surface became invalid or requires reconfiguration after a resize/minimize event; errno is then SURFACE_OUT_OF_DATE or another backend status. A texture handed back with errno set to SURFACE_SUBOPTIMAL is usable, but the surface should be reconfigured soon.
@@ -241,10 +252,11 @@ const GpuTexture* gpuSurfaceNextTextureEXT(GpuQueue* queue, GpuSurface* surface)
  * }
  * @endcode
  *
- * @param queue GPU queue/device the surface was created against.
- * @param surface Surface whose currently acquired texture should be presented.
+ * @note Presenting with no texture acquired reports itself unsupported and presents nothing.
  * @note A present that fails, typically because the surface is out of date, leaves the backend's status in errno; reconfigure the surface and carry on.
  *
+ * @param queue GPU queue/device the surface was created against.
+ * @param surface Surface whose currently acquired texture should be presented.
  * @param wait_submission_index Submission index to wait on before presenting (as returned by gpuSubmit), or NO_SUBMISSION_WAIT to present without waiting on a specific submission.
  */
 void gpuSurfacePresentEXT(GpuQueue* queue, GpuSurface* surface, uint64_t wait_submission_index NOAPI_DEFAULT(NO_SUBMISSION_WAIT));

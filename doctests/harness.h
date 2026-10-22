@@ -20,6 +20,7 @@
 #endif
 
 #include <assert.h>
+#include <errno.h>
 #include <string.h>
 #ifdef __cplusplus
 	#include <filesystem>
