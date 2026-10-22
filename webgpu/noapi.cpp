@@ -185,7 +185,7 @@ bool gpuSetupDefaultWebGPUEXT(GpuWebGPUSurfaceLoaderEXT surface_loader, void* su
 	return true;
 }
 
-// A narrower pointer would truncate the monobuffer tag, so the web build targets wasm64 (see -sMEMORY64 in the top level CMakeLists).
+// A narrower pointer would truncate the monobuffer tag, so the web build targets wasm64 (see -m64 in the top level CMakeLists).
 static_assert(sizeof(gpu*) == sizeof(uint64_t), "A gpu* has to be 64 bits wide to carry a device address");
 
 // An address is a monobuffer tag (its index plus one, so no address is null) above this many bits of offset
@@ -1255,7 +1255,11 @@ namespace GPU {
 		if(format == WGPUTextureFormat_Depth32FloatStencil8) return wgpuDeviceHasFeature(queue->device, WGPUFeatureName_Depth32FloatStencil8);
 		bool norm16 = desc.format == FORMAT_R16_UNORM || desc.format == FORMAT_R16_SNORM || desc.format == FORMAT_RG16_UNORM
 			|| desc.format == FORMAT_RG16_SNORM || desc.format == FORMAT_RGBA16_UNORM || desc.format == FORMAT_RGBA16_SNORM;
+#ifdef __EMSCRIPTEN__
+		return !norm16;
+#else
 		return !norm16 || wgpuDeviceHasFeature(queue->device, WGPUFeatureName_TextureFormatsTier1);
+#endif
 	}
 }
 

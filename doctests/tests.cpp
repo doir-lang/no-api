@@ -1311,6 +1311,52 @@ TEST_CASE("gpuBlitTextureEXT round trips with nearest sampling") {
 	noapi_doctest_end();
 }
 
+TEST_CASE("gpuBlitTextureEXT keeps the source's orientation") {
+	GpuQueue* queue = noapi_doctest_queue();
+	GpuDoctestBackend backend = noapi_doctest_backend();
+	(void)queue;
+	(void)backend;
+	noapi_doctest_begin();
+	{
+		GpuTextureDesc source_desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_SAMPLED | USAGE_TRANSFER_DST)};
+		GpuTextureDesc destination_desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
+		auto source_memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, source_desc));
+		auto destination_memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, destination_desc));
+		auto source = gpuCreateTexture(queue, source_desc, source_memory);
+		auto destination = gpuCreateTexture(queue, destination_desc, destination_memory);
+
+		// Red, green, blue and white quadrants, from the top left in reading order (RGBA bytes)
+		constexpr uint32_t quadrants[4] = {0xff0000ff, 0xff00ff00, 0xffff0000, 0xffffffff};
+		auto texels = gpuMalloc<uint32_t>(queue, 64 * 64);
+		auto texels_gpu = gpuHostToDevicePointer(queue, texels);
+		for(uint32_t y = 0; y < 64; ++y)
+			for(uint32_t x = 0; x < 64; ++x)
+				texels[y * 64 + x] = quadrants[(y / 32) * 2 + x / 32];
+		auto pixels = gpuMalloc<uint32_t>(queue, 64 * 64, MEMORY_READBACK);
+		auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
+
+		auto cmd = gpuStartCommandRecording(queue);
+		gpuSyncMemoryEXT(cmd, texels_gpu);
+		gpuCopyToTexture(cmd, source_memory, texels_gpu, source);
+		gpuBarrier(cmd, STAGE_TRANSFER, STAGE_PIXEL_SHADER);
+		gpuBlitTextureEXT(cmd, destination, source, false);
+		gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
+		gpuCopyFromTexture(cmd, pixels_gpu, destination_memory, destination);
+		gpuSyncMemoryEXT(cmd, pixels_gpu);
+		gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
+		CHECK_EQ(pixels[0], quadrants[0]);
+		CHECK_EQ(pixels[63], quadrants[1]);
+		CHECK_EQ(pixels[63 * 64], quadrants[2]);
+		CHECK_EQ(pixels[64 * 64 - 1], quadrants[3]);
+
+		gpuFree(queue, pixels);
+		gpuFree(queue, texels);
+		gpuFree(queue, destination_memory);
+		gpuFree(queue, source_memory);
+	}
+	noapi_doctest_end();
+}
+
 TEST_CASE("gpuBlitTextureEXT falls back to nearest for unfilterable formats") {
 	GpuQueue* queue = noapi_doctest_queue();
 	GpuDoctestBackend backend = noapi_doctest_backend();
@@ -2536,6 +2582,62 @@ TEST_CASE("gpuAddShaderModuleEXT replaces a registered module and refuses the AP
 
 		gpuFreePipeline(queue, pipeline);
 		gpuRemoveShaderModuleEXT("noapi_example_scale");
+	}
+	noapi_doctest_end();
+}
+
+TEST_CASE("gpuAddShaderModuleEXT reaches a pipeline whose compiler session was cached before another stage's") {
+	GpuQueue* queue = noapi_doctest_queue();
+	GpuDoctestBackend backend = noapi_doctest_backend();
+	(void)queue;
+	(void)backend;
+	noapi_doctest_begin();
+	{
+		const char* draft = "module noapi_example_cached; public uint exampleValue() { return 2; }";
+		gpuAddShaderModuleEXT("noapi_example_cached", {draft, strlen(draft)});
+		auto compute = string_to_bytes(R"slang(
+			import noapi; import noapi_example_cached;
+			[shader("compute")] [numthreads(1, 1, 1)] void main() { gpuComputeData<uint>()[0] = exampleValue(); }
+		)slang");
+		auto draft_pipeline = gpuCreateComputePipeline(queue, compute);
+		assert(draft_pipeline);
+
+		// A graphics compile, so the compute session is no longer the most recently used one
+		auto graphics = string_to_bytes(R"slang(
+			import noapi;
+			[shader("vertex")] float4 vertexMain(uint index : SV_VertexID) : SV_Position { return float4(0, 0, 0, 1); }
+			[shader("fragment")] float4 fragmentMain() : SV_Target { return float4(1, 1, 1, 1); }
+		)slang");
+		GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
+		auto graphics_pipeline = gpuCreateGraphicsPipeline(queue, graphics, graphics, {.colorTargets = {&target, 1}});
+		assert(graphics_pipeline);
+
+		const char* module = "module noapi_example_cached; public uint exampleValue() { return 3; }";
+		gpuAddShaderModuleEXT("noapi_example_cached", {module, strlen(module)});
+		auto pipeline = gpuCreateComputePipeline(queue, compute);
+		assert(pipeline);
+
+		auto value = gpuMalloc<uint32_t>(queue);
+		*value = 0;
+		auto value_gpu = gpuHostToDevicePointer(queue, value);
+		auto result = gpuMalloc<uint32_t>(queue, 1, MEMORY_READBACK);
+		auto result_gpu = gpuHostToDevicePointer(queue, result);
+		auto cmd = gpuStartCommandRecording(queue);
+		gpuSyncMemoryEXT(cmd, value_gpu);
+		gpuSetPipeline(cmd, pipeline);
+		gpuDispatch(cmd, value_gpu, {1, 1, 1});
+		gpuBarrier(cmd, STAGE_COMPUTE, STAGE_TRANSFER);
+		gpuMemCpy(cmd, result_gpu, value_gpu, 4);
+		gpuSyncMemoryEXT(cmd, result_gpu);
+		gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
+		CHECK_EQ(*result, 3u);
+
+		gpuFree(queue, result);
+		gpuFree(queue, value);
+		gpuFreePipeline(queue, pipeline);
+		gpuFreePipeline(queue, graphics_pipeline);
+		gpuFreePipeline(queue, draft_pipeline);
+		assert(gpuRemoveShaderModuleEXT("noapi_example_cached"));
 	}
 	noapi_doctest_end();
 }

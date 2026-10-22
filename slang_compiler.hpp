@@ -550,8 +550,8 @@ inline std::mutex& compile_mutex() {
 	return instance;
 }
 
-// The last session, keyed by everything it bakes in, so WebGPU's recompiles on layout changes don't reload every module.
-struct SessionCache {
+// A session keyed by everything it bakes in, so WebGPU's recompiles on layout changes don't reload every module.
+struct CachedSession {
 	Slang::ComPtr<slang::ISession> session;
 	SlangCompileTarget target = SLANG_TARGET_UNKNOWN;
 	std::string backend_module;
@@ -563,25 +563,23 @@ struct SessionCache {
 	std::unordered_map<std::string, std::string> code;
 };
 
-inline SessionCache& session_cache() {
-	static SessionCache instance;
+// Several sessions, since compute and graphics compiles differ in their defines and a single one would reparse the API's modules on every switch.
+constexpr size_t SESSION_CACHE_CAPACITY = 8;
+
+// Least recently used first
+inline std::vector<CachedSession>& session_cache() {
+	static std::vector<CachedSession> instance;
 	return instance;
 }
 
 // Drops whatever the compiler cached. Called by every gpu*SlangEXT mutation.
 inline void invalidate_sessions() {
 	std::lock_guard lock(compile_mutex());
-	auto& cache = session_cache();
-	cache.session = nullptr;
-	cache.target = SLANG_TARGET_UNKNOWN;
-	cache.backend_module.clear();
-	cache.macro_key.clear();
-	cache.generation = 0;
-	cache.code.clear();
+	session_cache().clear();
 }
 
-// Callers hold compile_mutex().
-inline slang::ISession* get_session(SlangCompileTarget target, std::string_view backend_module,
+// Callers hold compile_mutex(). The result stays valid until the next call.
+inline CachedSession* get_session(SlangCompileTarget target, std::string_view backend_module,
 	const std::vector<std::pair<std::string, std::string>>& extra_defines, std::string& out_error
 ) {
 	auto& reg = registry();
@@ -598,12 +596,18 @@ inline slang::ISession* get_session(SlangCompileTarget target, std::string_view 
 	}
 
 	auto& cache = session_cache();
-	if(cache.session && cache.target == target && cache.generation == generation
-		&& cache.backend_module == backend_module && cache.macro_key == macro_key)
-		return cache.session.get();
+	// A registry change clears the cache, but one can land between taking the generation above and here.
+	std::erase_if(cache, [&](const CachedSession& cached) { return cached.generation != generation; });
+	auto found = std::find_if(cache.begin(), cache.end(), [&](const CachedSession& cached) {
+		return cached.target == target && cached.backend_module == backend_module && cached.macro_key == macro_key;
+	});
+	if(found != cache.end()) {
+		std::rotate(found, found + 1, cache.end());
+		return &cache.back();
+	}
 
 	// Either way the compiler can't run: Slang never started (reported once, by global_session), or won't open a session
-	auto unavailable = [&out_error]() -> slang::ISession* {
+	auto unavailable = [&out_error]() -> CachedSession* {
 		out_error = "the Slang compiler is unavailable";
 		return nullptr;
 	};
@@ -683,14 +687,15 @@ inline slang::ISession* get_session(SlangCompileTarget target, std::string_view 
 	for(auto& [name, source]: modules)
 		if(!load(name.c_str(), source)) return nullptr;
 
-	cache.session = session;
-	cache.target = target;
-	cache.backend_module = backend_module;
-	cache.macro_key = std::move(macro_key);
-	cache.generation = generation;
-	cache.code.clear();
-	cache.next_user_module = 0;
-	return cache.session.get();
+	if(cache.size() >= SESSION_CACHE_CAPACITY) cache.erase(cache.begin());
+	cache.push_back({
+		.session = session,
+		.target = target,
+		.backend_module = std::string(backend_module),
+		.macro_key = std::move(macro_key),
+		.generation = generation,
+	});
+	return &cache.back();
 }
 
 // ---------------------------------------------------------------------------
@@ -716,10 +721,10 @@ inline std::optional<std::string> compile(SlangCompileTarget target, std::string
 ) {
 	std::lock_guard lock(compile_mutex());
 
-	auto* session = get_session(target, backend_module, extra_defines, out_error);
-	if(!session) return std::nullopt;
-
-	auto& cache = session_cache();
+	auto* cached = get_session(target, backend_module, extra_defines, out_error);
+	if(!cached) return std::nullopt;
+	auto& cache = *cached;
+	auto* session = cache.session.get();
 
 	// Keyed by stage and source only; everything else is what the session itself was keyed by.
 	auto cache_key = std::to_string((int)stage) + '\n' + std::string(source);

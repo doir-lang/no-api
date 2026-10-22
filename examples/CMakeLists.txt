@@ -1,7 +1,7 @@
 
 if(NOT EMSCRIPTEN)
 	find_package(glfw QUIET)
-	if (NOT glfw_FOUND AND NOT TARGET glfw)
+	if(NOT glfw_FOUND AND NOT TARGET glfw)
 		message(STATUS "glfw not found via find_package; fetching from GitHub")
 		include(FetchContent)
 		FetchContent_Declare(glfw
@@ -18,18 +18,18 @@ if(NOAPI_DEFAULT_BACKEND STREQUAL "webgpu")
 	target_link_libraries(glfw3webgpu PUBLIC glfw noapi::noapi)
 	noapi_enable_lto(glfw3webgpu)
 
-	if (GLFW_BUILD_COCOA)
+	if(GLFW_BUILD_COCOA)
 		target_compile_definitions(glfw3webgpu PRIVATE _GLFW_COCOA)
 		target_compile_options(glfw3webgpu PRIVATE -x objective-c)
 		target_link_libraries(glfw3webgpu PRIVATE "-framework Cocoa" "-framework CoreVideo" "-framework IOKit" "-framework QuartzCore")
 	endif()
-	if (GLFW_BUILD_WIN32)
+	if(GLFW_BUILD_WIN32)
 		target_compile_definitions(glfw3webgpu PRIVATE _GLFW_WIN32)
 	endif()
-	if (GLFW_BUILD_X11)
+	if(GLFW_BUILD_X11)
 		target_compile_definitions(glfw3webgpu PRIVATE _GLFW_X11)
 	endif()
-	if (GLFW_BUILD_WAYLAND)
+	if(GLFW_BUILD_WAYLAND)
 		target_compile_definitions(glfw3webgpu PRIVATE _GLFW_WAYLAND)
 	endif()
 
@@ -39,24 +39,19 @@ if(NOAPI_DEFAULT_BACKEND STREQUAL "webgpu")
 	endif()
 endif()
 
-# The API headers are meant to be usable from C too, so one translation unit of the examples is
-# compiled as C and linked in: a header that stops parsing as C, or an entry point whose C
-# declaration no longer matches the exported symbol, then fails the build here
+# One example links this C translation unit, so a header that stops parsing as C, or a mismatched C declaration, fails the build.
 add_library(noapi-c-compat OBJECT c_compat.c)
 target_link_libraries(noapi-c-compat PRIVATE noapi::noapi)
 set_target_properties(noapi-c-compat PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 noapi_enable_lto(noapi-c-compat)
 
-# stb_image and tiny_obj_loader are header only, with their implementation halves behind a macro.
-# One object library turns each on exactly once for whichever examples load assets.
+# stb_image and tiny_obj_loader are header only; this object library compiles each implementation exactly once for the examples that load assets.
 add_library(noapi-example-loaders OBJECT loaders.cpp)
 target_include_directories(noapi-example-loaders PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(noapi-example-loaders PROPERTIES CXX_STANDARD 26)
 noapi_enable_lto(noapi-example-loaders)
 
-# The files the asset loading examples open at runtime. A native build reads them out of the source
-# tree, so EXAMPLE_ASSET_DIR points there; Emscripten has no filesystem to read them from, so they are
-# packed into the module's virtual one under /assets and EXAMPLE_ASSET_DIR points at that instead.
+# Native builds read these from the source tree; Emscripten has no filesystem, so they are preloaded into its virtual one under /assets.
 set(NOAPI_EXAMPLE_ASSETS
 	pexels-70588695-35341664.jpg
 	sunflowers_puresky_2k.hdr
@@ -64,12 +59,7 @@ set(NOAPI_EXAMPLE_ASSETS
 )
 
 # noapi_add_example(<name> [ASSETS] [C_COMPAT])
-#
-# Declares <name> as an executable built from <name>.cpp against the selected backend.
-#
-# ASSETS gives it the loader library and an EXAMPLE_ASSET_DIR to find the files above in.
-# C_COMPAT links the C translation unit, which only one example needs to carry for the build to be
-# checked.
+# Builds <name>.cpp against the selected backend; ASSETS adds the asset loaders and EXAMPLE_ASSET_DIR, C_COMPAT links the C translation unit.
 function(noapi_add_example name)
 	cmake_parse_arguments(ARG "ASSETS;C_COMPAT" "" "" ${ARGN})
 
@@ -79,8 +69,7 @@ function(noapi_add_example name)
 		add_executable(${name} ${name}.cpp)
 	endif()
 
-	# noapi::noapi is whichever backend NOAPI_DEFAULT_BACKEND selected, and carries the
-	# NOAPI_BACKEND_VULKAN/NOAPI_BACKEND_WEBGPU define that the examples branch on
+	# noapi::noapi is whichever backend NOAPI_DEFAULT_BACKEND selected, and carries the NOAPI_BACKEND_VULKAN/NOAPI_BACKEND_WEBGPU define that the examples branch on
 	target_link_libraries(${name} PUBLIC glfw noapi::noapi)
 	target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 	set_target_properties(${name} PROPERTIES CXX_STANDARD 26)

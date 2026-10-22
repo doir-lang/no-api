@@ -107,10 +107,10 @@ diagnostics and capability queries.
   the driver has them.
 - **WebGPU backend:** nothing extra. Dawn is fetched and built automatically through
   [WebGPU-distribution](https://github.com/eliemichel/WebGPU-distribution).
-- **Web:** [Emscripten](https://emscripten.org). The build targets wasm64 (`-sMEMORY64=1`) because
+- **Web:** [Emscripten](https://emscripten.org). The build targets wasm64 (`-m64`) because
   GPU pointers are 64-bit tagged addresses.
 
-These are fetched with `FetchContent` when `find_package` can't find them: glslang,
+These are fetched with `FetchContent` when `find_package` can't find them:
 vk-bootstrap, VulkanMemoryAllocator, volk and GLFW (GLFW is only needed by the examples), and doctest for the header examples.
 
 ## Building
@@ -188,6 +188,33 @@ python3 tools/coverage.py -v vulkan       # line coverage of a backend from thos
 ```
 
 `coverage.py` also runs each program in `examples/` for a fixed number of frames (it sets `NOAPI_EXAMPLE_FRAMES`), which needs a display; pass `--doctests-only` to measure the header examples alone.
+
+## Profiling
+
+```sh
+cmake -S . -B build-prof -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DNOAPI_ENABLE_VULKAN=OFF \
+	-DCMAKE_C_FLAGS="-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer" \
+	-DCMAKE_CXX_FLAGS="-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer"
+cmake --build build-prof --target 4_pbr
+NOAPI_EXAMPLE_FRAMES=300 perf record --call-graph fp -e cpu_core/cycles/ -- ./build-prof/examples/4_pbr # the run to profile
+perf script > perf.script
+FlameGraph/stackcollapse-perf.pl perf.script > perf.folded
+FlameGraph/flamegraph.pl perf.folded > perf.svg
+```
+
+For the Vulkan backend, configure with `-DNOAPI_DEFAULT_BACKEND=vulkan -DNOAPI_ENABLE_WEBGPU=OFF` instead, as in [Building](#building). The scripts are from [FlameGraph](https://github.com/brendangregg/FlameGraph).
+
+The frame pointer flags are what make the profile readable, and they are not optional. Profiled the same way, the Release build of `4_pbr` unwound 84.7% of its cycles to a broken stack, and this build 1.5%. They go in `CMAKE_C_FLAGS` / `CMAKE_CXX_FLAGS` rather than on a target because those apply to everything configured here, including Dawn and Slang, and a stack is only as unwindable as the least cooperative frame on it. With frame pointers in the binary, `--call-graph fp` needs no stack copying; `dwarf` also works, but it adds nothing and makes `perf.data` much larger.
+
+`NOAPI_EXAMPLE_FRAMES` makes an example render that many frames and exit, so a run is bounded and repeatable (it also resizes the window and cycles the present mode on the way, as `tools/coverage.py` relies on).
+
+`-e cpu_core/cycles/` because a hybrid CPU otherwise reports `cpu_atom` and `cpu_core` as two events with their own sample periods, and anything that sums raw sample counts across them is measuring nothing.
+
+Check `kernel.perf_event_paranoid` before reading any of the numbers. At the default of 2, perf quietly records user space only (the event shows up as `cpu_core/cycles/u`), so time spent in the kernel and the GPU driver's ioctls is simply invisible. `sudo sysctl kernel.perf_event_paranoid=1` brings it back.
+
+Mind what an example spends its time on. Every pipeline is compiled from Slang at runtime, and in a 300 frame run of `4_pbr` that compilation is 63% of the cycles, none of it the API under test. Run more frames, or subtract `gpuCreate*Pipeline`, when the question is about frame time rather than startup.
+
+`perf.script` grows quickly with run length, so stream it with `awk` rather than loading it. Weight each sample by the period in its header line: once perf has throttled, that period is not constant, and counting every sample as one unit silently reweights the profile.
 
 ## Examples
 

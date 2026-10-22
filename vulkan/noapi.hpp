@@ -46,7 +46,7 @@ namespace GPU {
  * @param instance_extensions Extra instance extensions to enable.
  * @param extra_layers Extra instance layers to enable.
  * @param device_extensions Extra device extensions to enable.
- * @param debug Enable the validation layers and the debug messenger.
+ * @param debug Enable the validation layers and the debug messenger. Defaults to true.
  * @return The created objects, or why they could not be created (in which case nothing was).
  */
 inline std::expected<GpuVulkanDefault, std::string> gpuSetupDefaultVulkanEXT(

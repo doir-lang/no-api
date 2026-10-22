@@ -217,36 +217,6 @@ inline void upload_texture(GpuQueue* queue, const Texture& texture, std::span<co
 	gpuFree(queue, staging);
 }
 
-template<int CHANNELS, typename T>
-std::vector<T> resample(std::span<const T> src, uint32_t src_width, uint32_t src_height, uint32_t dst_width, uint32_t dst_height ) {
-	assert(src.size() >= size_t(src_width) * src_height * CHANNELS);
-	std::vector<T> out(size_t(dst_width) * dst_height * CHANNELS);
-
-	for(uint32_t y = 0; y < dst_height; ++y) {
-		auto y0 = y * src_height / dst_height;
-		auto y1 = std::max(y0 + 1, (y + 1) * src_height / dst_height);
-
-		for(uint32_t x = 0; x < dst_width; ++x) {
-			auto x0 = x * src_width / dst_width;
-			auto x1 = std::max(x0 + 1, (x + 1) * src_width / dst_width);
-
-			float sum[CHANNELS] = {};
-			for(auto sy = y0; sy < y1; ++sy)
-				for(auto sx = x0; sx < x1; ++sx)
-					for(int c = 0; c < CHANNELS; ++c)
-						sum[c] += float(src[(size_t(sy) * src_width + sx) * CHANNELS + c]);
-
-			auto scale = 1.0f / float((y1 - y0) * (x1 - x0));
-			for(int c = 0; c < CHANNELS; ++c) {
-				auto averaged = sum[c] * scale;
-				if constexpr(std::is_integral_v<T>) averaged += 0.5f;
-				out[(size_t(y) * dst_width + x) * CHANNELS + c] = T(averaged);
-			}
-		}
-	}
-	return out;
-}
-
 inline uint16_t float_to_half(float value) {
 	uint32_t bits;
 	memcpy(&bits, &value, sizeof(bits));
@@ -377,7 +347,7 @@ namespace detail {
 		std::println("present mode {}", (int)gpuSurfaceGetConfigurationEXT(app.surface).presentMode);
 	}
 
-	using FrameFn = std::function_ref<void(App&, GpuCommandBuffer*, const GpuTexture*)>;
+	using FrameFn = GPU::function_t<void(App&, GpuCommandBuffer*, const GpuTexture*)>;
 
 	inline void frame(App& app, const FrameFn& draw) {
 		if(app.width == 0 || app.height == 0) return;
@@ -403,7 +373,7 @@ namespace detail {
 	inline FrameFn loop_draw = [](App&, GpuCommandBuffer*, const GpuTexture*) {};
 }
 
-inline void run(App& app, detail::FrameFn draw, const std::function_ref<void(App&)>& teardown = [](App&) {}) {
+inline void run(App& app, detail::FrameFn draw, const GPU::function_t<void(App&)>& teardown = [](App&) {}) {
 #ifdef __EMSCRIPTEN__
 	detail::loop_app = &app;
 	detail::loop_draw = std::move(draw);

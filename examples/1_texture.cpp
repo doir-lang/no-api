@@ -4,9 +4,6 @@
 
 using namespace test;
 
-static constexpr uint32_t TEXTURE_SIZE = 1024;
-
-
 static const std::string slang_rectangle = R"slang(
 import noapi;
 
@@ -100,20 +97,23 @@ static constexpr GpuSamplerDesc ALBEDO_SAMPLER {
 };
 
 
-static std::vector<uint8_t> load_photo(float& out_aspect) {
+struct Photo {
+	uint32_t width, height;
+	std::vector<uint8_t> pixels;
+};
+
+// Uploaded at its own, non-square size, which WebGPU packs into its monotexture differently from a square one
+static Photo load_photo() {
 	constexpr auto path = EXAMPLE_ASSET_DIR "/pexels-70588695-35341664.jpg";
 
 	int width, height, channels;
 	auto pixels = stbi_load(path, &width, &height, &channels, 4);
 	if(!pixels) throw std::runtime_error(std::string("Failed to load ") + path + ": " + stbi_failure_reason());
+	std::println("photo: {}x{} ({} channels)", width, height, channels);
 
-	out_aspect = float(width) / float(height);
-	std::println("photo: {}x{} ({} channels), resampled to {}x{}", width, height, channels, TEXTURE_SIZE, TEXTURE_SIZE);
-
-	auto resampled = resample<4>(std::span<const uint8_t>(pixels, size_t(width) * height * 4),
-		uint32_t(width), uint32_t(height), TEXTURE_SIZE, TEXTURE_SIZE);
+	Photo photo {uint32_t(width), uint32_t(height), {pixels, pixels + size_t(width) * height * 4}};
 	stbi_image_free(pixels);
-	return resampled;
+	return photo;
 }
 
 TEST_MAIN({
@@ -121,16 +121,16 @@ TEST_MAIN({
 	open_window(app, "NoAPI Texture");
 	create_device(app);
 
-	float photo_aspect = 1.0f;
-	auto photo = load_photo(photo_aspect);
+	auto photo = load_photo();
+	auto photo_aspect = float(photo.width) / float(photo.height);
 
 	auto albedo = create_texture(app.queue, GpuTextureDesc{
-		.dimensions = {TEXTURE_SIZE, TEXTURE_SIZE, 1},
-		.mipCount = mip_count_for(TEXTURE_SIZE, TEXTURE_SIZE),
+		.dimensions = {photo.width, photo.height, 1},
+		.mipCount = mip_count_for(photo.width, photo.height),
 		.format = FORMAT_RGBA8_UNORM,
 		.usage = TEXTURE_USAGE_FLAGS(USAGE_SAMPLED | USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_DST),
 	});
-	upload_texture(app.queue, albedo, std::as_bytes(std::span(photo)));
+	upload_texture(app.queue, albedo, std::as_bytes(std::span(photo.pixels)));
 	std::println("albedo: {} mip levels", albedo.desc.mipCount);
 
 	auto heap = gpuMalloc<GpuTextureDescriptor>(app.queue, 1, MEMORY_DESCRIPTOR_HEAP);
@@ -152,7 +152,7 @@ TEST_MAIN({
 	*data = RectData{
 		.vertices = gpuHostToDevicePointer(app.queue, vertices),
 		.fit = {1.0f, 1.0f},
-		.texture_size = {float(TEXTURE_SIZE), float(TEXTURE_SIZE)},
+		.texture_size = {float(photo.width), float(photo.height)},
 		.albedo = 0,
 	};
 	auto data_gpu = gpuHostToDevicePointer(app.queue, data);

@@ -12,9 +12,6 @@
 #include <vulkan/vulkan_core.h> // TODO: Remove when it stops being auto added
 
 // gpuBlitTextureEXT compiles its (tiny, fixed) GLSL at runtime rather than shipping a SPIR-V blob
-#include <glslang/Public/ShaderLang.h>
-#include <glslang/Public/ResourceLimits.h>
-#include <glslang/SPIRV/GlslangToSpv.h>
 
 #include <algorithm>
 #include <cassert>
@@ -1466,80 +1463,53 @@ namespace GPU::detail {
 		};
 	}
 
-	constexpr static std::string_view BLIT_VERTEX_SHADER = R"(
-#version 460
+	// Compiled with the API's own sessions, so it imports nothing and binds its source as an ordinary descriptor set.
+	constexpr static std::string_view BLIT_SHADER = R"slang(
+struct BlitVaryings {
+	float4 position : SV_Position;
+	float2 uv : TEXCOORD0;
+};
 
-layout(location = 0) out vec2 out_uv;
+[[vk::binding(0, 0)]] Sampler2D blit_source;
 
-void main() {
+[shader("vertex")]
+BlitVaryings vertexMain(uint index : SV_VertexID) {
 	// An oversized triangle covering the whole viewport, its uvs run 0..1 across the covered area
-	vec2 uv = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
-	// Vulkan's clip space puts -Y at the top of the viewport, which is also where v = 0 sits
-	gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
-	out_uv = uv;
+	float2 uv = float2((index << 1) & 2, index & 2);
+	BlitVaryings varyings;
+	// The session inverts Y for Vulkan, so v = 0 is written as +Y to land at the top of the viewport
+	varyings.position = float4(uv.x * 2 - 1, 1 - uv.y * 2, 0, 1);
+	varyings.uv = uv;
+	return varyings;
 }
-)";
 
-	constexpr static std::string_view BLIT_FRAGMENT_SHADER = R"(
-#version 460
-
-layout(set = 0, binding = 0) uniform sampler2D blit_source;
-
-layout(location = 0) in vec2 in_uv;
-layout(location = 0) out vec4 out_color;
-
-void main() {
+[shader("fragment")]
+float4 fragmentMain(float2 uv : TEXCOORD0) : SV_Target {
 	// The view covers a single mip, so there is never another level to pick between
-	out_color = textureLod(blit_source, in_uv, 0.0);
+	return blit_source.SampleLevel(uv, 0);
 }
-)";
+)slang";
 
-	inline std::vector<uint32_t> compile_glsl(EShLanguage stage, std::string_view source) {
-		static const bool initialized = []{ glslang::InitializeProcess(); return true; }();
-		(void)initialized;
+	inline bool create_internal_shader_module(GpuQueue* queue, std::string_view source, GPU::shaders::SHADER_STAGE stage, VkShaderModule& out_module) {
+		auto spirv = compile_shader(queue, {source.data(), source.size()}, stage);
+		if(!spirv) return false;
 
-		auto data = source.data();
-		int length = source.size();
-
-		glslang::TShader shader(stage);
-		shader.setStringsWithLengths(&data, &length, 1);
-		shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 460);
-		shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_3);
-		shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_6);
-
-		// Only ever handed this file's own fixed shaders, so a failure is a bug here rather than something to recover from
-		[[maybe_unused]] bool parsed = shader.parse(GetDefaultResources(), 460, false, EShMsgDefault);
-		assert(parsed && "An internal shader failed to compile");
-
-		glslang::TProgram program;
-		program.addShader(&shader);
-		[[maybe_unused]] bool linked = program.link(EShMsgDefault);
-		assert(linked && "An internal shader failed to link");
-
-		std::vector<uint32_t> spirv;
-		glslang::GlslangToSpv(*program.getIntermediate(stage), spirv);
-		return spirv;
+		VkShaderModuleCreateInfo info {
+			.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+			.codeSize = spirv->size(),
+			.pCode = (const uint32_t*)spirv->data(),
+		};
+		VK_CHECK(vkCreateShaderModule(queue->device, &info, queue->callbacks, &out_module), false);
+		return true;
 	}
 
 	// Format independent, so built once and shared by every blit on the queue.
 	inline bool ensure_blit_layout(GpuQueue* queue) {
 		if(queue->blit_pipeline_layout) return true;
 
-		constexpr static std::array stages = {
-			std::pair{EShLangVertex, BLIT_VERTEX_SHADER},
-			std::pair{EShLangFragment, BLIT_FRAGMENT_SHADER}
-		};
-		for(size_t i = 0; i < stages.size(); ++i) {
-			auto spirv = compile_glsl(stages[i].first, stages[i].second);
-			if(spirv.empty()) return false;
-
-			VkShaderModuleCreateInfo info {
-				.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-				.codeSize = spirv.size() * sizeof(uint32_t),
-				.pCode = spirv.data(),
-			};
-			VK_CHECK(vkCreateShaderModule(queue->device, &info, queue->callbacks, &queue->blit_shader_modules[i]), false);
-		}
+		constexpr static std::array stages = {GPU::shaders::SHADER_STAGE::VERTEX, GPU::shaders::SHADER_STAGE::FRAGMENT};
+		for(size_t i = 0; i < stages.size(); ++i)
+			if(!create_internal_shader_module(queue, BLIT_SHADER, stages[i], queue->blit_shader_modules[i])) return false;
 
 		for(size_t linear = 0; linear < queue->blit_samplers.size(); ++linear) {
 			auto filter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
@@ -1601,7 +1571,7 @@ void main() {
 			}
 		};
 
-		// The triangle is generated from gl_VertexIndex, so nothing is fetched and nothing is indexed
+		// The triangle is generated from SV_VertexID, so nothing is fetched and nothing is indexed
 		VkPipelineVertexInputStateCreateInfo vertex_input_state {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
 		VkPipelineInputAssemblyStateCreateInfo assembly_state {
 			.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
@@ -2094,45 +2064,31 @@ namespace GPU::detail {
 	};
 
 
-	// For SIGNAL_ATOMIC_MAX and OR. The address arrives as a buffer reference in a push constant, so no descriptor is needed.
-	constexpr static std::string_view SIGNAL_SHADER = R"(
-#version 460
-#extension GL_EXT_buffer_reference : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-#extension GL_EXT_shader_atomic_int64 : require
-
-layout(buffer_reference, std430, buffer_reference_align = 8) buffer Counter {
-	uint64_t value;
-};
-
-layout(push_constant) uniform Push {
-	Counter counter;
+	// For SIGNAL_ATOMIC_MAX and OR. The address arrives as a pointer in a push constant, so no descriptor is needed.
+	constexpr static std::string_view SIGNAL_SHADER = R"slang(
+// Matches SignalPushConstants
+struct SignalPush {
+	uint64_t* counter;
 	uint64_t value;
 	uint use_max; // 1 for SIGNAL_ATOMIC_MAX, 0 for SIGNAL_ATOMIC_OR
-} push;
+};
 
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+[[vk::push_constant]] ConstantBuffer<SignalPush> push;
 
+[shader("compute")] [numthreads(1, 1, 1)]
 void main() {
-	if(push.use_max != 0) atomicMax(push.counter.value, push.value);
-	else atomicOr(push.counter.value, push.value);
+	if(push.use_max != 0) InterlockedMax(*push.counter, push.value);
+	else InterlockedOr(*push.counter, push.value);
 }
-)";
+)slang";
 
 	// Built on first use; one pipeline covers both operations, chosen by push constant.
 	inline VkPipeline signal_pipeline(GpuQueue* queue) {
 		if(queue->signal_pipeline) return queue->signal_pipeline;
 
 		{
-			auto spirv = compile_glsl(EShLangCompute, SIGNAL_SHADER);
-			if(spirv.empty()) return VK_NULL_HANDLE;
-
-			VkShaderModuleCreateInfo module_info {
-				.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-				.codeSize = spirv.size() * sizeof(uint32_t),
-				.pCode = spirv.data(),
-			};
-			VK_CHECK(vkCreateShaderModule(queue->device, &module_info, queue->callbacks, &queue->signal_shader_module), VK_NULL_HANDLE);
+			if(!create_internal_shader_module(queue, SIGNAL_SHADER, GPU::shaders::SHADER_STAGE::COMPUTE, queue->signal_shader_module))
+				return VK_NULL_HANDLE;
 
 			VkPushConstantRange range {
 				.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,

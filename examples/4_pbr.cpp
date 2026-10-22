@@ -5,10 +5,6 @@
 
 using namespace test;
 
-static constexpr uint32_t ENVIRONMENT_WIDTH = 1024;
-static constexpr uint32_t ENVIRONMENT_HEIGHT = 512;
-
-
 static const std::string slang_scene_module = R"slang(
 module pbr_scene;
 import noapi;
@@ -215,29 +211,31 @@ static constexpr GpuSamplerDesc ENVIRONMENT_SAMPLER {
 };
 
 
-static std::vector<uint16_t> load_environment() {
+struct Environment {
+	uint32_t width, height;
+	std::vector<uint16_t> texels;
+};
+
+static Environment load_environment() {
 	constexpr auto path = EXAMPLE_ASSET_DIR "/sunflowers_puresky_2k.hdr";
 
 	int width, height, channels;
 	auto pixels = stbi_loadf(path, &width, &height, &channels, 3);
 	if(!pixels) throw std::runtime_error(std::string("Failed to load ") + path + ": " + stbi_failure_reason());
 
-	auto resampled = resample<3>(std::span<const float>(pixels, size_t(width) * height * 3),
-		uint32_t(width), uint32_t(height), ENVIRONMENT_WIDTH, ENVIRONMENT_HEIGHT);
+	auto count = size_t(width) * height;
+	auto peak = *std::max_element(pixels, pixels + count * 3);
+	std::println("environment: {}x{} ({} channels), peak radiance {:.1f}", width, height, channels, peak);
 
-	auto peak = *std::max_element(resampled.begin(), resampled.end());
-	std::println("environment: {}x{} ({} channels), resampled to {}x{}, peak radiance {:.1f}",
-		width, height, channels, ENVIRONMENT_WIDTH, ENVIRONMENT_HEIGHT, peak);
-	stbi_image_free(pixels);
-
-	std::vector<uint16_t> texels(size_t(ENVIRONMENT_WIDTH) * ENVIRONMENT_HEIGHT * 4);
-	for(size_t i = 0; i < size_t(ENVIRONMENT_WIDTH) * ENVIRONMENT_HEIGHT; ++i) {
-		texels[i * 4 + 0] = float_to_half(resampled[i * 3 + 0]);
-		texels[i * 4 + 1] = float_to_half(resampled[i * 3 + 1]);
-		texels[i * 4 + 2] = float_to_half(resampled[i * 3 + 2]);
-		texels[i * 4 + 3] = float_to_half(1.0f);
+	Environment environment {uint32_t(width), uint32_t(height), std::vector<uint16_t>(count * 4)};
+	for(size_t i = 0; i < count; ++i) {
+		environment.texels[i * 4 + 0] = float_to_half(pixels[i * 3 + 0]);
+		environment.texels[i * 4 + 1] = float_to_half(pixels[i * 3 + 1]);
+		environment.texels[i * 4 + 2] = float_to_half(pixels[i * 3 + 2]);
+		environment.texels[i * 4 + 3] = float_to_half(1.0f);
 	}
-	return texels;
+	stbi_image_free(pixels);
+	return environment;
 }
 
 
@@ -273,12 +271,12 @@ TEST_MAIN({
 
 	auto panorama = load_environment();
 	auto environment = create_texture(app.queue, GpuTextureDesc{
-		.dimensions = {ENVIRONMENT_WIDTH, ENVIRONMENT_HEIGHT, 1},
-		.mipCount = mip_count_for(ENVIRONMENT_WIDTH, ENVIRONMENT_HEIGHT),
+		.dimensions = {panorama.width, panorama.height, 1},
+		.mipCount = mip_count_for(panorama.width, panorama.height),
 		.format = FORMAT_RGBA16_FLOAT,
 		.usage = TEXTURE_USAGE_FLAGS(USAGE_SAMPLED | USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_DST),
 	});
-	upload_texture(app.queue, environment, std::as_bytes(std::span(panorama)));
+	upload_texture(app.queue, environment, std::as_bytes(std::span(panorama.texels)));
 	std::println("environment: {} mip levels, roughness 1 reads level {}",
 		environment.desc.mipCount, environment.desc.mipCount - 1);
 

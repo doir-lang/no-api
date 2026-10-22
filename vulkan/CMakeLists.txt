@@ -1,18 +1,7 @@
 find_package(Vulkan REQUIRED)
 
-find_package(glslang QUIET)
-if (NOT glslang_FOUND AND NOT TARGET glslang::glslang)
-	message(STATUS "glslang not found via find_package; fetching from GitHub")
-	include(FetchContent)
-	FetchContent_Declare(glslang
-		GIT_REPOSITORY https://github.com/KhronosGroup/glslang
-		GIT_TAG 16.5.0
-	)
-	FetchContent_MakeAvailable(glslang)
-endif()
-
 find_package(vk-bootstrap QUIET)
-if (NOT vk-bootstrap_FOUND)
+if(NOT vk-bootstrap_FOUND)
 	message(STATUS "vk-bootstrap not found via find_package; fetching from GitHub")
 	include(FetchContent)
 	FetchContent_Declare(vk-bootstrap
@@ -23,7 +12,7 @@ if (NOT vk-bootstrap_FOUND)
 endif()
 
 find_package(VulkanMemoryAllocator QUIET)
-if (NOT VulkanMemoryAllocator_FOUND)
+if(NOT VulkanMemoryAllocator_FOUND)
 	message(STATUS "VulkanMemoryAllocator not found via find_package; fetching from GitHub")
 	include(FetchContent)
 	FetchContent_Declare(VulkanMemoryAllocator
@@ -34,7 +23,7 @@ if (NOT VulkanMemoryAllocator_FOUND)
 endif()
 
 find_package(volk QUIET)
-if (NOT volk_FOUND)
+if(NOT volk_FOUND)
 	message(STATUS "volk not found via find_package; fetching from GitHub")
 	include(FetchContent)
 	FetchContent_Declare(volk
@@ -51,13 +40,9 @@ target_link_libraries(noapi-vulkan PUBLIC
 	volk::volk
 	vk-bootstrap::vk-bootstrap
 	GPUOpen::VulkanMemoryAllocator
-	glslang::glslang
-	glslang::glslang-default-resource-limits
-	glslang::SPIRV
 )
 set_target_properties(noapi-vulkan PROPERTIES CXX_STANDARD 26)
 noapi_enable_lto(noapi-vulkan)
 target_include_directories(noapi-vulkan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
-# Lets anything linking this backend (rather than the other one) pick its shading language and its
-# windowing/instance glue at compile time
+# Lets anything linking this backend (rather than the other one) pick its shading language and its windowing/instance glue at compile time
 target_compile_definitions(noapi-vulkan PUBLIC NOAPI_BACKEND_VULKAN=1)
