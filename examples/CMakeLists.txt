@@ -39,7 +39,7 @@ if(NOAPI_DEFAULT_BACKEND STREQUAL "webgpu")
 	endif()
 endif()
 
-# The API headers are meant to be usable from C too, so one translation unit of the test suite is
+# The API headers are meant to be usable from C too, so one translation unit of the examples is
 # compiled as C and linked in: a header that stops parsing as C, or an entry point whose C
 # declaration no longer matches the exported symbol, then fails the build here
 add_library(noapi-c-compat OBJECT c_compat.c)
@@ -48,29 +48,29 @@ set_target_properties(noapi-c-compat PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRE
 noapi_enable_lto(noapi-c-compat)
 
 # stb_image and tiny_obj_loader are header only, with their implementation halves behind a macro.
-# One object library turns each on exactly once for whichever tests load assets.
-add_library(noapi-test-loaders OBJECT loaders.cpp)
-target_include_directories(noapi-test-loaders PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-set_target_properties(noapi-test-loaders PROPERTIES CXX_STANDARD 26)
-noapi_enable_lto(noapi-test-loaders)
+# One object library turns each on exactly once for whichever examples load assets.
+add_library(noapi-example-loaders OBJECT loaders.cpp)
+target_include_directories(noapi-example-loaders PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+set_target_properties(noapi-example-loaders PROPERTIES CXX_STANDARD 26)
+noapi_enable_lto(noapi-example-loaders)
 
-# The files the asset loading tests open at runtime. A native build reads them out of the source
-# tree, so TEST_ASSET_DIR points there; Emscripten has no filesystem to read them from, so they are
-# packed into the module's virtual one under /assets and TEST_ASSET_DIR points at that instead.
-set(NOAPI_TEST_ASSETS
+# The files the asset loading examples open at runtime. A native build reads them out of the source
+# tree, so EXAMPLE_ASSET_DIR points there; Emscripten has no filesystem to read them from, so they are
+# packed into the module's virtual one under /assets and EXAMPLE_ASSET_DIR points at that instead.
+set(NOAPI_EXAMPLE_ASSETS
 	pexels-70588695-35341664.jpg
 	sunflowers_puresky_2k.hdr
 	teapot.obj
 )
 
-# noapi_add_test(<name> [ASSETS] [C_COMPAT])
+# noapi_add_example(<name> [ASSETS] [C_COMPAT])
 #
 # Declares <name> as an executable built from <name>.cpp against the selected backend.
 #
-# ASSETS gives it the loader library and a TEST_ASSET_DIR to find the files above in.
-# C_COMPAT links the C translation unit, which only one test needs to carry for the build to be
+# ASSETS gives it the loader library and an EXAMPLE_ASSET_DIR to find the files above in.
+# C_COMPAT links the C translation unit, which only one example needs to carry for the build to be
 # checked.
-function(noapi_add_test name)
+function(noapi_add_example name)
 	cmake_parse_arguments(ARG "ASSETS;C_COMPAT" "" "" ${ARGN})
 
 	if(WIN32)
@@ -80,7 +80,7 @@ function(noapi_add_test name)
 	endif()
 
 	# noapi::noapi is whichever backend NOAPI_DEFAULT_BACKEND selected, and carries the
-	# NOAPI_BACKEND_VULKAN/NOAPI_BACKEND_WEBGPU define that the tests branch on
+	# NOAPI_BACKEND_VULKAN/NOAPI_BACKEND_WEBGPU define that the examples branch on
 	target_link_libraries(${name} PUBLIC glfw noapi::noapi)
 	target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 	set_target_properties(${name} PROPERTIES CXX_STANDARD 26)
@@ -95,15 +95,15 @@ function(noapi_add_test name)
 	endif()
 
 	if(ARG_ASSETS)
-		target_link_libraries(${name} PUBLIC noapi-test-loaders)
+		target_link_libraries(${name} PUBLIC noapi-example-loaders)
 		if(EMSCRIPTEN)
-			target_compile_definitions(${name} PRIVATE TEST_ASSET_DIR="/assets")
-			foreach(asset ${NOAPI_TEST_ASSETS})
+			target_compile_definitions(${name} PRIVATE EXAMPLE_ASSET_DIR="/assets")
+			foreach(asset ${NOAPI_EXAMPLE_ASSETS})
 				target_link_options(${name} PRIVATE
 					"SHELL:--preload-file ${CMAKE_CURRENT_SOURCE_DIR}/${asset}@/assets/${asset}")
 			endforeach()
 		else()
-			target_compile_definitions(${name} PRIVATE TEST_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+			target_compile_definitions(${name} PRIVATE EXAMPLE_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 		endif()
 	endif()
 
@@ -114,12 +114,12 @@ function(noapi_add_test name)
 	endif()
 endfunction()
 
-noapi_add_test(0_basic C_COMPAT)
-noapi_add_test(1_texture ASSETS)
-noapi_add_test(2_compute_texture)
-noapi_add_test(3_meshlet)
-noapi_add_test(4_pbr ASSETS)
-noapi_add_test(5_raytrace)
+noapi_add_example(0_basic C_COMPAT)
+noapi_add_example(1_texture ASSETS)
+noapi_add_example(2_compute_texture)
+noapi_add_example(3_meshlet)
+noapi_add_example(4_pbr ASSETS)
+noapi_add_example(5_raytrace)
 
 if(EMSCRIPTEN)
 	add_custom_target(serve

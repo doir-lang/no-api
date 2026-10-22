@@ -95,6 +95,17 @@ if(NOAPI_ENABLE_WEBGPU)
 	add_subdirectory(webgpu)
 endif()
 
+# Instruments the backends for tools/coverage.py. Unoptimized so that line counts match the source; everything else keeps its build type.
+option(NOAPI_ENABLE_COVERAGE "Instrument the backends for gcov line coverage" OFF)
+if(NOAPI_ENABLE_COVERAGE)
+	foreach(backend noapi-vulkan noapi-webgpu)
+		if(TARGET ${backend})
+			target_compile_options(${backend} PRIVATE --coverage -O0)
+			target_link_options(${backend} PUBLIC --coverage)
+		endif()
+	endforeach()
+endif()
+
 # Alias the selected default backend as noapi::noapi
 if(NOAPI_DEFAULT_BACKEND STREQUAL "vulkan")
 	if(NOT NOAPI_ENABLE_VULKAN)
@@ -111,7 +122,17 @@ else()
 endif()
 
 if(PROJECT_IS_TOP_LEVEL)
-	add_subdirectory(test)
+	add_subdirectory(examples)
+endif()
+
+# The examples in the headers' documentation, run headlessly by tools/doctest.py. Emscripten has no headless device to run them on.
+if(EMSCRIPTEN)
+	option(NOAPI_BUILD_DOCTESTS "Build the header documentation examples" OFF)
+else()
+	option(NOAPI_BUILD_DOCTESTS "Build the header documentation examples" ${PROJECT_IS_TOP_LEVEL})
+endif()
+if(NOAPI_BUILD_DOCTESTS)
+	add_subdirectory(doctests)
 endif()
 
 # ---------------------------------------------------------------------------

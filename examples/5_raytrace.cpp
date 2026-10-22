@@ -354,12 +354,44 @@ static constexpr GpuSamplerDesc IMAGE_SAMPLER {
 static constexpr uint32_t IMAGE_SAMPLED = 0;
 static constexpr uint32_t IMAGE_STORAGE = 1;
 
-static constexpr std::array<Sphere, 4> SCENE {{
-	{.center = {-1.3f, -0.35f, -0.4f}, .radius = 0.65f, .albedo = {0.85f, 0.32f, 0.28f}, .reflectivity = 0.08f},
-	{.center = { 0.0f,  0.00f,  0.0f}, .radius = 1.00f, .albedo = {0.95f, 0.95f, 0.97f}, .reflectivity = 0.92f},
-	{.center = { 1.5f, -0.45f, -0.7f}, .radius = 0.55f, .albedo = {0.30f, 0.70f, 0.45f}, .reflectivity = 0.10f},
-	{.center = { 0.5f, -0.55f,  1.4f}, .radius = 0.45f, .albedo = {0.90f, 0.75f, 0.35f}, .reflectivity = 0.45f},
+// How a ball moves: circling the middle of the scene and bouncing on the ground. A zero orbit radius keeps it where it is.
+struct Motion {
+	float orbit_radius, orbit_speed, orbit_phase;
+	float bounce_height, bounce_speed;
+};
+
+// The CPU's view of a ball; the GPU only gets the Sphere, whose layout the shader fixes.
+struct Ball {
+	Sphere sphere;
+	Motion motion;
+};
+
+// The red orbit and the shared outer one are 1.25 apart, more than the 1.2 their radii need, so nothing collides
+static constexpr std::array<Ball, 4> SCENE {{
+	{.sphere = {.radius = 0.65f, .albedo = {0.85f, 0.32f, 0.28f}, .reflectivity = 0.08f},
+		.motion = {.orbit_radius = 1.75f, .orbit_speed =  0.45f, .orbit_phase = 3.4f, .bounce_height = 0.35f, .bounce_speed = 1.8f}},
+	{.sphere = {.center = {0.0f, 0.0f, 0.0f}, .radius = 1.00f, .albedo = {0.95f, 0.95f, 0.97f}, .reflectivity = 0.92f}},
+	{.sphere = {.radius = 0.55f, .albedo = {0.30f, 0.70f, 0.45f}, .reflectivity = 0.10f},
+		.motion = {.orbit_radius = 3.00f, .orbit_speed = -0.30f, .orbit_phase = 5.9f, .bounce_height = 0.60f, .bounce_speed = 2.4f}},
+	{.sphere = {.radius = 0.45f, .albedo = {0.90f, 0.75f, 0.35f}, .reflectivity = 0.45f},
+		.motion = {.orbit_radius = 3.00f, .orbit_speed = -0.30f, .orbit_phase = 2.8f, .bounce_height = 0.90f, .bounce_speed = 3.1f}},
 }};
+
+static void place_spheres(Sphere* spheres, float time) {
+	for(size_t i = 0; i < SCENE.size(); ++i) {
+		auto& [sphere, motion] = SCENE[i];
+		spheres[i] = sphere;
+		if(motion.orbit_radius == 0.0f) continue;
+
+		auto angle = motion.orbit_phase + time * motion.orbit_speed;
+		auto bounce = std::abs(std::sin(time * motion.bounce_speed));
+		spheres[i].center = {
+			std::cos(angle) * motion.orbit_radius,
+			GROUND_HEIGHT + sphere.radius + bounce * motion.bounce_height,
+			std::sin(angle) * motion.orbit_radius,
+		};
+	}
+}
 
 
 static Texture create_trace_image(App& app, GpuTextureDescriptor* heap, gpu* heap_gpu) {
@@ -408,7 +440,7 @@ TEST_MAIN({
 	std::println("image: {}x{}, {} mip level, retraced every frame", app.width, app.height, image.desc.mipCount);
 
 	auto spheres = gpuMalloc<Sphere>(app.queue, SCENE.size());
-	memcpy(spheres, SCENE.data(), SCENE.size() * sizeof(Sphere));
+	place_spheres(spheres, float(glfwGetTime()));
 	auto spheres_gpu = gpuHostToDevicePointer(app.queue, spheres);
 
 	auto trace = gpuMalloc<TraceData>(app.queue);
@@ -460,7 +492,7 @@ TEST_MAIN({
 	Controls controls;
 	double last_time = glfwGetTime();
 
-	std::println("scene: {} spheres over a plane at y = {}", SCENE.size(), GROUND_HEIGHT);
+	std::println("scene: {} spheres over a plane at y = {}, three of them circling the mirror", SCENE.size(), GROUND_HEIGHT);
 	std::println("controls: up/down bounces, [ ] exposure");
 
 	run(app, [&](App& app, GpuCommandBuffer* cmd, const GpuTexture* backbuffer) {
@@ -490,6 +522,9 @@ TEST_MAIN({
 		trace->bounces = controls.bounces;
 		trace->exposure = controls.exposure;
 
+		place_spheres(spheres, float(now));
+
+		gpuSyncMemoryEXT(cmd, spheres_gpu);
 		gpuSyncMemoryEXT(cmd, trace_gpu);
 		gpuSetActiveTextureHeapPtr(cmd, heap_gpu);
 		gpuSetEnabledSamplersEXT(cmd, {&IMAGE_SAMPLER, 1});

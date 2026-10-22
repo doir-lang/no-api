@@ -5,39 +5,19 @@
 // ---------------------------------------------------------------------------
 
 /**
- * Every public header in this API is written to parse as both C++ and C99, so that the
- * same (C++ built) library can be called from either language. This header holds the
- * pieces that make that possible: the macros that spell a C++ only piece of syntax in a
- * way C can swallow, and the small vocabulary types that stand in for the standard
- * library ones the API would otherwise take by value.
+ * Every public header in this API is written to parse as both C++ and C11, so that the same (C++ built) library can be called from either language. This header holds the pieces that make that possible: the macros that spell a C++ only piece of syntax in a way C can swallow, and the small vocabulary types that stand in for the standard library ones the API would otherwise take by value.
  *
  * The rules the rest of the headers follow:
  *
- * - Functions meant to be called from C are declared inside a
- * NOAPI_EXTERN_C_BEGIN/END pair, so they get C language linkage and can be linked
- * against from a C translation unit. Only one function of a given name may have C
- * linkage, so overload sets are given one canonical C entry point each; the remaining
- * overloads are C++ only conveniences that forward to it.
+ * - Functions meant to be called from C are declared inside a NOAPI_EXTERN_C_BEGIN/END pair, so they get C language linkage and can be linked against from a C translation unit. Only one function of a given name may have C linkage, so overload sets are given one canonical C entry point each; the remaining overloads are C++ only conveniences that forward to it.
  *
- * - Templates, and anything else that has no C spelling at all (std::hash
- * specializations, the std::expected returning setup helpers, the backends' internal
- * object definitions), live inside #ifdef __cplusplus.
+ * - Templates, and anything else that has no C spelling at all (std::hash specializations, the std::expected returning setup helpers, the backends' internal object definitions), live inside #ifdef __cplusplus.
  *
- * - Default arguments and default member initializers are written NOAPI_DEFAULT(value),
- * which disappears in C. A C caller therefore has to pass every argument; the
- * descriptor structs come with GPU_*_DEFAULT initializer macros so that their
- * documented defaults are still reachable.
+ * - Default arguments and default member initializers are written NOAPI_DEFAULT(value), which disappears in C. A C caller therefore has to pass every argument; the descriptor structs come with GPU_*_DEFAULT initializer macros so that their documented defaults are still reachable.
  *
- * - std::span, std::optional and std::string_view parameters are replaced by the
- * GpuXSpan / GpuOptionalX / GpuStringView structs below. In C they are plain structs;
- * in C++ they convert implicitly to and from the standard type they stand for and carry
- * enough of its interface (size(), data(), begin()/end(), operator*, ...) to be used
- * like it.
+ * - std::span, std::optional and std::string_view parameters are replaced by the GpuXSpan / GpuOptionalX / GpuStringView structs below. In C they are plain structs; in C++ they convert implicitly to and from the standard type they stand for and carry enough of its interface (size(), data(), begin()/end(), operator*, ...) to be used like it.
  *
- * - A parameter that is a const reference in C++ is written NOAPI_CONST_REF(T), which is
- * a const T* in C. This is the one place the two faces of a declaration are not the
- * same type: it relies on a reference being passed as a pointer, which both the Itanium
- * C++ ABI (every Unix-like target) and MSVC guarantee.
+ * - A parameter that is a const reference in C++ is written NOAPI_CONST_REF(T), which is a const T* in C. This is the one place the two faces of a declaration are not the same type: it relies on a reference being passed as a pointer, which both the Itanium C++ ABI (every Unix-like target) and MSVC guarantee. Code that has to compile as both passes the argument as NOAPI_REF(value).
  */
 
 #ifdef __cplusplus
@@ -49,12 +29,14 @@
 	#include <string_view>
 	#include <type_traits>
 
+	/**
+	 * NOAPI_EXTERN_C_BEGIN / NOAPI_EXTERN_C_END – Open and close a run of declarations with C language linkage. Nothing in C, which has no other kind.
+	 */
 	#define NOAPI_EXTERN_C_BEGIN extern "C" {
 	#define NOAPI_EXTERN_C_END }
 
 	/**
-	 * NOAPI_DEFAULT – A default argument or default member initializer. Present in C++,
-	 * gone in C (where the value is documented by the matching GPU_*_DEFAULT macro instead).
+	 * NOAPI_DEFAULT – A default argument or default member initializer. Present in C++, gone in C (where the value is documented by the matching GPU_*_DEFAULT macro instead).
 	 */
 	#define NOAPI_DEFAULT(...) = __VA_ARGS__
 
@@ -63,13 +45,26 @@
 	 */
 	#define NOAPI_CONST_REF(TYPE) const TYPE&
 
+	/**
+	 * NOAPI_REF – Pass an lvalue to a NOAPI_CONST_REF parameter from code that compiles as both C and C++: the value itself in C++, its address in C.
+	 *
+	 * @code
+	 * GpuDepthStencilDesc desc = GPU_DEPTH_STENCIL_DESC_DEFAULT;
+	 * GpuDepthStencilState* state = gpuCreateDepthStencilState(queue, NOAPI_REF(desc));
+	 * gpuFreeDepthStencilState(queue, state);
+	 * @endcode
+	 */
+	#define NOAPI_REF(VALUE) (VALUE)
+
+	/**
+	 * NOAPI_INLINE / NOAPI_CONSTEXPR / NOAPI_NOEXCEPT – The specifiers a header-defined function carries in C++, spelled so that C (which has none of them) sees a static inline function instead.
+	 */
 	#define NOAPI_INLINE inline
 	#define NOAPI_CONSTEXPR constexpr
 	#define NOAPI_NOEXCEPT noexcept
 
 	/**
-	 * NOAPI_ALIGNAS – Raises a struct member's alignment, and with it the struct's own.
-	 * Spelled on a member rather than on the type because C only allows it there.
+	 * NOAPI_ALIGNAS – Raises a struct member's alignment, and with it the struct's own. Spelled on a member rather than on the type because C only allows it there.
 	 */
 	#define NOAPI_ALIGNAS(BYTES) alignas(BYTES)
 #else
@@ -82,12 +77,11 @@
 
 	#define NOAPI_DEFAULT(...)
 	#define NOAPI_CONST_REF(TYPE) const TYPE*
+	#define NOAPI_REF(VALUE) (&(VALUE))
 
 	#define NOAPI_INLINE static inline
 	#define NOAPI_CONSTEXPR static inline
 	#define NOAPI_NOEXCEPT
-
-	/// See the C++ flavour above.
 	#define NOAPI_ALIGNAS(BYTES) _Alignas(BYTES)
 #endif
 
@@ -96,18 +90,11 @@
 // ---------------------------------------------------------------------------
 
 /**
- * NOAPI_SPAN_TYPE – Declares a {pointer, count} view over a contiguous, read only run of
- * ELEMENT (which is always const qualified, and for which `ELEMENT*` is the pointer the
- * struct stores).
+ * NOAPI_SPAN_TYPE – Declares a {pointer, count} view over a contiguous, read only run of ELEMENT (which is always const qualified, and for which `ELEMENT*` is the pointer the struct stores).
  *
- * The two members are named ptr and count rather than data and size so that the C++ face
- * can also offer the data()/size() accessors std::span is used through; C code reads the
- * members directly.
+ * The two members are named ptr and count rather than data and size so that the C++ face can also offer the data()/size() accessors std::span is used through; C code reads the members directly.
  *
- * In C++ the type converts implicitly from std::span, from any contiguous range (a
- * std::vector or std::array of the element type), and from a {pointer, count} pair, and
- * back to std::span, so it can be passed and consumed exactly like the std::span it
- * replaced.
+ * In C++ the type converts implicitly from std::span, from any contiguous range (a std::vector or std::array of the element type), and from a {pointer, count} pair, and back to std::span, so it can be passed and consumed exactly like the std::span it replaced.
  */
 #ifdef __cplusplus
 	#define NOAPI_SPAN_TYPE(NAME, ELEMENT) \
@@ -145,12 +132,10 @@
 		} NAME
 #endif
 
-/**
- * GpuByteSpan – A read only view of raw bytes, used for the shader source handed to the
- * pipeline creation functions (Slang text; see shaders.h). Stands in for
- * std::span<const std::byte>.
- */
 #ifdef __cplusplus
+	/**
+	 * GpuByteSpan – A read only view of raw bytes, used for the shader source handed to the pipeline creation functions (Slang text; see shaders.h). Stands in for std::span<const std::byte>.
+	 */
 	struct GpuByteSpan {
 		const void* ptr;
 		size_t count; ///< Size of the run in bytes.
@@ -176,11 +161,10 @@
 	} GpuByteSpan;
 #endif
 
-/**
- * GpuStringView – A borrowed, not necessarily null terminated run of characters, used for
- * the messages handed to an error callback. Stands in for std::string_view.
- */
 #ifdef __cplusplus
+	/**
+	 * GpuStringView – A borrowed, not necessarily null terminated run of characters, used for the messages handed to an error callback. Stands in for std::string_view.
+	 */
 	struct GpuStringView {
 		const char* ptr;
 		size_t count; ///< Length of the text in characters, excluding any null terminator.
@@ -203,8 +187,7 @@
 #endif
 
 /**
- * GpuCStringSpan – A read only view of an array of null terminated strings, as the
- * platform layers want their extension and layer lists.
+ * GpuCStringSpan – A read only view of an array of null terminated strings, as the platform layers want their extension and layer lists.
  */
 NOAPI_SPAN_TYPE(GpuCStringSpan, const char* const);
 
@@ -213,14 +196,9 @@ NOAPI_SPAN_TYPE(GpuCStringSpan, const char* const);
 // ---------------------------------------------------------------------------
 
 /**
- * NOAPI_OPTIONAL_TYPE – Declares a {flag, value} struct standing in for
- * std::optional<TYPE>.
+ * NOAPI_OPTIONAL_TYPE – Declares a {flag, value} struct standing in for std::optional<TYPE>.
  *
- * The flag is a plain member named has_value (so C code can read and write it), which is
- * why the C++ face spells the test as `if(optional)` rather than `optional.has_value()`.
- * Everything else std::optional is used through — operator*, operator->, value_or, and
- * implicit conversion to and from std::optional itself — is provided, along with an
- * implicit conversion from a bare value and from std::nullopt.
+ * The flag is a plain member named has_value (so C code can read and write it), which is why the C++ face spells the test as `if(optional)` rather than `optional.has_value()`. Everything else std::optional is used through — operator*, operator->, value_or, and implicit conversion to and from std::optional itself — is provided, along with an implicit conversion from a bare value and from std::nullopt.
  */
 #ifdef __cplusplus
 	#define NOAPI_OPTIONAL_TYPE(NAME, TYPE) \

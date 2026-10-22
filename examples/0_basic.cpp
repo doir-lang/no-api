@@ -228,7 +228,7 @@ static void emscripten_frame(void *arg) {
 #endif
 
 int real_main() {
-	assert(noapi_c_compat_packed_default_sampler() == GpuSamplerDesc{}.pack() && "C and C++ disagree about GpuSamplerDesc");
+	assert(noapi_c_compat_packed_default_sampler() == gpuSamplerDescPackEXT(GpuSamplerDesc{}) && "C and C++ disagree about GpuSamplerDesc");
 
 	AppState state = {0};
 	const int initial_width = 800;
@@ -329,15 +329,15 @@ int real_main() {
 
 	auto caps = gpuGetSurfaceCapabilitiesEXT(state.queue, state.surface);
 	std::print("surface formats (best first):");
-	for(auto format: caps.formatList())
+	for(auto format: std::span(caps.formats, caps.formatCount))
 		std::print(" {}{}", (int)format, gpuFormatIsSrgbEXT(format) ? " (srgb)" : "");
 	std::print("\npresent modes (best first):");
-	for(auto mode: caps.presentModeList())
+	for(auto mode: std::span(caps.presentModes, caps.presentModeCount))
 		std::print(" {}", (int)mode);
 	std::println("\ntransparency: {}", caps.supportsTransparency);
 
 	GpuSurfaceDescriptor config;
-	for(auto format: caps.formatList())
+	for(auto format: std::span(caps.formats, caps.formatCount))
 		if(!gpuFormatIsSrgbEXT(format)) {
 			config = gpuSurfaceGetConfigurationEXT(state.surface);
 			config.texture.format = format;

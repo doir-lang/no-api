@@ -220,7 +220,7 @@ static constexpr GpuSamplerDesc ENVIRONMENT_SAMPLER {
 
 
 static std::vector<uint16_t> load_environment() {
-	constexpr auto path = TEST_ASSET_DIR "/sunflowers_puresky_2k.hdr";
+	constexpr auto path = EXAMPLE_ASSET_DIR "/sunflowers_puresky_2k.hdr";
 
 	int width, height, channels;
 	auto pixels = stbi_loadf(path, &width, &height, &channels, 3);
@@ -245,11 +245,11 @@ static std::vector<uint16_t> load_environment() {
 }
 
 static std::vector<MeshVertex> load_teapot(std::vector<uint32_t>& out_indices) {
-	constexpr auto path = TEST_ASSET_DIR "/teapot.obj";
+	constexpr auto path = EXAMPLE_ASSET_DIR "/teapot.obj";
 
 	tinyobj::ObjReaderConfig config;
 	config.triangulate = true;
-	config.mtl_search_path = TEST_ASSET_DIR;
+	config.mtl_search_path = EXAMPLE_ASSET_DIR;
 
 	tinyobj::ObjReader reader;
 	if(!reader.ParseFromFile(path, config))

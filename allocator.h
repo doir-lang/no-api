@@ -15,8 +15,7 @@
 NOAPI_EXTERN_C_BEGIN
 
 /**
- * CpuAllocatorFunc – Function pointer type for a custom CPU-side allocator hook,
- * matching the realloc/free semantics documented on gpuDefaultCpuAllocator.
+ * CpuAllocatorFunc – Function pointer type for a custom CPU-side allocator hook, matching the realloc/free semantics documented on gpuDefaultCpuAllocator.
  *
  * @param p Existing allocation to resize or free, or NULL to allocate fresh memory.
  * @param size Requested size in bytes, or 0 to free \p p.
@@ -24,16 +23,24 @@ NOAPI_EXTERN_C_BEGIN
 typedef void *(*CpuAllocatorFunc)(void *p, size_t size);
 
 /**
- * gpuDefaultCpuAllocator – Default CPU-side host allocator hook, implementing
- * realloc/free-style semantics:
+ * gpuDefaultCpuAllocator – Default CPU-side host allocator hook, implementing realloc/free-style semantics:
  *
  * - If \p p is NULL and \p size > 0: allocates new memory.
  * - If \p p is not NULL and \p size > 0: reallocates and copies data.
  * - If \p size is 0: frees memory and returns NULL.
  * - If \p size equals the current allocation size: may return \p p unchanged.
  *
+ * @code
+ * int* numbers = (int*)gpuDefaultCpuAllocator(NULL, 4 * sizeof(int));
+ * assert(numbers);
+ * numbers = (int*)gpuDefaultCpuAllocator(numbers, 8 * sizeof(int));
+ * assert(numbers);
+ * assert(gpuDefaultCpuAllocator(numbers, 0) == NULL);
+ * @endcode
+ *
  * @param p Existing allocation to resize or free, or NULL to allocate fresh memory.
  * @param size Requested size in bytes, or 0 to free \p p.
+ * @return The allocation, or NULL when freeing or when the memory could not be had, in which case \p p is left as it was.
  */
 NOAPI_INLINE void* gpuDefaultCpuAllocator(void* p, size_t size) NOAPI_NOEXCEPT {
 	if(size == 0) {
@@ -48,9 +55,7 @@ NOAPI_EXTERN_C_END
 
 #ifdef __cplusplus
 /**
- * default_ – Namespace holding default implementations for optional callback
- * hooks used by the API. Kept as the C++ spelling of the gpuDefault* hooks, which are
- * what a C caller (and the default arguments in these headers) names them by.
+ * default_ – Namespace holding default implementations for optional callback hooks used by the API. Kept as the C++ spelling of the gpuDefault* hooks, which are what a C caller (and the default arguments in these headers) names them by.
  */
 namespace default_ {
 	inline constexpr CpuAllocatorFunc cpu_allocator = gpuDefaultCpuAllocator;

@@ -4,22 +4,7 @@
 // Shader Compilation – shared implementation
 // ---------------------------------------------------------------------------
 
-/**
- * The half of shaders.h that is the same whichever backend is built: the global Slang
- * session, the registry behind the gpu*SlangEXT functions, and the portable `noapi`
- * module every shader imports.
- *
- * This is a header rather than a translation unit of its own because the two backends are
- * separate static libraries that are never linked into the same binary (see the note on
- * GpuSamplerDescListHash in samplers.h). Each one therefore gets its own copy, which is
- * also what keeps the gpu*SlangEXT definitions from being two definitions of one symbol.
- *
- * A backend supplies the other half: the source of the `noapi_backend` module that the
- * portable module is written against. On Vulkan that source is fixed (NOAPI_BACKEND_MODULE
- * in vulkan/noapi.cpp); on WebGPU it is regenerated from the queue's monobuffer and
- * monotexture set every time that set changes (generate_backend_module in
- * webgpu/noapi.cpp).
- */
+// The backend independent half of shaders.h. A header because each backend library is linked alone and needs its own copy; backends supply `noapi_backend`.
 
 #ifdef __cplusplus
 
@@ -39,43 +24,17 @@
 
 namespace GPU::shaders {
 
-/**
- * STAGE – Which entry point a compile is looking for. Deliberately not the STAGE enum in
- * compute.h, which names pipeline stages for barriers rather than shader entry points.
- */
+// Which entry point a compile looks for; compute.h's STAGE names pipeline stages for barriers instead.
 enum class SHADER_STAGE { COMPUTE, VERTEX, FRAGMENT, MESH };
 
-/**
- * is_graphics – Whether a stage belongs to a graphics pipeline, which is every stage but
- * compute. What this selects is which set of root pointers the backend module exposes
- * (GPU_COMPUTE below), and a mesh shader is handed the graphics set.
- */
+// A mesh shader counts as graphics, so it gets the draw's root pointers.
 constexpr inline bool is_graphics(SHADER_STAGE stage) { return stage != SHADER_STAGE::COMPUTE; }
 
 // ---------------------------------------------------------------------------
 // The portable module
 // ---------------------------------------------------------------------------
 
-/**
- * PORTABLE_MODULE – The `noapi` module, as every shader sees it. Identical on both
- * backends; everything that differs between them is reached through `noapi_backend`.
- *
- * What a backend has to supply is deliberately tiny. Memory is two functions —
- * gpuBackendLoadU32 and gpuBackendStoreU32, one 32 bit word at a raw address — and
- * everything a shader actually writes (a typed pointer, an array index, a matrix, a struct
- * of its own) is built out of those two here, generically, by GpuPtr<T> and the IGpuLoadable
- * conformances. The rest of the backend module is only what cannot be said in terms of a
- * word: which root pointers the dispatch or draw was given, and the sampler and texture
- * entry points.
- *
- * GPU_COMPUTE / GPU_GRAPHICS select which root data accessors exist, and GPU_STORES says
- * whether writes are reachable at all — they are not from a WebGPU graphics stage, where
- * the monobuffers are bound read only, so a pointer there has no setter and `p[i] = v`
- * fails to compile rather than silently going nowhere. GPU_TEXTURE_STORES says the same of
- * gpuStoreTexture, separately, because the two are not limited by the same thing: WebGPU
- * also binds a storage texture to a compute pass and not to a render one, since no pass may
- * have a texture bound as writable and as sampled at once.
- */
+// Shaders' `noapi` module, identical on both backends: everything is built on noapi_backend's one word load and store. GPU_STORES and GPU_TEXTURE_STORES gate writes.
 constexpr static const char* PORTABLE_MODULE = R"slang(
 module noapi;
 import noapi_backend;
@@ -532,14 +491,7 @@ public void gpuStoreTexture2D(uint heap_index, uint2 texel, float4 value) {
 // Registry
 // ---------------------------------------------------------------------------
 
-/**
- * Registry – What the gpu*SlangEXT functions configure: the extra modules and search
- * paths a shader may import, and the macros every compile starts with.
- *
- * `generation` counts changes to any of it. A cached session was built against one value
- * of it and is thrown away once it no longer matches, which is what makes a registration
- * reach pipelines created afterwards.
- */
+// `generation` counts changes, so a session built against an older one is discarded and registrations reach later pipelines.
 struct Registry {
 	std::mutex mutex;
 	std::vector<std::string> search_paths;
@@ -555,7 +507,7 @@ inline Registry& registry() {
 	return instance;
 }
 
-/// The two module names the API owns, which a user registration may not shadow
+// The two module names the API owns, which a user registration may not shadow
 inline bool is_reserved_module(std::string_view name) {
 	return name == "noapi" || name == "noapi_backend";
 }
@@ -580,14 +532,7 @@ inline void report_diagnostic(std::string_view message) {
 // Sessions
 // ---------------------------------------------------------------------------
 
-/**
- * global_session – The one IGlobalSession, created on first use. It holds the parsed core
- * module, which is the expensive part of starting the compiler, so every session is built
- * from this rather than from scratch.
- *
- * A global session is explicitly not thread safe, so every use of it (and of anything
- * created from it) is serialized on compile_mutex below.
- */
+// Holds the parsed core module, the expensive part of starting Slang. Not thread safe, so every use is serialized on compile_mutex.
 inline slang::IGlobalSession* global_session() {
 	static Slang::ComPtr<slang::IGlobalSession> instance = [] {
 		Slang::ComPtr<slang::IGlobalSession> session;
@@ -603,15 +548,7 @@ inline std::mutex& compile_mutex() {
 	return instance;
 }
 
-/**
- * SessionCache – The last session built, kept so that a backend recompiling the same
- * shaders against the same bindings (which WebGPU does on every layout change) does not
- * reload `noapi` and the registered modules each time.
- *
- * Keyed by everything a session bakes in: the target, the backend module's source, the
- * macros, and the registry generation. User shaders are loaded into it under a unique
- * name per compile, so nothing accumulated in it is ever stale.
- */
+// The last session, keyed by everything it bakes in, so WebGPU's recompiles on layout changes don't reload every module.
 struct SessionCache {
 	Slang::ComPtr<slang::ISession> session;
 	SlangCompileTarget target = SLANG_TARGET_UNKNOWN;
@@ -620,16 +557,7 @@ struct SessionCache {
 	uint64_t generation = 0;
 	uint64_t next_user_module = 0;
 
-	/**
-	 * code – What compile() already produced for this session, keyed by stage and source.
-	 *
-	 * Not just an optimization. A shader is recompiled whenever the bindings move underneath
-	 * it, and on WebGPU a render pipeline is rebuilt whenever the depth, blend or index state
-	 * it was baked against changes, which can be as often as every frame. Without this each of
-	 * those would run the whole compiler again *and* leave another module behind in the
-	 * session, which never forgets one. Everything in here was built against this session, so
-	 * it is dropped along with it.
-	 */
+	// Without this, every rebuild (on WebGPU possibly each frame) would rerun the compiler and leave another module in the session forever.
 	std::unordered_map<std::string, std::string> code;
 };
 
@@ -638,7 +566,7 @@ inline SessionCache& session_cache() {
 	return instance;
 }
 
-/// Drops whatever the compiler cached. Called by every gpu*SlangEXT mutation.
+// Drops whatever the compiler cached. Called by every gpu*SlangEXT mutation.
 inline void invalidate_sessions() {
 	std::lock_guard lock(compile_mutex());
 	auto& cache = session_cache();
@@ -650,12 +578,7 @@ inline void invalidate_sessions() {
 	cache.code.clear();
 }
 
-/**
- * get_session – The session for this target and backend module, reusing the cached one
- * when nothing it was built against has changed.
- *
- * Callers hold compile_mutex().
- */
+// Callers hold compile_mutex().
 inline slang::ISession* get_session(SlangCompileTarget target, std::string_view backend_module,
 	const std::vector<std::pair<std::string, std::string>>& extra_defines, std::string& out_error
 ) {
@@ -705,23 +628,9 @@ inline slang::ISession* get_session(SlangCompileTarget target, std::string_view 
 	for(auto& [name, value]: defines)
 		macros.push_back({name.c_str(), value.c_str()});
 
-	// Vulkan's clip space points the opposite way down the Y axis to WebGPU's. Rather than
-	// making every shader flip for one backend and not the other (which is what the two hand
-	// written shader sets this replaced had to do), the SPIR-V target is told to invert Y on
-	// the way out, so the same source lands the same way up on both.
-	// Slang lowers ResourceDescriptorHeap/SamplerDescriptorHeap two different ways. Without this
-	// capability it emits a traditional set/binding descriptor array, which a pipeline created with
-	// VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT then has to be handed an explicit
-	// VkShaderDescriptorSetAndBindingMappingInfoEXT for -- against binding numbers Slang picked. With
-	// it, the heap access is emitted as SPV_EXT_descriptor_heap and needs no mapping at all, which is
-	// what the Vulkan backend's heap is built around.
+	// Vulkan's clip space Y points the other way, so SPIR-V inverts Y. spvDescriptorHeapEXT emits heap access as SPV_EXT_descriptor_heap, needing no binding map.
 	auto descriptor_heap = global->findCapability("spvDescriptorHeapEXT");
-	// Mesh shading is what a mesh entry point lowers through, and saying so here rather than
-	// letting it be inferred is what keeps the diagnostic for a mesh shader on a target that
-	// cannot run one a compile error rather than a silently mis-lowered module. A shader with no
-	// mesh entry point emits none of it, so declaring it costs a device without
-	// VK_EXT_mesh_shader nothing -- what such a device refuses is the pipeline, which
-	// gpuGetCapabilitiesEXT().mesh_shaders says up front.
+	// Declared so a mesh shader on an incapable target is a compile error; shaders without one emit none of it.
 	auto mesh_shading = global->findCapability("spvMeshShadingEXT");
 
 	slang::CompilerOptionEntry spirv_options[] = {
@@ -732,8 +641,7 @@ inline slang::ISession* get_session(SlangCompileTarget target, std::string_view 
 
 	slang::TargetDesc target_desc {
 		.format = target,
-		// Leaving the profile unset makes the target reject compute shaders on some paths,
-		// and every stage this API compiles is covered by this one
+		// An unset profile makes some paths reject compute shaders; this one covers every stage the API compiles.
 		.profile = global->findProfile(target == SLANG_SPIRV ? "spirv_1_5" : "glsl_450"),
 		.compilerOptionEntries = target == SLANG_SPIRV ? spirv_options : nullptr,
 		.compilerOptionEntryCount = target == SLANG_SPIRV ? (uint32_t)std::size(spirv_options) : 0,
@@ -754,14 +662,7 @@ inline slang::ISession* get_session(SlangCompileTarget target, std::string_view 
 		return nullptr;
 	}
 
-	// The modules a shader may import, innermost first: the backend's half of the ABI, the
-	// portable module written against it, and then whatever the program registered.
-	//
-	// The API's own two have to go in before the registered ones, not after: a module is
-	// compiled as it is loaded, so anything it imports has to already be in the session. A
-	// registered module that says `import noapi` -- which is the whole point of being able to
-	// register one that describes a shared data layout -- fails to find it otherwise. Nothing
-	// is lost by the order, since neither of the API's modules can import a registered one.
+	// The API's modules load first: a module compiles as it loads, so a registered one importing noapi needs it already present.
 	auto load = [&](const char* name, std::string_view source) -> bool {
 		Slang::ComPtr<slang::IBlob> diagnostics;
 		auto path = std::string(name) + ".slang";
@@ -815,22 +716,6 @@ inline const char* stage_name(SHADER_STAGE stage) {
 	return "unknown";
 }
 
-/**
- * compile – Turn a shader's Slang source into the code the backend wants, by linking it
- * against the portable module and the backend module and emitting the one entry point
- * whose stage was asked for.
- *
- * The result is the blob Slang produced: SPIR-V words for SLANG_SPIRV, WGSL text for
- * SLANG_WGSL. It is returned by value because the caller outlives the session that
- * produced it.
- *
- * @param target What to emit.
- * @param backend_module Source of the `noapi_backend` module to link against.
- * @param source The shader's own Slang source.
- * @param stage Which entry point to emit.
- * @param extra_defines Macros the backend needs on top of the registered ones.
- * @param out_error Set to why the compile failed, when it does.
- */
 inline std::optional<std::string> compile(SlangCompileTarget target, std::string_view backend_module,
 	std::string_view source, SHADER_STAGE stage,
 	const std::vector<std::pair<std::string, std::string>>& extra_defines, std::string& out_error
@@ -842,8 +727,7 @@ inline std::optional<std::string> compile(SlangCompileTarget target, std::string
 
 	auto& cache = session_cache();
 
-	// Keyed by stage and source only: everything else a compile depends on is what the session
-	// itself was keyed by, and a new session starts with an empty cache
+	// Keyed by stage and source only; everything else is what the session itself was keyed by.
 	auto cache_key = std::to_string((int)stage) + '\n' + std::string(source);
 	if(auto found = cache.code.find(cache_key); found != cache.code.end())
 		return found->second;
@@ -861,9 +745,7 @@ inline std::optional<std::string> compile(SlangCompileTarget target, std::string
 		return std::nullopt;
 	}
 
-	// Entry points are found by stage rather than by name, so that one module can supply
-	// both halves of a graphics pipeline and be handed to the pipeline twice. A stage's
-	// entry point has to be unambiguous: two of the same stage is a shader level mistake.
+	// Entry points are found by stage, so one module can supply both halves of a graphics pipeline; two of one stage is an error.
 	auto wanted = to_slang_stage(stage);
 	Slang::ComPtr<slang::IEntryPoint> found;
 	for(SlangInt32 i = 0; i < module->getDefinedEntryPointCount(); ++i) {
@@ -871,8 +753,7 @@ inline std::optional<std::string> compile(SlangCompileTarget target, std::string
 		if(SLANG_FAILED(module->getDefinedEntryPoint(i, candidate.writeRef())) || !candidate)
 			continue;
 
-		// The stage is only reachable through a layout, and a module's own layout never
-		// lists its entry points, so each candidate is composed with the module to ask
+		// The stage is only reachable through a layout, and a module's own layout lists no entry points.
 		slang::IComponentType* parts[] = {module, candidate.get()};
 		Slang::ComPtr<slang::IComponentType> composed;
 		if(SLANG_FAILED(session->createCompositeComponentType(parts, 2, composed.writeRef())) || !composed)
@@ -932,9 +813,7 @@ inline std::optional<std::string> compile(SlangCompileTarget target, std::string
 // The public EXT surface
 // ---------------------------------------------------------------------------
 
-// Not inline: these are the definitions the rest of the program links against, and this header
-// is included by exactly one translation unit per backend library (that backend's noapi.cpp),
-// which is what makes one definition of each the right number.
+// Not inline: only one translation unit per backend library includes this, so this is the one definition.
 extern "C" {
 
 void gpuSetShaderDiagnosticCallbackEXT(GpuShaderDiagnosticCallbackEXT callback, void* userdata) {

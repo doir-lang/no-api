@@ -71,7 +71,7 @@ void noapi_c_compat_api(GpuQueue* queue, GpuSurface* surface, gpu* data) {
 	GpuDepthStencilDesc depth_desc = GPU_DEPTH_STENCIL_DESC_DEFAULT;
 	depth_desc.depthMode = DEPTH_READ | DEPTH_WRITE;
 	depth_desc.depthTest = OP_LESS_EQUAL;
-	GpuDepthStencilState* depth = gpuCreateDepthStencilState(queue, &depth_desc);
+	GpuDepthStencilState* depth = gpuCreateDepthStencilState(queue, NOAPI_REF(depth_desc));
 
 	GpuBlendDesc blend_desc = GPU_BLEND_DESC_DEFAULT;
 	GpuBlendState* blend = gpuCreateBlendState(queue, &blend_desc);

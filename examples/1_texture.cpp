@@ -101,7 +101,7 @@ static constexpr GpuSamplerDesc ALBEDO_SAMPLER {
 
 
 static std::vector<uint8_t> load_photo(float& out_aspect) {
-	constexpr auto path = TEST_ASSET_DIR "/pexels-70588695-35341664.jpg";
+	constexpr auto path = EXAMPLE_ASSET_DIR "/pexels-70588695-35341664.jpg";
 
 	int width, height, channels;
 	auto pixels = stbi_load(path, &width, &height, &channels, 4);

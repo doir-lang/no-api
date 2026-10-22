@@ -34,8 +34,8 @@
 	#include <emscripten/emscripten.h>
 #endif
 
-#ifndef TEST_ASSET_DIR
-	#define TEST_ASSET_DIR "."
+#ifndef EXAMPLE_ASSET_DIR
+	#define EXAMPLE_ASSET_DIR "."
 #endif
 
 namespace test {
@@ -316,7 +316,7 @@ inline void create_device(App& app) {
 
 	auto caps = gpuGetSurfaceCapabilitiesEXT(app.queue, app.surface);
 	app.surface_format = gpuSurfaceGetConfigurationEXT(app.surface).texture.format;
-	for(auto format: caps.formatList())
+	for(auto format: std::span(caps.formats, caps.formatCount))
 		if(!gpuFormatIsSrgbEXT(format)) {
 			auto config = gpuSurfaceGetConfigurationEXT(app.surface);
 			config.texture.format = format;

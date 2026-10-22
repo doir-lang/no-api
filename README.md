@@ -91,7 +91,9 @@ offset into one of a handful of "monobuffers". The shader looks the same either 
 | [`compat.h`](compat.h) | The macros and span/optional stand-ins that keep the headers valid C |
 | [`vulkan/`](vulkan) | Vulkan backend (`noapi.h` C interface, `noapi.hpp` C++ conveniences) |
 | [`webgpu/`](webgpu) | WebGPU backend (Dawn natively, the browser under Emscripten) |
-| [`test/`](test) | Sample programs that double as tests |
+| [`examples/`](examples) | Standalone sample programs |
+| [`doctests/`](doctests) | Harness that runs the examples in the headers' documentation |
+| [`tools/`](tools) | `doctest.py` (check and run the header examples) and `coverage.py` (backend line coverage) |
 
 Functions ending in `EXT` are extensions to the original design, such as surfaces, samplers,
 diagnostics and capability queries.
@@ -109,7 +111,7 @@ diagnostics and capability queries.
   GPU pointers are 64-bit tagged addresses.
 
 These are fetched with `FetchContent` when `find_package` can't find them: glslang,
-vk-bootstrap, VulkanMemoryAllocator, volk and GLFW (GLFW is only needed by the tests).
+vk-bootstrap, VulkanMemoryAllocator, volk and GLFW (GLFW is only needed by the examples), and doctest for the header examples.
 
 ## Building
 
@@ -125,7 +127,7 @@ git submodule update --init --recursive
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/test/0_basic
+./build/examples/0_basic
 ```
 
 **Native, Vulkan:**
@@ -142,7 +144,7 @@ cmake --build build-vk
 emcmake cmake -S . -B build-em -G Ninja -DCMAKE_BUILD_TYPE=Release \
 	-DNOAPI_SLANG_ROOT=/path/to/slang-wasm-release
 cmake --build build-em
-cmake --build build-em --target serve   # serves the tests at http://localhost:8080
+cmake --build build-em --target serve   # serves the examples at http://localhost:8080
 ```
 
 ### Options
@@ -154,6 +156,8 @@ cmake --build build-em --target serve   # serves the tests at http://localhost:8
 | `NOAPI_DEFAULT_BACKEND` | `webgpu` if enabled, else `vulkan` | Backend behind the `noapi::noapi` alias |
 | `NOAPI_SLANG_ROOT` | *(empty)* | Use a prebuilt Slang release instead of building the submodule |
 | `NOAPI_ENABLE_LTO` | `ON` when top level | Link-time optimization for the optimized configurations |
+| `NOAPI_BUILD_DOCTESTS` | `ON` when top level (`OFF` under Emscripten) | Build `noapi-doctests`, the header examples |
+| `NOAPI_ENABLE_COVERAGE` | `OFF` | Instrument the backends for gcov (used by `tools/coverage.py`) |
 
 Slang is a large dependency. If it isn't installed and `NOAPI_SLANG_ROOT` isn't set, the
 `external/slang` submodule is built with everything this project doesn't use turned off. A
@@ -171,11 +175,21 @@ The backend you link defines `NOAPI_BACKEND_VULKAN` or `NOAPI_BACKEND_WEBGPU`. I
 backend's header (`<vulkan/noapi.hpp>` or `<webgpu/noapi.hpp>`, or the `.h` version from C), then
 create a queue. `gpuSetupDefaultVulkanEXT` or `gpuSetupDefaultWebGPUEXT` creates the instance,
 device and surface for you. If you already have your own, pass them to `gpuCreateQueue`.
-[`test/0_basic.cpp`](test/0_basic.cpp) is a complete example from start to finish.
+[`examples/0_basic.cpp`](examples/0_basic.cpp) is a complete example from start to finish.
 
 ## Tests
 
-| Test | Shows |
+The examples in the headers' documentation are the unit tests. `tools/doctest.py` extracts every `@code` block, compiles it as C and as C++, and runs it against a headless device, then reports public declarations that are missing documentation or an example:
+
+```sh
+python3 tools/doctest.py build build-vk   # build and run the examples in each build directory
+python3 tools/doctest.py --check          # only check the documentation
+python3 tools/coverage.py -v vulkan       # line coverage of a backend from those examples
+```
+
+## Examples
+
+| Example | Shows |
 | --- | --- |
 | `0_basic` | Compute round trip, split barriers, surface setup, a triangle; also links a C translation unit to check the headers stay valid C |
 | `1_texture` | Loading an image into a texture and sampling it |
@@ -184,7 +198,7 @@ device and surface for you. If you already have your own, pass them to `gpuCreat
 | `4_pbr` | Image-based PBR lighting of the Utah teapot, using an HDR environment map |
 | `5_raytrace` | A compute shader ray tracer |
 
-Asset credits are listed in [`test/credits.txt`](test/credits.txt).
+Asset credits are listed in [`examples/credits.txt`](examples/credits.txt).
 
 ## License
 
