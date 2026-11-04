@@ -4,6 +4,11 @@ if(NOT EMSCRIPTEN)
 endif()
 set(DAWN_VERSION "7991" CACHE STRING "Version of the Dawn release to use: the number after 'chromium/' in the tag of an existing release on DAWN_MIRROR. The webgpu.hpp in include/ may not be compatible with other versions than the default.")
 
+# Dawn's default load flags need an absolute path, so loading vulkan-1.dll (its only Windows backend here) fails; the loader lives in System32
+if(WIN32)
+	set(DAWN_FORCE_SYSTEM_COMPONENT_LOAD ON CACHE BOOL "" FORCE)
+endif()
+
 include(FetchContent)
 FetchContent_Declare(webgpu-distribution
 	GIT_REPOSITORY https://github.com/eliemichel/WebGPU-distribution

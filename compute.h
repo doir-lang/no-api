@@ -844,12 +844,12 @@ GpuTextureSizeAlign gpuTextureSizeAlign(GpuQueue* queue, NOAPI_CONST_REF(GpuText
  * @endcode
  *
  * @note Only a single texture can be created on each allocation, and the texture is freed by freeing that memory.
- * @note A description gpuTextureSizeAlign gives a size of 0 for is not created. On WebGPU a texture created with USAGE_SAMPLED must also have a format gpuFormatIsFilterableEXT accepts; any other is reported as unsupported and not created.
+ * @note A description gpuTextureSizeAlign gives a size of 0 for is not created. Vulkan places the texture in \p memory, so the allocation must meet the size and alignment gpuTextureSizeAlign reports; WebGPU keeps textures apart from it and asks only {16, 16}. On WebGPU a texture created with USAGE_SAMPLED must also have a format gpuFormatIsFilterableEXT accepts; any other is reported as unsupported and not created.
  *
  * @param queue The GPU queue (device) on which the texture will be created.
  * @param desc Texture description matching the one passed to gpuTextureSizeAlign.
  * @param memory GPU address of a MEMORY_TEXTURE (or MEMORY_TEXTURE_READBACK) allocation from gpuMalloc.
- * @return The texture, or NULL with errno set if \p memory is not the start of an allocation, already has a texture, or the device refuses the description.
+ * @return The texture, or NULL with errno set if \p memory is not the start of an allocation, already has a texture, is smaller or less aligned than gpuTextureSizeAlign asks for, or the device refuses the description.
  */
 GpuTexture* gpuCreateTexture(GpuQueue* queue, NOAPI_CONST_REF(GpuTextureDesc) desc, gpu* memory);
 

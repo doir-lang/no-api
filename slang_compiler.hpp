@@ -552,6 +552,8 @@ inline std::mutex& compile_mutex() {
 
 // A session keyed by everything it bakes in, so WebGPU's recompiles on layout changes don't reload every module.
 struct CachedSession {
+	// Declared first so it is released last: the cache can outlive global_session's static at exit, and a session released after its global session crashes
+	Slang::ComPtr<slang::IGlobalSession> global;
 	Slang::ComPtr<slang::ISession> session;
 	SlangCompileTarget target = SLANG_TARGET_UNKNOWN;
 	std::string backend_module;
@@ -689,6 +691,7 @@ inline CachedSession* get_session(SlangCompileTarget target, std::string_view ba
 
 	if(cache.size() >= SESSION_CACHE_CAPACITY) cache.erase(cache.begin());
 	cache.push_back({
+		.global = Slang::ComPtr<slang::IGlobalSession>(global),
 		.session = session,
 		.target = target,
 		.backend_module = std::string(backend_module),

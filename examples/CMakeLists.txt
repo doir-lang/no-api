@@ -65,6 +65,8 @@ function(noapi_add_example name)
 
 	if(WIN32)
 		add_executable(${name} WIN32 ${name}.cpp)
+		# windows.h, included for WinMain, otherwise defines min and max macros that break std::min and std::max
+		target_compile_definitions(${name} PRIVATE NOMINMAX)
 	else()
 		add_executable(${name} ${name}.cpp)
 	endif()
@@ -74,6 +76,12 @@ function(noapi_add_example name)
 	target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 	set_target_properties(${name} PROPERTIES CXX_STANDARD 26)
 	noapi_enable_lto(${name})
+	noapi_copy_runtime_dlls(${name})
+
+	# MinGW's libstdc++ keeps std::print's console support in a separate library
+	if(MINGW AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+		target_link_libraries(${name} PRIVATE stdc++exp)
+	endif()
 
 	if(TARGET glfw3webgpu)
 		target_link_libraries(${name} PUBLIC glfw3webgpu)

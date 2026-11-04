@@ -39,6 +39,7 @@ add_custom_command(
 add_executable(noapi-doctests harness.cpp tests.cpp ${NOAPI_DOCTEST_GENERATED})
 target_include_directories(noapi-doctests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(noapi-doctests PRIVATE noapi::noapi doctest::doctest)
+noapi_copy_runtime_dlls(noapi-doctests)
 # Fault injection: on Linux the linker redirects the backends' calls into Slang and Dawn through wrappers in tests.cpp, which can make them fail on demand
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 	set(NOAPI_DOCTEST_WRAPPED slang_createGlobalSession2)

@@ -704,6 +704,18 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 
 	VkImage image;
 	VK_CHECK(vkCreateImage(queue->device, &info, queue->callbacks, &image), nullptr);
+
+	VkMemoryRequirements requirements;
+	vkGetImageMemoryRequirements(queue->device, image, &requirements);
+	VmaAllocationInfo placement;
+	vmaGetAllocationInfo(queue->gpu_allocator, backing->second.allocation, &placement);
+	// The allocation's offset within its VkDeviceMemory block is what must meet the image's alignment, not the address gpuMalloc returned
+	if(placement.offset % requirements.alignment || placement.size < requirements.size || !(requirements.memoryTypeBits & (1u << placement.memoryType))) {
+		vkDestroyImage(queue->device, image, queue->callbacks);
+		errno = VK_ERROR_INITIALIZATION_FAILED;
+		return nullptr;
+	}
+
 	// Through VMA: the allocation is a suballocation, and vkBindImageMemory at offset 0 would alias whatever starts the block.
 	if(auto bound = vmaBindImageMemory(queue->gpu_allocator, backing->second.allocation, image); bound != VK_SUCCESS) {
 		vkDestroyImage(queue->device, image, queue->callbacks);

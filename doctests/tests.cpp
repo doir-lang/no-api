@@ -956,9 +956,20 @@ TEST_CASE("gpuCreateTexture turns down descriptions the device can't make") {
 		auto memory = (gpu*)gpuMalloc(queue, 64 * 64 * 4, 256, MEMORY_TEXTURE);
 		assert(!gpuCreateTexture(queue, {.dimensions = {64, 64, 1}, .sampleCount = 64, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_COLOR_ATTACHMENT}, memory));
 		assert(!gpuCreateTexture(queue, {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_COLOR_ATTACHMENT}, (gpu*)((char*)memory + 256))); // Not the start of an allocation
-		// Created on Vulkan; WebGPU only samples formats a sampler can filter, so it reports this one unsupported and returns NULL
-		(void)gpuCreateTexture(queue, {.dimensions = {64, 64, 1}, .format = FORMAT_R32_UINT, .usage = USAGE_SAMPLED}, memory);
 		gpuFree(queue, memory);
+
+		// Created on Vulkan; WebGPU only samples formats a sampler can filter, so it reports this one unsupported and returns NULL
+		GpuTextureDesc unfilterable = {.dimensions = {64, 64, 1}, .format = FORMAT_R32_UINT, .usage = USAGE_SAMPLED};
+		auto unfilterable_memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, unfilterable));
+		(void)gpuCreateTexture(queue, unfilterable, unfilterable_memory);
+		gpuFree(queue, unfilterable_memory);
+
+#ifdef NOAPI_BACKEND_VULKAN
+		// Vulkan places the image in the allocation, so one smaller than gpuTextureSizeAlign asks for is turned down rather than overrun
+		auto small = (gpu*)gpuMalloc(queue, 256, 256, MEMORY_TEXTURE);
+		assert(!gpuCreateTexture(queue, {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_SAMPLED}, small));
+		gpuFree(queue, small);
+#endif
 
 		GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_SAMPLED};
 		auto shared = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
@@ -1366,7 +1377,7 @@ TEST_CASE("gpuBlitTextureEXT falls back to nearest for unfilterable formats") {
 	{
 		GpuTextureDesc source_desc = {.dimensions = {16, 16, 1}, .format = FORMAT_RGBA32_FLOAT, .usage = TEXTURE_USAGE_FLAGS(USAGE_SAMPLED | USAGE_COLOR_ATTACHMENT)};
 		GpuTextureDesc destination_desc = {.dimensions = {16, 16, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_COLOR_ATTACHMENT};
-		auto source_memory = (gpu*)gpuMalloc(queue, 16 * 16 * 16, 256, MEMORY_TEXTURE);
+		auto source_memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, source_desc));
 		auto destination_memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, destination_desc));
 		auto destination = gpuCreateTexture(queue, destination_desc, destination_memory);
 		if(auto source = gpuCreateTexture(queue, source_desc, source_memory)) {
@@ -1937,7 +1948,8 @@ TEST_CASE("GpuBlendDesc: every equation against every factor") {
 				assert(std::abs(red - std::clamp(expected[op], 0.0f, 1.0f)) < 0.02f);
 			}
 		uint32_t last = std::size(ops) * std::size(factors);
-		assert((pixels[last] >> 24) == 0x80 && (pixels[last + 1] >> 24) == 0); // Alpha written as is, then zeroed
+		// 0.5 lands on 127.5, which drivers may round either way (NVIDIA gives 0x7f)
+		assert(std::abs(int(pixels[last] >> 24) - 0x80) <= 1 && (pixels[last + 1] >> 24) == 0); // Alpha written as is, then zeroed
 
 		for(auto state: states) gpuFreeBlendState(queue, state);
 		gpuFreePipeline(queue, pipeline);

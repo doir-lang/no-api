@@ -62,6 +62,25 @@ function(noapi_enable_lto)
 endfunction()
 
 # ---------------------------------------------------------------------------
+# Runtime libraries
+# ---------------------------------------------------------------------------
+
+# noapi_copy_runtime_dlls(<target>)
+# On Windows, copies the DLLs <target> links, and the slang-glslang module Slang loads beside its own, next to <target> after each build.
+function(noapi_copy_runtime_dlls target)
+	if(NOT WIN32)
+		return()
+	endif()
+	# slang-glslang is configured after the callers, so it is looked up when generating rather than now
+	set(dlls "$<TARGET_RUNTIME_DLLS:${target}>$<$<TARGET_EXISTS:slang-glslang>:;$<TARGET_FILE:slang-glslang>>")
+	add_custom_command(TARGET ${target} POST_BUILD
+		COMMAND "$<IF:$<BOOL:${dlls}>,${CMAKE_COMMAND};-E;copy_if_different;${dlls};$<TARGET_FILE_DIR:${target}>,${CMAKE_COMMAND};-E;true>"
+		COMMAND_EXPAND_LISTS
+		VERBATIM
+	)
+endfunction()
+
+# ---------------------------------------------------------------------------
 # Slang
 # ---------------------------------------------------------------------------
 
@@ -157,6 +176,9 @@ else()
 		set(SLANG_ENABLE_SPLIT_DEBUG_INFO OFF CACHE BOOL "" FORCE)
 		# Only needed for Slang's C++ / CPU targets, which this project never asks for
 		set(SLANG_SLANG_LLVM_FLAVOR DISABLE CACHE STRING "" FORCE)
+		# On Windows Slang downloads a prebuilt webgpu_dawn and slang-tint for its tests; the former clashes with Dawn's webgpu_dawn target
+		set(SLANG_WEBGPU_DAWN_BINARY_URL "" CACHE STRING "" FORCE)
+		set(SLANG_SLANG_TINT_BINARY_URL "" CACHE STRING "" FORCE)
 		# slang-glslang hosts spirv-opt, loaded at runtime. Emscripten leaves it off: a runtime loaded module is a side module the page must fetch.
 		if(EMSCRIPTEN)
 			set(SLANG_ENABLE_SLANG_GLSLANG OFF CACHE BOOL "" FORCE)
@@ -175,6 +197,18 @@ else()
 			set(SLANG_USE_SYSTEM_SPIRV_TOOLS OFF CACHE BOOL "" FORCE)
 		endif()
 		add_subdirectory(external/slang EXCLUDE_FROM_ALL)
+		# slang_add_target overrides the directory's EXCLUDE_FROM_ALL. The dispatcher CLI fails to link on MinGW (wmain without -municode), and its implib would clobber libslang.dll.a.
+		if(TARGET slang-dispatcher)
+			set_target_properties(slang-dispatcher PROPERTIES EXCLUDE_FROM_ALL TRUE)
+		endif()
+		# Slang's Windows executables define wmain, which MinGW only uses as the entry point when linked with -municode
+		if(MINGW)
+			foreach(noapi_slang_wmain_target slang-bootstrap slangc slang-dispatcher)
+				if(TARGET ${noapi_slang_wmain_target})
+					target_link_options(${noapi_slang_wmain_target} PRIVATE -municode)
+				endif()
+			endforeach()
+		endif()
 		# Nothing links the wrapper, as Slang loads it at runtime, so without this it is never built
 		if(TARGET slang-glslang)
 			add_dependencies(noapi-slang slang-glslang)
