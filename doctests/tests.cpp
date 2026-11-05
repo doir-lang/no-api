@@ -2344,6 +2344,75 @@ TEST_CASE("gpuDrawIndexedInstanced draws with 16 bit indices and fragment data")
 	noapi_doctest_end();
 }
 
+// More draws than one root data chunk holds, with an allocation part way through that changes what group 0 binds on WebGPU
+TEST_CASE("gpuDrawIndexedInstanced gives every draw its own root data") {
+	GpuQueue* queue = noapi_doctest_queue();
+	GpuDoctestBackend backend = noapi_doctest_backend();
+	(void)queue;
+	(void)backend;
+	noapi_doctest_begin();
+	{
+		// Draw i covers only pixel i, in a color that encodes i
+		auto shader = string_to_bytes(R"slang(
+			import noapi;
+			[shader("vertex")] float4 vertexMain(uint index : SV_VertexID) : SV_Position {
+				uint cell = gpuVertexData<uint>()[0];
+				float2 center = (float2(cell % 256, cell / 256) + 0.5) / float2(256, 160) * float2(2, -2) + float2(-1, 1);
+				float2 corners[3] = { float2(-0.4, -0.4), float2(1.2, -0.4), float2(-0.4, 1.2) };
+				return float4(center + corners[index] * float2(2, -2) / float2(256, 160), 0, 1);
+			}
+			[shader("fragment")] float4 fragmentMain() : SV_Target {
+				uint cell = gpuFragmentData<uint>()[0];
+				return float4(float(cell & 255), float(cell >> 8), 0, 255) / 255;
+			}
+		)slang");
+		constexpr uint32_t cells = 256 * 160; // Over 1 MiB of root data even at the smallest slot WebGPU allows
+		GpuTextureDesc desc = {.dimensions = {256, 160, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
+		auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
+		auto texture = gpuCreateTexture(queue, desc, memory);
+		GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
+		auto pipeline = gpuCreateGraphicsPipeline(queue, shader, shader, {.colorTargets = {&target, 1}});
+		auto roots = gpuMalloc<uint32_t>(queue, cells * 4); // One 16 byte root data struct per draw
+		for(uint32_t i = 0; i < cells; ++i) roots[i * 4] = i;
+		auto indices = gpuMalloc<uint32_t>(queue, 3);
+		for(uint32_t i = 0; i < 3; ++i) indices[i] = i;
+		auto roots_gpu = gpuHostToDevicePointer(queue, roots);
+		auto indices_gpu = gpuHostToDevicePointer(queue, indices);
+		auto pixels = gpuMalloc<uint32_t>(queue, cells, MEMORY_READBACK);
+		auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
+
+		GpuColorAttachment attachment = {.texture = texture, .loadOp = LOAD_OP_CLEAR};
+		auto cmd = gpuStartCommandRecording(queue);
+		gpuSyncMemoryEXT(cmd, roots_gpu);
+		gpuSyncMemoryEXT(cmd, indices_gpu);
+		gpuBeginRenderPass(cmd, {.colorAttachments = {&attachment, 1}});
+		gpuSetPipeline(cmd, pipeline);
+		void* grown = nullptr;
+		for(uint32_t i = 0; i < cells; ++i) {
+			if(i == cells / 2) grown = gpuMalloc(queue, 1 << 16);
+			auto root = (gpu*)((char*)roots_gpu + i * 16);
+			gpuDrawIndexedInstanced(cmd, root, root, indices_gpu, 3, 1);
+		}
+		gpuEndRenderPass(cmd);
+		gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
+		gpuCopyFromTexture(cmd, pixels_gpu, memory, texture);
+		gpuSyncMemoryEXT(cmd, pixels_gpu);
+		gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
+		uint32_t wrong = 0;
+		for(uint32_t i = 0; i < cells; ++i)
+			wrong += pixels[i] != (0xff000000u | (i >> 8) << 8 | (i & 255));
+		assert(wrong == 0);
+
+		gpuFreePipeline(queue, pipeline);
+		gpuFree(queue, grown);
+		gpuFree(queue, pixels);
+		gpuFree(queue, indices);
+		gpuFree(queue, roots);
+		gpuFree(queue, memory);
+	}
+	noapi_doctest_end();
+}
+
 TEST_CASE("gpuDrawIndexedInstancedIndirect reads its arguments from GPU memory") {
 	GpuQueue* queue = noapi_doctest_queue();
 	GpuDoctestBackend backend = noapi_doctest_backend();

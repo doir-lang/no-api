@@ -645,7 +645,9 @@ namespace GPU::detail {
 		const bool cube = descriptor.type == TEXTURE_CUBE || descriptor.type == TEXTURE_CUBE_ARRAY;
 		return VkImageCreateInfo{
 			.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-			.flags = VkImageCreateFlags(VK_IMAGE_CREATE_ALIAS_BIT | (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0)),
+			// No VK_IMAGE_CREATE_ALIAS_BIT: it only matters for two images sharing memory, which gpuCreateTexture refuses, and it isn't free:
+			// on Mesa's Intel driver (RPL-U) it added a fixed ~40 us to every render pass, consistent with the image losing its fast clears.
+			.flags = VkImageCreateFlags(cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0),
 			.imageType = type2vulkan(descriptor.type),
 			.format = GPU::detail::format2vulkan(descriptor.format),
 			.extent = VkExtent3D{descriptor.dimensions.x, descriptor.dimensions.y, descriptor.dimensions.z},

@@ -12,6 +12,7 @@
 #include <map>
 #include <set>
 #include <array>
+#include <vector>
 #include <variant>
 #include <vector>
 #include <bit>
@@ -207,6 +208,14 @@ struct GpuQueue {
 	WGPUBindGroupLayout current_graphics_bind_group_layout0 = nullptr; // 0 == buffers
 	WGPUPipelineLayout current_graphics_pipeline_layout = nullptr;
 
+	// Root data for draws and dispatches, one slot per call at a dynamic offset; staged on the CPU and uploaded at gpuSubmit, so a call creates no buffer or bind group.
+	struct ShaderDataChunk {
+		WGPUBuffer buffer = nullptr; // Uniform | CopyDst, shader_data_chunk_size bytes
+		std::vector<uint8_t> staging; // What the command buffer wrote so far; its size is the next free offset
+	};
+	constexpr static size_t shader_data_chunk_size = 1 << 20;
+	std::vector<ShaderDataChunk*> shader_data_chunk_pool; // Free chunks; a command buffer hands its own back once its submission finished
+
 	// gpuBlitTextureEXT's own layouts, built on the first blit; indexed by "filtering", since a filtering sampler can't touch an unfilterable format.
 	WGPUShaderModule blit_shader = nullptr;
 	std::array<WGPUBindGroupLayout, 2> blit_bind_group_layouts = {};
@@ -253,6 +262,33 @@ struct GpuCommandBuffer {
 
 	// Told whether the buffer was submitted: one freed unsubmitted only releases what it made, since the work it was waiting on never ran.
 	std::vector<std::function<void(bool submitted)>> code_pending_submission_finished;
+
+	// Chunks this buffer's root data went into, uploaded at submission; the last is the one being filled.
+	std::vector<GpuQueue::ShaderDataChunk*> shader_data_chunks;
+
+	// Group 0, rebuilt only when something it binds changes: a monobuffer grows or moves, another heap or sampler set, a new root data chunk. Indexed by "compute".
+	struct BufferGroupKey {
+		std::array<WGPUBuffer, 5> monobuffers = {};
+		std::array<size_t, 5> monobuffer_sizes = {};
+		WGPUBuffer texture_heap = nullptr;
+		size_t texture_heap_size = 0;
+		WGPUBuffer sampler_lookup = nullptr;
+		WGPUBuffer shader_data = nullptr;
+		bool operator==(const BufferGroupKey&) const = default;
+	};
+	struct BufferGroup {
+		BufferGroupKey key;
+		WGPUBindGroup group = nullptr;
+	};
+	std::array<BufferGroup, 2> buffer_groups = {};
+
+	// What the open pass already has bound, so a draw only sets what differs; a new pass starts with nothing bound.
+	struct PassBindings {
+		std::array<WGPUBindGroup, 4> groups = {};
+		WGPUBuffer index_buffer = nullptr;
+		uint64_t index_offset = 0, index_size = 0;
+		WGPUIndexFormat index_format = WGPUIndexFormat_Undefined;
+	} pass_bindings;
 };
 
 struct GpuDepthStencilState {
