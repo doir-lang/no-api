@@ -790,7 +790,7 @@ void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd,
  * gpuFree(queue, memory);
  * @endcode
  *
- * @note Every argument struct between \p args and the end of its allocation is drawn. On Vulkan more than one needs the device's multiDrawIndirect feature.
+ * @note Every argument struct between \p args and the end of its allocation is drawn. On Vulkan they go in one call when the device has multiDrawIndirect (a hand rolled device must enable it where the physical device offers it, as gpuSetupDefaultVulkanEXT does), and one call each otherwise. A first instance other than zero needs drawIndirectFirstInstance on Vulkan and indirect-first-instance on WebGPU, which the setup helpers enable where present.
  *
  * @param cmd Command buffer to record into.
  * @param vertex_data GPU pointer to the vertex shader root data struct.

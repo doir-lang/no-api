@@ -151,6 +151,9 @@ bool gpuSetupDefaultVulkanEXT(GpuVulkanSurfaceLoaderEXT surface_loader, void* su
 
 	// Optional too: only GpuRasterDesc::supportDualSourceBlending needs it
 	(void)gpu.enable_features_if_present(VkPhysicalDeviceFeatures{.dualSrcBlend = true});
+	// Separately, since vk-bootstrap enables a struct all or nothing: one indirect call for many argument structs, and a first instance other than zero in them
+	(void)gpu.enable_features_if_present(VkPhysicalDeviceFeatures{.multiDrawIndirect = true});
+	(void)gpu.enable_features_if_present(VkPhysicalDeviceFeatures{.drawIndirectFirstInstance = true});
 
 
 	// Logical Device
@@ -283,8 +286,12 @@ GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice dev
 		VkPhysicalDeviceFeatures2 features { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &features12 };
 		vkGetPhysicalDeviceFeatures2(gpu, &features);
 		out->capabilities.split_barrier_signals = features12.shaderBufferInt64Atomics;
-		// Read from the physical device as well, so this trusts the VkDevice enabled dualSrcBlend, as gpuSetupDefaultVulkanEXT does where it can.
+		// Read from the physical device as well, so this trusts the VkDevice enabled dualSrcBlend and multiDrawIndirect, as gpuSetupDefaultVulkanEXT does where it can.
 		out->capabilities.dual_source_blending = features.features.dualSrcBlend;
+		out->multi_draw_indirect = features.features.multiDrawIndirect;
+		VkPhysicalDeviceProperties properties;
+		vkGetPhysicalDeviceProperties(gpu, &properties);
+		out->max_draw_indirect_count = out->multi_draw_indirect ? std::max(properties.limits.maxDrawIndirectCount, 1u) : 1;
 	}
 
 	// Read from the physical device, so this trusts the VkDevice enabled gpuOptionalVulkanDeviceExtensionsEXT, as gpuSetupDefaultVulkanEXT does.
@@ -3010,7 +3017,10 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd, gpu* vertex_data, gp
 	assert(arguments.buffer && "The indirect arguments don't lie inside any allocation");
 	// Every argument struct between the provided pointer and the end of its allocation is drawn, matching what the WebGPU backend does with the same pointer
 	auto count = (arguments.size - arguments.offset) / sizeof(VkDrawIndexedIndirectCommand);
-	vkCmdDrawIndexedIndirect(cmd->command_buffer, arguments.buffer, arguments.offset, count, sizeof(VkDrawIndexedIndirectCommand));
+	for(VkDeviceSize first = 0; first < count; first += cmd->queue->max_draw_indirect_count) {
+		auto batch = (uint32_t)std::min<VkDeviceSize>(count - first, cmd->queue->max_draw_indirect_count);
+		vkCmdDrawIndexedIndirect(cmd->command_buffer, arguments.buffer, arguments.offset + first * sizeof(VkDrawIndexedIndirectCommand), batch, sizeof(VkDrawIndexedIndirectCommand));
+	}
 }
 
 void gpuDrawMeshlets(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_data, uvec3 dim) {

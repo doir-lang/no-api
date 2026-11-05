@@ -63,9 +63,9 @@ static bool setup_failed(char* out_error, size_t out_error_capacity, std::string
 
 namespace GPU {
 #ifdef __EMSCRIPTEN__
-	constexpr static WGPUFeatureName optional_features[] = {WGPUFeatureName_Depth32FloatStencil8, WGPUFeatureName_DualSourceBlending};
+	constexpr static WGPUFeatureName optional_features[] = {WGPUFeatureName_Depth32FloatStencil8, WGPUFeatureName_DualSourceBlending, WGPUFeatureName_IndirectFirstInstance};
 #else
-	constexpr static WGPUFeatureName optional_features[] = {WGPUFeatureName_Depth32FloatStencil8, WGPUFeatureName_DualSourceBlending, WGPUFeatureName_TextureFormatsTier1};
+	constexpr static WGPUFeatureName optional_features[] = {WGPUFeatureName_Depth32FloatStencil8, WGPUFeatureName_DualSourceBlending, WGPUFeatureName_IndirectFirstInstance, WGPUFeatureName_TextureFormatsTier1};
 #endif
 }
 
@@ -129,7 +129,7 @@ bool gpuSetupDefaultWebGPUEXT(GpuWebGPUSurfaceLoaderEXT surface_loader, void* su
 	wgpuAdapterGetLimits(out.adapter, &out.limits);
 
 	{ // Device
-		// The formats compute.h marks EXT and dual source blending; asked for only where the adapter has them, so the queue can tell the difference
+		// The formats compute.h marks EXT, dual source blending and indirect first instance; asked for only where the adapter has them, so the queue can tell the difference
 		std::vector<WGPUFeatureName> features;
 		for(auto feature: GPU::optional_features)
 			if(wgpuAdapterHasFeature(out.adapter, feature)) features.push_back(feature);

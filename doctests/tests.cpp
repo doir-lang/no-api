@@ -2395,6 +2395,64 @@ TEST_CASE("gpuDrawIndexedInstancedIndirect reads its arguments from GPU memory")
 	noapi_doctest_end();
 }
 
+TEST_CASE("gpuDrawIndexedInstancedIndirect draws every argument struct to the end of the allocation") {
+	GpuQueue* queue = noapi_doctest_queue();
+	GpuDoctestBackend backend = noapi_doctest_backend();
+	(void)queue;
+	(void)backend;
+	noapi_doctest_begin();
+	{
+		// Each draw covers one corner, picked by its first instance, so a missed draw leaves its corner clear
+		auto shader = string_to_bytes(R"slang(
+			import noapi;
+			[shader("vertex")] float4 vertexMain(uint index : SV_VertexID, uint instance : SV_VulkanInstanceID) : SV_Position {
+				float2 corner = float2(instance & 1, instance >> 1) * 2 - 1;
+				float2 offsets[3] = { float2(0, 0), float2(-corner.x, 0), float2(0, -corner.y) };
+				return float4(corner + offsets[index] * 0.5, 0, 1);
+			}
+			[shader("fragment")] float4 fragmentMain() : SV_Target { return float4(0, 0, 1, 1); }
+		)slang");
+		GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
+		auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
+		auto texture = gpuCreateTexture(queue, desc, memory);
+		GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
+		auto pipeline = gpuCreateGraphicsPipeline(queue, shader, shader, {.colorTargets = {&target, 1}});
+
+		struct DrawArguments { uint32_t index_count, instance_count, first_index; int32_t vertex_offset; uint32_t first_instance; };
+		auto arguments = gpuMalloc<DrawArguments>(queue, 4);
+		for(uint32_t i = 0; i < 4; ++i) arguments[i] = {3, 1, 0, 0, i};
+		auto indices = gpuMalloc<uint32_t>(queue, 3);
+		for(uint32_t i = 0; i < 3; ++i) indices[i] = i;
+		auto arguments_gpu = gpuHostToDevicePointer(queue, arguments);
+		auto indices_gpu = gpuHostToDevicePointer(queue, indices);
+		auto pixels = gpuMalloc<uint32_t>(queue, 64 * 64, MEMORY_READBACK);
+		auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
+
+		GpuColorAttachment attachment = {.texture = texture, .loadOp = LOAD_OP_CLEAR};
+		auto cmd = gpuStartCommandRecording(queue);
+		gpuSyncMemoryEXT(cmd, arguments_gpu);
+		gpuSyncMemoryEXT(cmd, indices_gpu);
+		gpuBeginRenderPass(cmd, {.colorAttachments = {&attachment, 1}});
+		gpuSetPipeline(cmd, pipeline);
+		gpuDrawIndexedInstancedIndirect(cmd, indices_gpu, indices_gpu, indices_gpu, arguments_gpu);
+		gpuEndRenderPass(cmd);
+		gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
+		gpuCopyFromTexture(cmd, pixels_gpu, memory, texture);
+		gpuSyncMemoryEXT(cmd, pixels_gpu);
+		gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
+		for(uint32_t corner: {0u, 63u, 64u * 63, 64u * 64 - 1})
+			assert(pixels[corner] == 0xffff0000);
+		assert(pixels[64 * 32 + 32] != 0xffff0000);
+
+		gpuFreePipeline(queue, pipeline);
+		gpuFree(queue, pixels);
+		gpuFree(queue, indices);
+		gpuFree(queue, arguments);
+		gpuFree(queue, memory);
+	}
+	noapi_doctest_end();
+}
+
 TEST_CASE("gpuDrawMeshlets draws a meshlet") {
 	GpuQueue* queue = noapi_doctest_queue();
 	GpuDoctestBackend backend = noapi_doctest_backend();

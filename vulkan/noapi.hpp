@@ -128,6 +128,10 @@ struct GpuQueue {
 	// VK_KHR_swapchain_maintenance1: a present can carry a fence, so retired swapchains are freed exactly (see GpuSurface::RetiredSwapchain).
 	bool present_fences_supported = false;
 
+	// Without multiDrawIndirect each indirect argument struct is its own draw; with it, at most max_draw_indirect_count go in one.
+	bool multi_draw_indirect = false;
+	uint32_t max_draw_indirect_count = 1;
+
 	// Messages are deduplicated because they fire per draw, and one report per draw would bury the first.
 	GpuDiagnosticCallbackEXT diagnostic_callback = nullptr;
 	void* diagnostic_userdata = nullptr;
