@@ -12,6 +12,7 @@
 #include <map>
 #include <set>
 #include <array>
+#include <vector>
 #include <variant>
 #include <vector>
 #include <bit>
@@ -94,7 +95,7 @@ struct GpuQueue {
 	size_t last_finished_submission = 0;
 	GpuSemaphore current_submission_timeline_semaphore;
 
-	// Group 0 must fit the guaranteed 8 storage buffers: five monobuffers, the texture heap, and the sampler map (see SamplerSet::lookup_buffer).
+	// Group 0 must fit the guaranteed 8 storage buffers: five monobuffers and the texture heap.
 	size_t active_monobuffer_size = 0, active_monobuffer_capacity = 0;
 	WGPUBuffer empty_buffer = nullptr;
 	std::array<WGPUBuffer, 5> monobuffers;
@@ -120,6 +121,7 @@ struct GpuQueue {
 		uint32_t sampleCount = 1; ///< MSAA sample count.
 		FORMAT format = FORMAT_NONE; ///< Texel format.
 		TEXTURE_USAGE_FLAGS usage = (TEXTURE_USAGE_FLAGS)0; ///< What the atlas has to be created for.
+		uint64_t dedicated = 0; ///< Nonzero gives the texture an atlas of its own; see GpuQueue::dedicated_monotextures.
 
 		// Dimensions round up to a power of two: textures up to that size share the atlas, each in the top left of its layers.
 		static TextureHash from_descriptor(const GpuTextureDesc& desc) {
@@ -131,13 +133,13 @@ struct GpuQueue {
 		}
 
 		bool operator==(const TextureHash& o) const {
-			return type == o.type && dimensions.x == o.dimensions.x && dimensions.y == o.dimensions.y && dimensions.z == o.dimensions.z && sampleCount == o.sampleCount && format == o.format && usage == o.usage;
+			return type == o.type && dimensions.x == o.dimensions.x && dimensions.y == o.dimensions.y && dimensions.z == o.dimensions.z && sampleCount == o.sampleCount && format == o.format && usage == o.usage && dedicated == o.dedicated;
 		}
 
 		struct Hasher {
 			uint64_t operator()(const TextureHash& t) const {
 				return std::hash<size_t>{}(t.type) ^ std::hash<size_t>{}(t.dimensions.x) ^ std::hash<size_t>{}(t.dimensions.y) ^ std::hash<size_t>{}(t.dimensions.z)
-					^ std::hash<size_t>{}(t.sampleCount) ^ std::hash<size_t>{}(t.format) ^ std::hash<size_t>{}(t.usage);
+					^ std::hash<size_t>{}(t.sampleCount) ^ std::hash<size_t>{}(t.format) ^ std::hash<size_t>{}(t.usage) ^ std::hash<uint64_t>{}(t.dedicated);
 			}
 		};
 	};
@@ -178,6 +180,9 @@ struct GpuQueue {
 	std::vector<MonotextureRange> texture_freelist;
 	// Monotextures emptied down to a 1x1 stand in, keyed like MonotextureRange::_index; gpuCreateTexture reuses their slots (see collapse_monotexture_if_empty).
 	std::set<uint32_t> collapsed_monotextures;
+	// A texture that is both an attachment and bound in group 2 gets an atlas to itself, numbered from this; a render pass can then unbind
+	// exactly that atlas from group 2 while it is attached, since WebGPU forbids sampling what a pass renders to (see pass_bind_group2).
+	uint64_t dedicated_monotextures = 0;
 
 	// Group 1 binds storage textures, group 2 sampled ones; a pass can't bind a texture as both, hence compute and graphics flavors (see update_pipeline_layouts).
 	WGPUBindGroupLayout current_compute_bind_group_layout1 = nullptr;
@@ -190,13 +195,29 @@ struct GpuQueue {
 	WGPUBindGroup current_graphics_bind_group2 = nullptr;
 	WGPUBindGroupLayout current_bind_group_layout3 = nullptr; // 3 == samplers
 
+	// What the graphics group 2 binds, per binding: the atlas and its shape, so a render pass can swap out the one it attaches.
+	struct Group2Binding {
+		WGPUTexture texture = nullptr;
+		WGPUTextureView view = nullptr;
+		TextureHash desc;
+	};
+	std::vector<Group2Binding> current_graphics_group2_bindings;
+	// Graphics group 2 with some bindings swapped out for render passes that attach them, keyed by (binding, attached mip) pairs.
+	// Built against the current layout, so update_pipeline_layouts empties it; the views and stand ins go with the group.
+	struct AttachmentGroup2 {
+		WGPUBindGroup group = nullptr;
+		std::vector<WGPUTextureView> views;
+		std::vector<WGPUTexture> textures;
+	};
+	std::map<std::vector<std::pair<uint32_t, uint32_t>>, AttachmentGroup2> attachment_group2_cache;
+
 	// Everything one list of enabled samplers needs, cached per queue so alternating between two sets rebuilds neither.
 	struct SamplerSet {
 		std::vector<WGPUSampler> samplers; // exactly gpu_sampler_slot_count of them, padded with the default
 		WGPUBindGroup bind_group = nullptr; // group 3
 
-		// Maps a packed GpuSamplerDesc to its slot, or to 0 (the default sampler) when it was never enabled.
-		WGPUBuffer lookup_buffer = nullptr;
+		// Each slot's packed GpuSamplerDesc, or ~0u for none, which pipelines bake in as override constants so a constant description folds to its slot.
+		std::array<uint32_t, gpu_sampler_slot_count> packed = {};
 	};
 	std::unordered_map<std::vector<GpuSamplerDesc>, SamplerSet, GpuSamplerDescListHash> sampler_cache;
 	SamplerSet* default_sampler_set = nullptr; // What a command buffer gets when it never enables any
@@ -206,6 +227,14 @@ struct GpuQueue {
 
 	WGPUBindGroupLayout current_graphics_bind_group_layout0 = nullptr; // 0 == buffers
 	WGPUPipelineLayout current_graphics_pipeline_layout = nullptr;
+
+	// Root data for draws and dispatches, one slot per call at a dynamic offset; staged on the CPU and uploaded at gpuSubmit, so a call creates no buffer or bind group.
+	struct ShaderDataChunk {
+		WGPUBuffer buffer = nullptr; // Uniform | CopyDst, shader_data_chunk_size bytes
+		std::vector<uint8_t> staging; // What the command buffer wrote so far; its size is the next free offset
+	};
+	constexpr static size_t shader_data_chunk_size = 1 << 20;
+	std::vector<ShaderDataChunk*> shader_data_chunk_pool; // Free chunks; a command buffer hands its own back once its submission finished
 
 	// gpuBlitTextureEXT's own layouts, built on the first blit; indexed by "filtering", since a filtering sampler can't touch an unfilterable format.
 	WGPUShaderModule blit_shader = nullptr;
@@ -253,6 +282,35 @@ struct GpuCommandBuffer {
 
 	// Told whether the buffer was submitted: one freed unsubmitted only releases what it made, since the work it was waiting on never ran.
 	std::vector<std::function<void(bool submitted)>> code_pending_submission_finished;
+
+	// Chunks this buffer's root data went into, uploaded at submission; the last is the one being filled.
+	std::vector<GpuQueue::ShaderDataChunk*> shader_data_chunks;
+
+	// Group 0, rebuilt only when something it binds changes: a monobuffer grows or moves, another heap or sampler set, a new root data chunk. Indexed by "compute".
+	struct BufferGroupKey {
+		std::array<WGPUBuffer, 5> monobuffers = {};
+		std::array<size_t, 5> monobuffer_sizes = {};
+		WGPUBuffer texture_heap = nullptr;
+		size_t texture_heap_size = 0;
+		WGPUBuffer shader_data = nullptr;
+		bool operator==(const BufferGroupKey&) const = default;
+	};
+	struct BufferGroup {
+		BufferGroupKey key;
+		WGPUBindGroup group = nullptr;
+	};
+	std::array<BufferGroup, 2> buffer_groups = {};
+
+	// What the open pass already has bound, so a draw only sets what differs; a new pass starts with nothing bound.
+	struct PassBindings {
+		std::array<WGPUBindGroup, 4> groups = {};
+		WGPUBuffer index_buffer = nullptr;
+		uint64_t index_offset = 0, index_size = 0;
+		WGPUIndexFormat index_format = WGPUIndexFormat_Undefined;
+	} pass_bindings;
+
+	// The open render pass's (binding, mip) pairs for attachments group 2 also binds, sorted; empty when it attaches none (see pass_bind_group2).
+	std::vector<std::pair<uint32_t, uint32_t>> pass_attached;
 };
 
 struct GpuDepthStencilState {
@@ -297,6 +355,9 @@ struct GpuPipeline {
 	struct ComputeCache {
 		std::string IR;
 		mutable WGPUComputePipeline pipeline;
+		mutable WGPUShaderModule module = nullptr; // Kept, so a new sampler set only rebuilds the pipeline
+		mutable uint32_t sampler_overrides = 0; // Which slots' override constants the module declares, one bit each
+		mutable const GpuQueue::SamplerSet* sampler_set = nullptr; // The set the pipeline's override constants hold
 	};
 
 	struct RenderCache {
@@ -308,10 +369,15 @@ struct GpuPipeline {
 		mutable std::optional<GpuDepthStencilDesc> depth_stencil = {};
 		mutable std::optional<GpuBlendDesc> blend = {};
 		mutable INDEX_TYPE_EXT index_type = INDEX_TYPE_UINT32; // Only relevant for strip topologies
+		mutable const GpuQueue::SamplerSet* sampler_set = nullptr; // The set the pipeline's override constants hold
 		mutable WGPURenderPipeline pipeline = nullptr;
+
+		// Kept across variants, so new state or a new sampler set only rebuilds the pipeline; see ComputeCache.
+		mutable WGPUShaderModule vertex_module = nullptr, fragment_module = nullptr;
+		mutable uint32_t vertex_sampler_overrides = 0, fragment_sampler_overrides = 0;
 	};
 
-	mutable WGPUPipelineLayout reference_layout; // The layout the cached variant was built against
+	mutable WGPUPipelineLayout reference_layout; // The layout the cached variant and modules were built against
 	std::variant<ComputeCache, RenderCache> cache;
 };
 

@@ -92,7 +92,7 @@ struct GpuQueue {
 	std::map<VkDeviceAddress, Allocation> allocations;
 	// Snapshot heaps made for texture heaps that could not be bound in place, by the address they copy.
 	std::unordered_map<VkDeviceAddress, std::tuple<VkBuffer, VmaAllocation, VkDeviceSize, VkDeviceAddress>> descriptor_heaps;
-	VkDeviceSize minimum_descriptor_heap_size = 0, sampler_size = 0, image_size = 0;
+	VkDeviceSize minimum_descriptor_heap_size = 0, sampler_size = 0, image_size = 0, max_sampler_heap_size = 0;
 	VkDeviceSize descriptor_heap_alignment = 0; // resourceHeapAlignment
 
 	// Native descriptor slots per GpuTextureDescriptor, which shaders multiply heap indices by; more than one when the driver's descriptors are narrower.
@@ -194,7 +194,6 @@ struct GpuCommandBuffer {
 	const GpuPipeline* bound_pipeline = nullptr;
 	// Reapplied after gpuSetPipeline, which would otherwise replace it with the pipeline's own blending.
 	const GpuBlendState* bound_blend_state = nullptr;
-	VkDeviceAddress sampler_map = {};
 	std::vector<VkSemaphore> wait_semaphores;
 
 	// A signal's event waiting for its gpuWaitBefore. The barrier is kept because vkCmdWaitEvents2 must repeat vkCmdSetEvent2's dependency.

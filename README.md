@@ -227,6 +227,7 @@ Mind what an example spends its time on. Every pipeline is compiled from Slang a
 | `4_pbr` | Image-based PBR lighting of the Utah teapot, using an HDR environment map |
 | `5_msaa_stencil_outline` | 4x MSAA resolved into the surface, a stencil outline around the teapot, and a culled triangle strip floor |
 | `6_raytrace` | A compute shader ray tracer |
+| `7_postprocess` | Bloom and tonemapping: an HDR scene, a bright pass, a separable blur ping-ponging between two sampleable render targets, and a composite into the surface |
 
 Asset credits are listed in [`examples/credits.txt`](examples/credits.txt).
 

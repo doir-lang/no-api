@@ -2293,6 +2293,150 @@ TEST_CASE("gpuBeginRenderPass: LOAD_OP_LOAD keeps what the last pass cleared") {
 	noapi_doctest_end();
 }
 
+TEST_CASE("gpuBeginRenderPass: ping-pongs between two sampleable targets") {
+	GpuQueue* queue = noapi_doctest_queue();
+	GpuDoctestBackend backend = noapi_doctest_backend();
+	(void)queue;
+	(void)backend;
+	noapi_doctest_begin();
+	{
+		// Each pass samples the other target and rotates its channels, so red becomes blue and then green
+		auto shader = string_to_bytes(R"slang(
+			import noapi;
+			[shader("vertex")] float4 vertexMain(uint index : SV_VertexID) : SV_Position { return float4(float2((index << 1) & 2, index & 2) * 2 - 1, 0, 1); }
+			[shader("fragment")] float4 fragmentMain(float4 position : SV_Position) : SV_Target {
+				return gpuSample2D(gpuFragmentData<uint>()[0], gpuGetSamplerIndex(gpuDefaultSampler()), position.xy / 64).gbra;
+			}
+		)slang");
+		GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_SAMPLED | USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
+		gpu* memory[2];
+		GpuTexture* textures[2];
+		auto heap = gpuMalloc<GpuTextureDescriptor>(queue, 2, MEMORY_DESCRIPTOR_HEAP);
+		for(uint32_t i = 0; i < 2; ++i) {
+			memory[i] = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
+			textures[i] = gpuCreateTexture(queue, desc, memory[i]);
+			REQUIRE(textures[i]);
+			heap[i] = gpuTextureViewDescriptor(queue, textures[i], {});
+		}
+		auto heap_gpu = gpuHostToDevicePointer(queue, heap);
+		GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
+		auto pipeline = gpuCreateGraphicsPipeline(queue, shader, shader, {.colorTargets = {&target, 1}});
+		REQUIRE(pipeline);
+
+		auto sources = gpuMalloc<uint32_t>(queue, 2);
+		auto indices = gpuMalloc<uint32_t>(queue, 3);
+		for(uint32_t i = 0; i < 3; ++i) indices[i] = i;
+		auto pixels = gpuMalloc<uint32_t>(queue, 2 * 64 * 64, MEMORY_READBACK);
+		auto sources_gpu = gpuHostToDevicePointer(queue, sources);
+		auto indices_gpu = gpuHostToDevicePointer(queue, indices);
+		auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
+		sources[0] = 0;
+		sources[1] = 1;
+
+		GpuColorAttachment red = {.texture = textures[0], .loadOp = LOAD_OP_CLEAR, .clearValue = {1, 0, 0, 1}};
+		auto cmd = gpuStartCommandRecording(queue);
+		gpuSyncMemoryEXT(cmd, heap_gpu);
+		gpuSyncMemoryEXT(cmd, sources_gpu);
+		gpuSyncMemoryEXT(cmd, indices_gpu);
+		gpuSetActiveTextureHeapPtr(cmd, heap_gpu);
+		gpuBeginRenderPass(cmd, {.colorAttachments = {&red, 1}});
+		gpuEndRenderPass(cmd);
+		for(uint32_t pass = 0; pass < 2; ++pass) {
+			gpuBarrier(cmd, STAGE(STAGE_RASTER_COLOR_OUT | STAGE_PIXEL_SHADER), STAGE(STAGE_PIXEL_SHADER | STAGE_RASTER_COLOR_OUT));
+			GpuColorAttachment color = {.texture = textures[1 - pass], .loadOp = LOAD_OP_DONT_CARE};
+			gpuBeginRenderPass(cmd, {.colorAttachments = {&color, 1}});
+			gpuSetPipeline(cmd, pipeline);
+			gpu* source = sources_gpu + pass * sizeof(uint32_t);
+			gpuDrawIndexedInstanced(cmd, source, source, indices_gpu, 3, 1);
+			gpuEndRenderPass(cmd);
+		}
+		gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
+		gpuCopyFromTexture(cmd, pixels_gpu, memory[0], textures[0]);
+		gpuCopyFromTexture(cmd, pixels_gpu + 64 * 64 * sizeof(uint32_t), memory[1], textures[1]);
+		gpuSyncMemoryEXT(cmd, pixels_gpu);
+		gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
+		CHECK(pixels[0] == 0xff00ff00); // Green, as RGBA bytes
+		CHECK(pixels[64 * 64 - 1] == 0xff00ff00);
+		CHECK(pixels[64 * 64] == 0xffff0000); // Blue
+		CHECK(pixels[2 * 64 * 64 - 1] == 0xffff0000);
+
+		gpuFreePipeline(queue, pipeline);
+		gpuFree(queue, pixels);
+		gpuFree(queue, indices);
+		gpuFree(queue, sources);
+		gpuFree(queue, heap);
+		for(auto m: memory) gpuFree(queue, m);
+	}
+	noapi_doctest_end();
+}
+
+TEST_CASE("gpuBeginRenderPass: renders a mip while sampling the one above it") {
+	GpuQueue* queue = noapi_doctest_queue();
+	GpuDoctestBackend backend = noapi_doctest_backend();
+	(void)queue;
+	(void)backend;
+	noapi_doctest_begin();
+	{
+		auto shader = string_to_bytes(R"slang(
+			import noapi;
+			[shader("vertex")] float4 vertexMain(uint index : SV_VertexID) : SV_Position { return float4(float2((index << 1) & 2, index & 2) * 2 - 1, 0, 1); }
+			[shader("fragment")] float4 fragmentMain(float4 position : SV_Position) : SV_Target {
+				return gpuSample(0, gpuGetSamplerIndex(gpuDefaultSampler()), float3(position.xy / 32, 0), 0u, 0.0).gbra;
+			}
+		)slang");
+		GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .mipCount = 2, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_SAMPLED | USAGE_COLOR_ATTACHMENT)};
+		GpuTextureDesc copy_desc = {.dimensions = {32, 32, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
+		auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
+		auto copy_memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, copy_desc));
+		auto texture = gpuCreateTexture(queue, desc, memory);
+		auto copy = gpuCreateTexture(queue, copy_desc, copy_memory);
+		REQUIRE(texture);
+		REQUIRE(copy);
+		auto heap = gpuMalloc<GpuTextureDescriptor>(queue, 1, MEMORY_DESCRIPTOR_HEAP);
+		heap[0] = gpuTextureViewDescriptor(queue, texture, {.mipCount = 1});
+		auto heap_gpu = gpuHostToDevicePointer(queue, heap);
+		GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
+		auto pipeline = gpuCreateGraphicsPipeline(queue, shader, shader, {.colorTargets = {&target, 1}});
+		REQUIRE(pipeline);
+
+		auto indices = gpuMalloc<uint32_t>(queue, 3);
+		for(uint32_t i = 0; i < 3; ++i) indices[i] = i;
+		auto pixels = gpuMalloc<uint32_t>(queue, 32 * 32, MEMORY_READBACK);
+		auto indices_gpu = gpuHostToDevicePointer(queue, indices);
+		auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
+
+		GpuColorAttachment red = {.texture = texture, .loadOp = LOAD_OP_CLEAR, .clearValue = {1, 0, 0, 1}};
+		GpuColorAttachment mip1 = {.texture = texture, .mipLevel = 1, .loadOp = LOAD_OP_DONT_CARE};
+		auto cmd = gpuStartCommandRecording(queue);
+		gpuSyncMemoryEXT(cmd, heap_gpu);
+		gpuSyncMemoryEXT(cmd, indices_gpu);
+		gpuSetActiveTextureHeapPtr(cmd, heap_gpu);
+		gpuBeginRenderPass(cmd, {.colorAttachments = {&red, 1}});
+		gpuEndRenderPass(cmd);
+		gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_PIXEL_SHADER);
+		gpuBeginRenderPass(cmd, {.colorAttachments = {&mip1, 1}});
+		gpuSetPipeline(cmd, pipeline);
+		gpuDrawIndexedInstanced(cmd, indices_gpu, indices_gpu, indices_gpu, 3, 1);
+		gpuEndRenderPass(cmd);
+		gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_PIXEL_SHADER);
+		gpuBlitTextureEXT(cmd, copy, texture, false, 0, 0, 1, 0);
+		gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
+		gpuCopyFromTexture(cmd, pixels_gpu, copy_memory, copy);
+		gpuSyncMemoryEXT(cmd, pixels_gpu);
+		gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
+		CHECK(pixels[0] == 0xffff0000); // Blue, as RGBA bytes: mip 0's red with its channels rotated
+		CHECK(pixels[32 * 32 - 1] == 0xffff0000);
+
+		gpuFreePipeline(queue, pipeline);
+		gpuFree(queue, pixels);
+		gpuFree(queue, indices);
+		gpuFree(queue, heap);
+		gpuFree(queue, copy_memory);
+		gpuFree(queue, memory);
+	}
+	noapi_doctest_end();
+}
+
 TEST_CASE("gpuDrawIndexedInstanced draws with 16 bit indices and fragment data") {
 	GpuQueue* queue = noapi_doctest_queue();
 	GpuDoctestBackend backend = noapi_doctest_backend();
@@ -2339,6 +2483,75 @@ TEST_CASE("gpuDrawIndexedInstanced draws with 16 bit indices and fragment data")
 		gpuFree(queue, pixels);
 		gpuFree(queue, indices);
 		gpuFree(queue, color);
+		gpuFree(queue, memory);
+	}
+	noapi_doctest_end();
+}
+
+// More draws than one root data chunk holds, with an allocation part way through that changes what group 0 binds on WebGPU
+TEST_CASE("gpuDrawIndexedInstanced gives every draw its own root data") {
+	GpuQueue* queue = noapi_doctest_queue();
+	GpuDoctestBackend backend = noapi_doctest_backend();
+	(void)queue;
+	(void)backend;
+	noapi_doctest_begin();
+	{
+		// Draw i covers only pixel i, in a color that encodes i
+		auto shader = string_to_bytes(R"slang(
+			import noapi;
+			[shader("vertex")] float4 vertexMain(uint index : SV_VertexID) : SV_Position {
+				uint cell = gpuVertexData<uint>()[0];
+				float2 center = (float2(cell % 256, cell / 256) + 0.5) / float2(256, 160) * float2(2, -2) + float2(-1, 1);
+				float2 corners[3] = { float2(-0.4, -0.4), float2(1.2, -0.4), float2(-0.4, 1.2) };
+				return float4(center + corners[index] * float2(2, -2) / float2(256, 160), 0, 1);
+			}
+			[shader("fragment")] float4 fragmentMain() : SV_Target {
+				uint cell = gpuFragmentData<uint>()[0];
+				return float4(float(cell & 255), float(cell >> 8), 0, 255) / 255;
+			}
+		)slang");
+		constexpr uint32_t cells = 256 * 160; // Over 1 MiB of root data even at the smallest slot WebGPU allows
+		GpuTextureDesc desc = {.dimensions = {256, 160, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_COLOR_ATTACHMENT | USAGE_TRANSFER_SRC)};
+		auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
+		auto texture = gpuCreateTexture(queue, desc, memory);
+		GpuColorTarget target = {.format = FORMAT_RGBA8_UNORM};
+		auto pipeline = gpuCreateGraphicsPipeline(queue, shader, shader, {.colorTargets = {&target, 1}});
+		auto roots = gpuMalloc<uint32_t>(queue, cells * 4); // One 16 byte root data struct per draw
+		for(uint32_t i = 0; i < cells; ++i) roots[i * 4] = i;
+		auto indices = gpuMalloc<uint32_t>(queue, 3);
+		for(uint32_t i = 0; i < 3; ++i) indices[i] = i;
+		auto roots_gpu = gpuHostToDevicePointer(queue, roots);
+		auto indices_gpu = gpuHostToDevicePointer(queue, indices);
+		auto pixels = gpuMalloc<uint32_t>(queue, cells, MEMORY_READBACK);
+		auto pixels_gpu = gpuHostToDevicePointer(queue, pixels);
+
+		GpuColorAttachment attachment = {.texture = texture, .loadOp = LOAD_OP_CLEAR};
+		auto cmd = gpuStartCommandRecording(queue);
+		gpuSyncMemoryEXT(cmd, roots_gpu);
+		gpuSyncMemoryEXT(cmd, indices_gpu);
+		gpuBeginRenderPass(cmd, {.colorAttachments = {&attachment, 1}});
+		gpuSetPipeline(cmd, pipeline);
+		void* grown = nullptr;
+		for(uint32_t i = 0; i < cells; ++i) {
+			if(i == cells / 2) grown = gpuMalloc(queue, 1 << 16);
+			auto root = (gpu*)((char*)roots_gpu + i * 16);
+			gpuDrawIndexedInstanced(cmd, root, root, indices_gpu, 3, 1);
+		}
+		gpuEndRenderPass(cmd);
+		gpuBarrier(cmd, STAGE_RASTER_COLOR_OUT, STAGE_TRANSFER);
+		gpuCopyFromTexture(cmd, pixels_gpu, memory, texture);
+		gpuSyncMemoryEXT(cmd, pixels_gpu);
+		gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
+		uint32_t wrong = 0;
+		for(uint32_t i = 0; i < cells; ++i)
+			wrong += pixels[i] != (0xff000000u | (i >> 8) << 8 | (i & 255));
+		assert(wrong == 0);
+
+		gpuFreePipeline(queue, pipeline);
+		gpuFree(queue, grown);
+		gpuFree(queue, pixels);
+		gpuFree(queue, indices);
+		gpuFree(queue, roots);
 		gpuFree(queue, memory);
 	}
 	noapi_doctest_end();
@@ -2604,6 +2817,67 @@ TEST_CASE("gpuSetEnabledSamplersEXT: shaders sample with the samplers enabled") 
 
 		gpuFreePipeline(queue, pipeline);
 		gpuFree(queue, color);
+		gpuFree(queue, heap);
+		gpuFree(queue, texels);
+		gpuFree(queue, memory);
+	}
+	noapi_doctest_end();
+}
+
+TEST_CASE("gpuSetEnabledSamplersEXT: one pipeline follows whichever set each dispatch has enabled") {
+	GpuQueue* queue = noapi_doctest_queue();
+	GpuDoctestBackend backend = noapi_doctest_backend();
+	(void)queue;
+	(void)backend;
+	noapi_doctest_begin();
+	{
+		GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_SAMPLED | USAGE_TRANSFER_DST)};
+		auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
+		auto texture = gpuCreateTexture(queue, desc, memory);
+		auto texels = gpuMalloc<uint32_t>(queue, 64 * 64);
+		for(uint32_t i = 0; i < 64 * 64; ++i) texels[i] = i % 64 < 32 ? 0xff0000ff : 0xff00ff00; // Red on the left, green on the right
+		auto texels_gpu = gpuHostToDevicePointer(queue, texels);
+		auto heap = gpuMalloc<GpuTextureDescriptor>(queue, 1, MEMORY_DESCRIPTOR_HEAP);
+		heap[0] = gpuTextureViewDescriptor(queue, texture, {});
+		auto heap_gpu = gpuHostToDevicePointer(queue, heap);
+
+		// Past the right edge: clamping stays green, mirroring comes back to green, and the default sampler repeats round to red
+		auto pipeline = gpuCreateComputePipeline(queue, string_to_bytes(R"slang(
+			import noapi;
+			[shader("compute")] [numthreads(1, 1, 1)]
+			void main() {
+				let clamp = GpuSamplerDesc(ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, FILTER_NEAREST, FILTER_NEAREST, FILTER_NEAREST);
+				let mirror = GpuSamplerDesc(ADDRESS_MODE_MIRROR_REPEAT, ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, FILTER_NEAREST, FILTER_NEAREST, FILTER_NEAREST);
+				gpuComputeData<float4>()[0] = gpuSample2D(0, gpuGetSamplerIndex(clamp), float2(1.25, 0.5));
+				gpuComputeData<float4>()[1] = gpuSample2D(0, gpuGetSamplerIndex(mirror), float2(1.25, 0.5));
+			}
+		)slang"));
+		REQUIRE(pipeline);
+		auto colors = gpuMalloc<float>(queue, 16, MEMORY_READBACK);
+		auto colors_gpu = gpuHostToDevicePointer(queue, colors);
+
+		GpuSamplerDesc clamp = {ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, FILTER_NEAREST, FILTER_NEAREST, FILTER_NEAREST};
+		GpuSamplerDesc mirror = {ADDRESS_MODE_MIRROR_REPEAT, ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, FILTER_NEAREST, FILTER_NEAREST, FILTER_NEAREST};
+		auto cmd = gpuStartCommandRecording(queue);
+		gpuSyncMemoryEXT(cmd, texels_gpu);
+		gpuCopyToTexture(cmd, memory, texels_gpu, texture);
+		gpuBarrier(cmd, STAGE_TRANSFER, STAGE_COMPUTE);
+		gpuSyncMemoryEXT(cmd, heap_gpu);
+		gpuSetActiveTextureHeapPtr(cmd, heap_gpu);
+		gpuSetPipeline(cmd, pipeline);
+		gpuSetEnabledSamplersEXT(cmd, {&clamp, 1}); // After the pipeline was set, so the dispatch has to notice
+		gpuDispatch(cmd, colors_gpu, {1, 1, 1});
+		gpuSetEnabledSamplersEXT(cmd, {&mirror, 1});
+		gpuDispatch(cmd, colors_gpu + 8 * sizeof(float), {1, 1, 1});
+		gpuSyncMemoryEXT(cmd, colors_gpu);
+		gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
+		CHECK(colors[1] == 1.0f); // Clamp enabled: green
+		CHECK(colors[4] == 1.0f); // Mirror not enabled, so the default sampler: red
+		CHECK(colors[8] == 1.0f); // Clamp no longer enabled: red
+		CHECK(colors[13] == 1.0f); // Mirror enabled: green
+
+		gpuFreePipeline(queue, pipeline);
+		gpuFree(queue, colors);
 		gpuFree(queue, heap);
 		gpuFree(queue, texels);
 		gpuFree(queue, memory);

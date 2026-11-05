@@ -384,8 +384,8 @@ fn cs_set_max() {
 }
 
 namespace GPU::detail {
-	// The map is indexed by packed description, so it needs one word per value up to the largest
-	constexpr static uint32_t sampler_lookup_size = gpuSamplerDescMaxPackedEXT() + 1;
+	// Override constant ids of the sampler slots' descriptions; high, so they stay clear of any a shader declares itself.
+	constexpr static uint32_t sampler_override_id = 60000;
 
 	constexpr static WGPUAddressMode address2wgpu(ADDRESS_MODE mode) {
 		switch (mode) {
@@ -453,18 +453,10 @@ namespace GPU::detail {
 		};
 		set.bind_group = wgpuDeviceCreateBindGroup(queue->device, &bind_group);
 
-		// Walked backwards so that the lowest slot wins if the same description was enabled twice
-		std::vector<uint32_t> lookup(sampler_lookup_size, 0);
-		for(size_t i = enabled.size(); i--; )
-			lookup[gpuSamplerDescPackEXT(enabled[i])] = i;
-
-		WGPUBufferDescriptor buffer {
-			.label = {"NoAPI Sampler Map", WGPU_STRLEN},
-			.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-			.size = lookup.size() * sizeof(uint32_t),
-		};
-		set.lookup_buffer = wgpuDeviceCreateBuffer(queue->device, &buffer);
-		wgpuQueueWriteBuffer(queue->queue, set.lookup_buffer, 0, lookup.data(), buffer.size);
+		// Slot 0 is the fallback rather than a match, so it holds no description
+		set.packed.fill(~0u);
+		for(size_t i = 1; i < enabled.size(); ++i)
+			set.packed[i] = gpuSamplerDescPackEXT(enabled[i]);
 
 		return &set;
 	}
@@ -558,6 +550,19 @@ namespace GPU {
 	}
 }
 
+// Offsets match the generated GpuShaderData (std140 style); each is padded to the 16 byte multiple WGSL rounds a uniform block's size to.
+struct ComputeShaderData {
+	gpu* compute;
+	uint64_t _padding = 0;
+};
+
+struct GraphicsShaderData {
+	gpu* vertex;
+	gpu* fragment;
+	gpu* indices;
+	uint64_t _padding = 0;
+};
+
 // Group 0 holds the buffers. WebGPU forbids writable storage buffers in the vertex stage, so the graphics flavor binds the monobuffers read only.
 WGPUBindGroupLayout create_buffer_bind_group_layout(GpuQueue* queue, bool compute) {
 	auto visibility = compute ? WGPUShaderStage_Compute : WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
@@ -576,25 +581,25 @@ WGPUBindGroupLayout create_buffer_bind_group_layout(GpuQueue* queue, bool comput
 			}
 		});
 
-	// The texture heap, then the sampler lookup map and monotexture sizes; both read only
-	for(uint32_t i = 0; i < 2; ++i)
-		group0.push_back({
-			.binding = binding++,
-			.visibility = visibility,
-			.buffer = {
-				.type = WGPUBufferBindingType_ReadOnlyStorage,
-				.hasDynamicOffset = false,
-				.minBindingSize = 0,
-			}
-		});
+	// The texture heap, read only
+	group0.push_back({
+		.binding = binding++,
+		.visibility = visibility,
+		.buffer = {
+			.type = WGPUBufferBindingType_ReadOnlyStorage,
+			.hasDynamicOffset = false,
+			.minBindingSize = 0,
+		}
+	});
 
+	// The root data: each draw or dispatch reads its own slot of a shared chunk at a dynamic offset (see GpuQueue::ShaderDataChunk)
 	group0.push_back({
 		.binding = binding++,
 		.visibility = visibility,
 		.buffer = {
 			.type = WGPUBufferBindingType_Uniform,
-			.hasDynamicOffset = false,
-			.minBindingSize = 0,
+			.hasDynamicOffset = true,
+			.minBindingSize = compute ? sizeof(ComputeShaderData) : sizeof(GraphicsShaderData),
 		}
 	});
 
@@ -764,6 +769,27 @@ void update_pipeline_layouts(GpuQueue* queue) {
 	std::tie(queue->current_graphics_bind_group_layout2, queue->current_graphics_bind_group2)
 		= create_layout_and_group(group2, group2entries);
 
+	// What each graphics group 2 binding is, so a render pass can swap out the ones it attaches (see pass_bind_group2)
+	queue->current_graphics_group2_bindings.assign(group2entries.size(), {});
+	for(size_t i = 0; i < queue->sampled_monotextures.size(); ++i) {
+		auto const& [_cap, texture, view, desc] = queue->sampled_monotextures[i];
+		queue->current_graphics_group2_bindings[i] = {texture, view, desc};
+	}
+	for(size_t i = 0; i < queue->storage_monotextures.size(); ++i) {
+		if(storage_sampled[i] < 0) continue;
+		auto const& [_cap, texture, view, desc] = queue->storage_monotextures[i];
+		queue->current_graphics_group2_bindings[storage_sampled[i]] = {texture, view, desc};
+	}
+
+	// Those were built against the layout just replaced
+	for(auto& [_key, cached]: queue->attachment_group2_cache)
+		queue->code_pending_submission_finished.emplace_back([cached = std::move(cached)]() {
+			wgpuBindGroupRelease(cached.group);
+			for(auto view: cached.views) wgpuTextureViewRelease(view);
+			for(auto texture: cached.textures) wgpuTextureRelease(texture);
+		}, queue->next_submission_index);
+	queue->attachment_group2_cache.clear();
+
 	// Group 3: samplers, whose shape never changes, so the layout outlives every sampler set.
 	if(!queue->current_bind_group_layout3)
 		queue->current_bind_group_layout3 = create_sampler_bind_group_layout(queue);
@@ -855,7 +881,6 @@ namespace GPU {
 
 namespace GPU::detail {
 	inline void free_sampler_set(GpuQueue::SamplerSet& set) {
-		if(set.lookup_buffer) wgpuBufferRelease(set.lookup_buffer);
 		if(set.bind_group) wgpuBindGroupRelease(set.bind_group);
 		for(auto sampler: set.samplers)
 			wgpuSamplerRelease(sampler);
@@ -883,6 +908,11 @@ void gpuFreeQueue(GpuQueue* queue) {
 	wgpuBufferRelease(queue->empty_buffer);
 	for(auto buffer: queue->monobuffers)
 		wgpuBufferRelease(buffer);
+	for(auto chunk: queue->shader_data_chunk_pool) {
+		wgpuBufferRelease(chunk->buffer);
+		delete chunk;
+	}
+	queue->shader_data_chunk_pool.clear();
 
 	for(auto monotextures: {&queue->storage_monotextures, &queue->sampled_monotextures})
 		for(auto& [_cap, texture, view, _desc]: *monotextures) {
@@ -893,6 +923,11 @@ void gpuFreeQueue(GpuQueue* queue) {
 		wgpuTextureViewRelease(view);
 	for(auto group: {queue->current_compute_bind_group1, queue->current_graphics_bind_group1, queue->current_compute_bind_group2, queue->current_graphics_bind_group2})
 		wgpuBindGroupRelease(group);
+	for(auto& [_key, cached]: queue->attachment_group2_cache) {
+		wgpuBindGroupRelease(cached.group);
+		for(auto view: cached.views) wgpuTextureViewRelease(view);
+		for(auto texture: cached.textures) wgpuTextureRelease(texture);
+	}
 	for(auto layout: {queue->current_compute_bind_group_layout0, queue->current_graphics_bind_group_layout0, queue->current_compute_bind_group_layout1,
 		queue->current_graphics_bind_group_layout1, queue->current_compute_bind_group_layout2, queue->current_graphics_bind_group_layout2})
 		wgpuBindGroupLayoutRelease(layout);
@@ -1342,6 +1377,10 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 	}
 
 	auto hash = GpuQueue::TextureHash::from_descriptor(desc);
+	// One both attached and bound in group 2 shares its atlas with nothing, so a render pass can unbind it alone (see pass_bind_group2)
+	bool attachment = desc.usage & (USAGE_COLOR_ATTACHMENT | USAGE_DEPTH_STENCIL_ATTACHMENT);
+	if(attachment && (desc.usage & USAGE_SAMPLED))
+		hash.dedicated = ++queue->dedicated_monotextures;
 	std::unordered_map<GpuQueue::TextureHash, size_t, GpuQueue::TextureHash::Hasher>* monotextures_lookup = nullptr;
 	std::vector<std::tuple<uint32_t, WGPUTexture, WGPUTextureView, GpuQueue::TextureHash>>* monotextures = nullptr;
 	bool is_storage_texture = desc.usage & USAGE_STORAGE;
@@ -1404,7 +1443,7 @@ GpuTexture* gpuCreateTexture(GpuQueue* queue, const GpuTextureDesc& desc, gpu* m
 			auto& [size, texture, full_view, description] = (*monotextures)[slot];
 			description = hash;
 			size = 0;
-			std::tie(texture, full_view) = GPU::detail::create_monotexture(queue, hash, desc.type == TEXTURE_3D ? 1 : desc.layerCount * 2);
+			std::tie(texture, full_view) = GPU::detail::create_monotexture(queue, hash, desc.type == TEXTURE_3D ? 1 : desc.layerCount * (hash.dedicated ? 1 : 2));
 
 			// We have a new monotexture the pipeline layouts should be aware of
 			update_pipeline_layouts(queue);
@@ -1621,9 +1660,8 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 			binding++, compute ? "RWStructuredBuffer" : "StructuredBuffer", i);
 
 	out += std::format("\n"
-		"[[vk::binding({}, 0)]] public StructuredBuffer<uint> texture_heap;\n"
-		"[[vk::binding({}, 0)]] public StructuredBuffer<uint> gpu_sampler_map;\n\n", binding, binding + 1);
-	binding += 2;
+		"[[vk::binding({}, 0)]] public StructuredBuffer<uint> texture_heap;\n\n", binding);
+	binding += 1;
 
 	out += std::string(compute
 		? "public struct GpuShaderData {\n\tpublic uint2 compute;\n}\n"
@@ -1657,9 +1695,14 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 		"// over as the 64 bits of the pointer, low word first. Everything wider than a word --\n"
 		"// pointers, vectors, matrices, a shader's own structs -- is built out of this one call\n"
 		"// by the portable module, so this switch is the whole of what the emulation costs.\n"
-		"public uint gpuBackendLoadU32(uint2 address) {{\n"
-		"\tlet index = address.x / 4u;\n"
-		"\tswitch(gpuBackendMonobuffer(address)) {{\n"
+		"// The low word is an offset inside one monobuffer, which cannot reach 4GiB, so nothing carries into the tag in the high word.\n"
+		"public uint2 gpuBackendOffset(uint2 address, int bytes) {{\n"
+		"\treturn uint2(address.x + uint(bytes), address.y);\n"
+		"}}\n"
+		"\n"
+		"public uint gpuBackendLoadU32(uint2 base, int bytes) {{\n"
+		"\tlet index = (base.x + uint(bytes)) / 4u;\n"
+		"\tswitch(gpuBackendMonobuffer(base)) {{\n"
 		"{}"
 		"\tdefault: return mono0[index];\n"
 		"\t}}\n"
@@ -1669,9 +1712,9 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 	// Compute only, since the rasterizer gets the monobuffers read only; GPU_STORES makes a graphics store a compile error.
 	if(compute)
 		out += std::format(
-			"public void gpuBackendStoreU32(uint2 address, uint value) {{\n"
-			"\tlet index = address.x / 4u;\n"
-			"\tswitch(gpuBackendMonobuffer(address)) {{\n"
+			"public void gpuBackendStoreU32(uint2 base, int bytes, uint value) {{\n"
+			"\tlet index = (base.x + uint(bytes)) / 4u;\n"
+			"\tswitch(gpuBackendMonobuffer(base)) {{\n"
 			"{}"
 			"\tdefault: mono0[index] = value; break;\n"
 			"\t}}\n"
@@ -1716,20 +1759,27 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 	for (uint32_t i = 0; i < gpu_sampler_slot_count; ++i)
 		out += std::format("[[vk::binding({}, 3)]] public SamplerState gpu_sampler_{};\n", i, i);
 
+	// Each slot's description arrives as an override constant (see SamplerSet::packed), so for a constant description the compares fold away
+	std::string sampler_slots;
+	for (uint32_t i = 1; i < gpu_sampler_slot_count; ++i) {
+		out += std::format("[vk::constant_id({})] const uint gpu_sampler_desc_{} = 0xFFFFFFFFu;\n", GPU::detail::sampler_override_id + i, i);
+		sampler_slots += std::format("\tif(packed == gpu_sampler_desc_{}) return {}u;\n", i, i);
+	}
+
 	auto storage_count = static_cast<uint32_t>(queue->storage_monotextures.size());
 	auto sampled_count = static_cast<uint32_t>(queue->sampled_monotextures.size());
 
 	out += std::format("\n"
 		"public static const uint GPU_SAMPLER_SLOT_COUNT = {}u;\n"
-		"public static const uint GPU_SAMPLER_LOOKUP_SIZE = {}u;\n"
 		"public static const uint GPU_STORAGE_TEXTURE_COUNT = {}u;\n"
 		"public static const uint GPU_SAMPLED_TEXTURE_COUNT = {}u;\n"
 		"\n"
 		"// Turns a packed GpuSamplerDesc into the slot holding it, or slot 0 (the default\n"
-		"// sampler) when that description was never handed to gpuSetEnabledSamplersEXT\n"
+		"// sampler) when that description was never handed to gpuSetEnabledSamplersEXT; the\n"
+		"// lowest slot wins when one was enabled twice\n"
 		"public uint gpuBackendSamplerSlot(uint packed) {{\n"
-		"\tif(packed >= GPU_SAMPLER_LOOKUP_SIZE) return 0u;\n"
-		"\treturn gpu_sampler_map[packed];\n"
+		"{}"
+		"\treturn 0u;\n"
 		"}}\n"
 		"\n"
 		"static const uint GPU_MONOTEXTURE_STORAGE_BIT = 0x80000000u;\n"
@@ -1769,7 +1819,7 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 		"\treturn (descriptor.monotexture & GPU_MONOTEXTURE_STORAGE_BIT) != 0u;\n"
 		"}}\n"
 		"\n",
-		gpu_sampler_slot_count, GPU::detail::sampler_lookup_size, storage_count, sampled_count);
+		gpu_sampler_slot_count, storage_count, sampled_count, sampler_slots);
 
 	// WGSL can't index arrays of samplers or textures, so picking either at runtime is a switch over every combination.
 	auto sample_function = [&](int at, TEXTURE type) {
@@ -1881,7 +1931,7 @@ namespace GPU::detail {
 	}
 }
 
-WGPUShaderModule create_shader_module(GpuQueue* queue, std::string_view IR, GPU::shaders::SHADER_STAGE stage, bool dual_source = false) {
+WGPUShaderModule create_shader_module(GpuQueue* queue, std::string_view IR, GPU::shaders::SHADER_STAGE stage, bool dual_source = false, uint32_t* sampler_overrides = nullptr) {
 	auto compute = stage == GPU::shaders::SHADER_STAGE::COMPUTE;
 
 	std::string error;
@@ -1901,6 +1951,14 @@ WGPUShaderModule create_shader_module(GpuQueue* queue, std::string_view IR, GPU:
 	}
 
 	if(dual_source) wgsl = GPU::detail::dual_source_outputs(*wgsl);
+
+	// Slang drops the overrides a shader never reads, and a pipeline may only set those the module declares
+	if(sampler_overrides) {
+		*sampler_overrides = 0;
+		for(uint32_t i = 1; i < gpu_sampler_slot_count; ++i)
+			if(wgsl->find(std::format("@id({})", GPU::detail::sampler_override_id + i)) != std::string::npos)
+				*sampler_overrides |= 1u << i;
+	}
 	WGPUShaderSourceWGSL source {
 		.chain {.sType = WGPUSType_ShaderSourceWGSL },
 		.code = {wgsl->data(), wgsl->size()}
@@ -1911,26 +1969,48 @@ WGPUShaderModule create_shader_module(GpuQueue* queue, std::string_view IR, GPU:
 	return wgpuDeviceCreateShaderModule(queue->device, &module);
 }
 
-bool update_compute_pipeline(GpuQueue* queue, const GpuPipeline* pipeline) {
+namespace GPU::detail {
+	// The override constants holding `set`'s descriptions, for the slots `declared` has a bit for; `keys` backs the entries' names.
+	inline std::vector<WGPUConstantEntry> sampler_constants(const GpuQueue::SamplerSet* set, uint32_t declared, std::vector<std::string>& keys) {
+		keys.clear();
+		keys.reserve(gpu_sampler_slot_count); // The entries point into these strings, so they must not move
+		std::vector<WGPUConstantEntry> out;
+		for(uint32_t i = 1; i < gpu_sampler_slot_count; ++i) {
+			if(!(declared & (1u << i))) continue;
+			keys.push_back(std::to_string(sampler_override_id + i));
+			out.push_back({.key = {keys.back().data(), keys.back().size()}, .value = double(set->packed[i])});
+		}
+		return out;
+	}
+}
+
+// The module is only recompiled when the layout moved on; a new sampler set just rebuilds the pipeline around it.
+bool update_compute_pipeline(GpuQueue* queue, const GpuPipeline* pipeline, const GpuQueue::SamplerSet* sampler_set) {
 	auto& cache = std::get<GpuPipeline::ComputeCache>(pipeline->cache);
 	if(cache.pipeline) wgpuComputePipelineRelease(cache.pipeline);
 	cache.pipeline = nullptr;
 
-	auto module = create_shader_module(queue, cache.IR, GPU::shaders::SHADER_STAGE::COMPUTE);
-	if(!module) return false;
+	if(!cache.module || pipeline->reference_layout != queue->current_compute_pipeline_layout) {
+		if(cache.module) wgpuShaderModuleRelease(cache.module);
+		cache.module = create_shader_module(queue, cache.IR, GPU::shaders::SHADER_STAGE::COMPUTE, false, &cache.sampler_overrides);
+		if(!cache.module) return false;
+	}
 
+	std::vector<std::string> keys;
+	auto constants = GPU::detail::sampler_constants(sampler_set, cache.sampler_overrides, keys);
 	WGPUComputePipelineDescriptor d {
 		.layout = queue->current_compute_pipeline_layout,
 		.compute = {
-			.module = module,
+			.module = cache.module,
 			// Leaving the entry point undefined picks the module's only one, which is all Slang emitted for this stage
 			.entryPoint = WGPU_STRING_VIEW_INIT,
+			.constantCount = constants.size(),
+			.constants = constants.data(),
 		}
 	};
 	cache.pipeline = wgpuDeviceCreateComputePipeline(queue->device, &d);
 	pipeline->reference_layout = queue->current_compute_pipeline_layout;
-
-	wgpuShaderModuleRelease(module);
+	cache.sampler_set = sampler_set;
 	return cache.pipeline;
 }
 
@@ -1943,7 +2023,7 @@ GpuPipeline* gpuCreateComputePipeline(GpuQueue* queue, GpuByteSpan computeIR) {
 		}
 	};
 
-	if(!update_compute_pipeline(queue, out)) {
+	if(!update_compute_pipeline(queue, out, queue->default_sampler_set)) {
 		gpuFreePipeline(queue, out);
 		return nullptr;
 	}
@@ -1954,9 +2034,12 @@ void gpuFreePipeline(GpuQueue* queue, GpuPipeline* pipeline) {
 	if(std::holds_alternative<GpuPipeline::ComputeCache>(pipeline->cache)) {
 		auto& cache = std::get<GpuPipeline::ComputeCache>(pipeline->cache);
 		if(cache.pipeline) wgpuComputePipelineRelease(cache.pipeline);
+		if(cache.module) wgpuShaderModuleRelease(cache.module);
 	} else {
 		auto& cache = std::get<GpuPipeline::RenderCache>(pipeline->cache);
 		if(cache.pipeline) wgpuRenderPipelineRelease(cache.pipeline);
+		if(cache.vertex_module) wgpuShaderModuleRelease(cache.vertex_module);
+		if(cache.fragment_module) wgpuShaderModuleRelease(cache.fragment_module);
 	}
 
 	pipeline->~GpuPipeline();
@@ -1978,6 +2061,81 @@ namespace GPU {
 					queue->code_pending_submission_finished.erase(queue->code_pending_submission_finished.begin() + i);
 				}
 			}
+	}
+}
+
+namespace GPU::detail {
+	// Slots sit at the uniform offset alignment, the only granularity a dynamic offset can name
+	inline size_t shader_data_stride(GpuQueue* queue) {
+		auto alignment = std::max<size_t>(queue->limits.minUniformBufferOffsetAlignment, 16);
+		return (std::max(sizeof(GraphicsShaderData), sizeof(ComputeShaderData)) + alignment - 1) / alignment * alignment;
+	}
+
+	// The chunk the next slot goes in, taking a fresh one from the pool when the current one is full
+	inline GpuQueue::ShaderDataChunk* shader_data_chunk(GpuCommandBuffer* cmd) {
+		auto queue = cmd->queue;
+		auto stride = shader_data_stride(queue);
+		if(!cmd->shader_data_chunks.empty() && cmd->shader_data_chunks.back()->staging.size() + stride <= GpuQueue::shader_data_chunk_size)
+			return cmd->shader_data_chunks.back();
+
+		GpuQueue::ShaderDataChunk* chunk;
+		if(!queue->shader_data_chunk_pool.empty()) {
+			chunk = queue->shader_data_chunk_pool.back();
+			queue->shader_data_chunk_pool.pop_back();
+		} else {
+			WGPUBufferDescriptor d {
+				.label = {"NoAPI ShaderData", WGPU_STRLEN},
+				.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst,
+				.size = GpuQueue::shader_data_chunk_size,
+			};
+			chunk = new GpuQueue::ShaderDataChunk{.buffer = wgpuDeviceCreateBuffer(queue->device, &d)};
+			chunk->staging.reserve(GpuQueue::shader_data_chunk_size);
+		}
+		cmd->shader_data_chunks.push_back(chunk);
+		// Back to the pool once the GPU has read it, or at once if it never will
+		cmd->code_pending_submission_finished.emplace_back([queue, chunk](bool) {
+			chunk->staging.clear();
+			queue->shader_data_chunk_pool.push_back(chunk);
+		});
+		return chunk;
+	}
+
+	// Ordered before the submit, so the GPU reads each slot as it was written when the call was recorded
+	inline void upload_shader_data(GpuCommandBuffer* cmd) {
+		for(auto chunk: cmd->shader_data_chunks)
+			if(!chunk->staging.empty())
+				wgpuQueueWriteBuffer(cmd->queue->queue, chunk->buffer, 0, chunk->staging.data(), chunk->staging.size());
+	}
+
+	// Group 0 for what is bound right now, reusing the last one built when none of it changed
+	inline WGPUBindGroup buffer_bind_group(GpuCommandBuffer* cmd, WGPUBuffer shader_data, size_t shader_data_size, bool compute) {
+		auto queue = cmd->queue;
+		GpuCommandBuffer::BufferGroupKey key {
+			.monobuffers = queue->monobuffers,
+			.monobuffer_sizes = queue->monobuffer_sizes,
+			.texture_heap = cmd->active_texture_heap ? cmd->active_texture_heap : queue->empty_buffer,
+			.texture_heap_size = cmd->active_texture_heap ? cmd->active_texture_heap_size : 4,
+			.shader_data = shader_data,
+		};
+		auto& cached = cmd->buffer_groups[compute];
+		if(cached.group && cached.key == key) return cached.group;
+
+		uint32_t binding = 0;
+		std::vector<WGPUBindGroupEntry> group0;
+		for(uint32_t i = 0; i < key.monobuffers.size(); ++i)
+			group0.push_back({.binding = binding++, .buffer = key.monobuffers[i], .offset = 0, .size = key.monobuffer_sizes[i]});
+		group0.push_back({.binding = binding++, .buffer = key.texture_heap, .offset = 0, .size = key.texture_heap_size});
+		group0.push_back({.binding = binding++, .buffer = shader_data, .offset = 0, .size = shader_data_size});
+
+		WGPUBindGroupDescriptor d {
+			.layout = compute ? queue->current_compute_bind_group_layout0 : queue->current_graphics_bind_group_layout0,
+			.entryCount = group0.size(),
+			.entries = group0.data()
+		};
+		auto group = wgpuDeviceCreateBindGroup(queue->device, &d);
+		cmd->code_pending_submission_finished.emplace_back([group](bool) { wgpuBindGroupRelease(group); });
+		cached = {key, group};
+		return group;
 	}
 }
 
@@ -2054,6 +2212,7 @@ void endRenderPass(GpuCommandBuffer* cmd) {
 	}, cmd->queue->next_submission_index);
 	cmd->render_pass = nullptr;
 	cmd->bound_render_pipeline = nullptr; // Nothing set on a pass outlives it
+	cmd->pass_attached.clear();
 }
 
 void endComputePass(GpuCommandBuffer* cmd) {
@@ -2076,6 +2235,7 @@ uint64_t gpuSubmitNoFreeEXT(GpuQueue* queue, GpuCommandBufferSpan command_buffer
 	for(auto buffer: command_buffers) {
 		endCurrentPass(buffer);
 		buffers.emplace_back(wgpuCommandEncoderFinish(buffer->encoder, nullptr));
+		GPU::detail::upload_shader_data(buffer);
 	}
 
 	GpuCommandBuffer cmd {
@@ -2764,11 +2924,16 @@ void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline) {
 	cmd->bound_pipeline = pipeline;
 
 	if(std::holds_alternative<GpuPipeline::ComputeCache>(pipeline->cache)) {
-		if(pipeline->reference_layout != cmd->queue->current_compute_pipeline_layout)
-			update_compute_pipeline(cmd->queue, pipeline);
+		auto sampler_set = cmd->sampler_set ? cmd->sampler_set : cmd->queue->default_sampler_set;
+		if(pipeline->reference_layout != cmd->queue->current_compute_pipeline_layout
+		|| std::get<GpuPipeline::ComputeCache>(pipeline->cache).sampler_set != sampler_set)
+			update_compute_pipeline(cmd->queue, pipeline, sampler_set);
 
 		endRenderPass(cmd);
-		if(!cmd->compute_pass) cmd->compute_pass = wgpuCommandEncoderBeginComputePass(cmd->encoder, nullptr);
+		if(!cmd->compute_pass) {
+			cmd->compute_pass = wgpuCommandEncoderBeginComputePass(cmd->encoder, nullptr);
+			cmd->pass_bindings = {};
+		}
 
 		wgpuComputePassEncoderSetPipeline(cmd->compute_pass, std::get<GpuPipeline::ComputeCache>(pipeline->cache).pipeline);
 	} else {
@@ -2778,94 +2943,91 @@ void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline) {
 	}
 }
 
-// Offsets match the generated GpuShaderData (std140 style); each is padded to the 16 byte multiple WGSL rounds a uniform block's size to.
-struct ComputeShaderData {
-	gpu* compute;
-	uint64_t _padding = 0;
-};
+namespace GPU::detail {
+	// The open render pass's graphics group 2: the queue's, unless the pass attaches a texture it binds, in which case that binding is
+	// swapped for a view of only the mips below the attached one, or, attached at mip 0, a 1x1 stand in of the same shape. Sampling an
+	// attached texture is a race on every API, so what it reads instead is unspecified; WebGPU just refuses to record it at all.
+	inline WGPUBindGroup pass_bind_group2(GpuCommandBuffer* cmd) {
+		auto queue = cmd->queue;
+		if(cmd->pass_attached.empty()) return queue->current_graphics_bind_group2;
 
-// Builds group 0: every monobuffer, the active texture heap, and a throwaway uniform holding the root data pointer(s) the shaders were invoked with
-WGPUBindGroup createBufferBindGroup(GpuCommandBuffer* cmd, const void* shader_data, size_t shader_data_size, bool compute) {
-	uint32_t binding = 0;
-	std::vector<WGPUBindGroupEntry> group0;
-	for(uint32_t i = 0; i < cmd->queue->monobuffers.size(); ++i)
-		group0.push_back({
-			.binding = binding++,
-			.buffer = cmd->queue->monobuffers[i],
-			.offset = 0,
-			.size = cmd->queue->monobuffer_sizes[i]
-		});
+		auto [found, inserted] = queue->attachment_group2_cache.try_emplace(cmd->pass_attached);
+		auto& cached = found->second;
+		if(!inserted) return cached.group;
 
-	// If there is no active texture heap bind the empty buffer
-	if(cmd->active_texture_heap)
-		group0.push_back({
-			.binding = binding++,
-			.buffer = cmd->active_texture_heap,
-			.offset = 0,
-			.size = cmd->active_texture_heap_size
-		});
-	else group0.push_back({
-		.binding = binding++,
-		.buffer = cmd->queue->empty_buffer,
-		.offset = 0,
-		.size = 4
-	});
+		std::vector<WGPUBindGroupEntry> entries;
+		auto& bindings = queue->current_graphics_group2_bindings;
+		for(uint32_t binding = 0; binding < bindings.size(); ++binding)
+			entries.push_back({.binding = binding, .textureView = bindings[binding].view});
 
-	{
-		auto& sampler_set = cmd->sampler_set ? *cmd->sampler_set : *cmd->queue->default_sampler_set;
-		group0.push_back({
-			.binding = binding++,
-			.buffer = sampler_set.lookup_buffer,
-			.offset = 0,
-			.size = GPU::detail::sampler_lookup_size * sizeof(uint32_t)
-		});
-	}
+		for(auto [binding, mip]: cmd->pass_attached) {
+			auto& bound = bindings[binding];
+			auto usage = wgpuTextureGetUsage(bound.texture) & ~WGPUTextureUsage_StorageBinding;
+			auto view_dimension = GPU::texture_view2wgpu(bound.desc.type);
+			auto layers = bound.desc.type == TEXTURE_3D ? 1 : wgpuTextureGetDepthOrArrayLayers(bound.texture);
+			auto texture = bound.texture;
+			if(mip == 0) {
+				// A cube array view needs whole cubes
+				layers = view_dimension == WGPUTextureViewDimension_CubeArray ? 6 : 1;
+				WGPUTextureDescriptor d {
+					.label = {"NoAPI Attachment Stand In", WGPU_STRLEN},
+					.usage = usage,
+					.dimension = GPU::texture2wgpu(bound.desc.type),
+					.size = {1, 1, layers},
+					.format = GPU::format2wgpu(bound.desc.format),
+					.mipLevelCount = 1,
+					.sampleCount = bound.desc.sampleCount,
+				};
+				texture = wgpuDeviceCreateTexture(queue->device, &d);
+				cached.textures.push_back(texture);
+			}
+			WGPUTextureViewDescriptor v {
+				.format = GPU::format2wgpu(bound.desc.format),
+				.dimension = view_dimension,
+				.baseMipLevel = 0,
+				.mipLevelCount = std::max(mip, 1u),
+				.baseArrayLayer = 0,
+				.arrayLayerCount = layers,
+				.aspect = WGPUTextureAspect_All,
+				.usage = usage,
+			};
+			cached.views.push_back(wgpuTextureCreateView(texture, &v));
+			entries[binding].textureView = cached.views.back();
+		}
 
-	{
-		WGPUBufferDescriptor d {
-			.label = {"NoAPI ShaderData", WGPU_STRLEN},
-			.usage = WGPUBufferUsage_Uniform,
-			.size = shader_data_size,
-			.mappedAtCreation = true,
+		WGPUBindGroupDescriptor d {
+			.label = {"NoAPI Attachment Group 2", WGPU_STRLEN},
+			.layout = queue->current_graphics_bind_group_layout2,
+			.entryCount = static_cast<uint32_t>(entries.size()),
+			.entries = entries.data(),
 		};
-		auto tmp = wgpuDeviceCreateBuffer(cmd->queue->device, &d);
-		cmd->queue->code_pending_submission_finished.emplace_back([tmp] { wgpuBufferRelease(tmp); }, cmd->queue->next_submission_index);
-		memcpy(wgpuBufferGetMappedRange(tmp, 0, d.size), shader_data, shader_data_size);
-		wgpuBufferUnmap(tmp);
-
-		group0.push_back({
-			.binding = binding++,
-			.buffer = tmp,
-			.offset = 0,
-			.size = d.size
-		});
+		cached.group = wgpuDeviceCreateBindGroup(queue->device, &d);
+		return cached.group;
 	}
-
-	WGPUBindGroupDescriptor d {
-		.layout = compute ? cmd->queue->current_compute_bind_group_layout0 : cmd->queue->current_graphics_bind_group_layout0,
-		.entryCount = group0.size(),
-		.entries = group0.data()
-	};
-	return wgpuDeviceCreateBindGroup(cmd->queue->device, &d);
 }
 
-// Binds every group needed by a dispatch or a draw (the texture groups are shared between the two)
+// Binds every group needed by a dispatch or a draw (the texture groups are shared between the two); only what differs from what the pass already has is set.
 void bindGroups(GpuCommandBuffer* cmd, const void* shader_data, size_t shader_data_size, bool compute) {
-	auto group0 = createBufferBindGroup(cmd, shader_data, shader_data_size, compute);
-	cmd->queue->code_pending_submission_finished.emplace_back([group0] { wgpuBindGroupRelease(group0); }, cmd->queue->next_submission_index);
+	auto chunk = GPU::detail::shader_data_chunk(cmd);
+	auto offset = (uint32_t)chunk->staging.size();
+	chunk->staging.resize(offset + GPU::detail::shader_data_stride(cmd->queue));
+	memcpy(chunk->staging.data() + offset, shader_data, shader_data_size);
 
-	auto group3 = (cmd->sampler_set ? cmd->sampler_set : cmd->queue->default_sampler_set)->bind_group;
+	std::array<WGPUBindGroup, 4> groups {
+		GPU::detail::buffer_bind_group(cmd, chunk->buffer, shader_data_size, compute),
+		compute ? cmd->queue->current_compute_bind_group1 : cmd->queue->current_graphics_bind_group1,
+		compute ? cmd->queue->current_compute_bind_group2 : GPU::detail::pass_bind_group2(cmd),
+		(cmd->sampler_set ? cmd->sampler_set : cmd->queue->default_sampler_set)->bind_group,
+	};
 
-	if(compute) {
-		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 0, group0, 0, nullptr);
-		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 1, cmd->queue->current_compute_bind_group1, 0, nullptr);
-		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 2, cmd->queue->current_compute_bind_group2, 0, nullptr);
-		wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, 3, group3, 0, nullptr);
-	} else {
-		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 0, group0, 0, nullptr);
-		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 1, cmd->queue->current_graphics_bind_group1, 0, nullptr);
-		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 2, cmd->queue->current_graphics_bind_group2, 0, nullptr);
-		wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, 3, group3, 0, nullptr);
+	auto& bound = cmd->pass_bindings;
+	for(uint32_t i = 0; i < groups.size(); ++i) {
+		// Group 0 moves to a new slot every call, so only the others can be skipped
+		if(i != 0 && bound.groups[i] == groups[i]) continue;
+		uint32_t dynamic_count = i == 0 ? 1 : 0;
+		if(compute) wgpuComputePassEncoderSetBindGroup(cmd->compute_pass, i, groups[i], dynamic_count, &offset);
+		else wgpuRenderPassEncoderSetBindGroup(cmd->render_pass, i, groups[i], dynamic_count, &offset);
+		bound.groups[i] = groups[i];
 	}
 }
 
@@ -2876,8 +3038,10 @@ void bindComputeGroups(GpuCommandBuffer* cmd, gpu* data) {
 
 void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions) {
 	assert(cmd->bound_pipeline);
-	// A copy or signal since gpuSetPipeline ended the pass, which Vulkan has no equivalent of, so it is reopened with the pipeline still bound
-	if(!cmd->compute_pass) gpuSetPipeline(cmd, cmd->bound_pipeline);
+	// A copy or signal since gpuSetPipeline ended the pass, which Vulkan has no equivalent of, so it is reopened with the pipeline still bound; a sampler set enabled since then needs the pipeline rebuilt
+	auto sampler_set = cmd->sampler_set ? cmd->sampler_set : cmd->queue->default_sampler_set;
+	if(!cmd->compute_pass || std::get<GpuPipeline::ComputeCache>(cmd->bound_pipeline->cache).sampler_set != sampler_set)
+		gpuSetPipeline(cmd, cmd->bound_pipeline);
 
 	bindComputeGroups(cmd, data);
 
@@ -2929,16 +3093,15 @@ GpuPipeline* gpuCreateGraphicsPipeline(GpuQueue* queue, GpuByteSpan vertexIR, Gp
 	auto& cache = std::get<GpuPipeline::RenderCache>(out->cache);
 	cache.descriptor.colorTargets = cache.color_targets;
 
-	// Compiled once now, though only a draw builds the pipeline, so a broken shader fails here as it does on Vulkan
-	for(auto [IR, stage]: {std::pair{std::string_view(cache.vertexIR), GPU::shaders::SHADER_STAGE::VERTEX}, std::pair{std::string_view(cache.fragmentIR), GPU::shaders::SHADER_STAGE::FRAGMENT}}) {
-		if(IR.empty()) continue;
-		auto module = create_shader_module(queue, IR, stage);
-		if(!module) {
-			gpuFreePipeline(queue, out);
-			return nullptr;
-		}
-		wgpuShaderModuleRelease(module);
+	// Compiled now, though only a draw builds the pipeline, so a broken shader fails here as it does on Vulkan; the draw reuses the modules
+	cache.vertex_module = create_shader_module(queue, cache.vertexIR, GPU::shaders::SHADER_STAGE::VERTEX, false, &cache.vertex_sampler_overrides);
+	if(!cache.fragmentIR.empty())
+		cache.fragment_module = create_shader_module(queue, cache.fragmentIR, GPU::shaders::SHADER_STAGE::FRAGMENT, desc.supportDualSourceBlending, &cache.fragment_sampler_overrides);
+	if(!cache.vertex_module || (!cache.fragmentIR.empty() && !cache.fragment_module)) {
+		gpuFreePipeline(queue, out);
+		return nullptr;
 	}
+	out->reference_layout = queue->current_graphics_pipeline_layout;
 
 	// Built by the first draw, once the depth/stencil, blend and index state it bakes in are known.
 	return out;
@@ -3077,6 +3240,26 @@ void gpuBeginRenderPass(GpuCommandBuffer* cmd, const GpuRenderPassDesc& desc) {
 		.depthStencilAttachment = merged ? &depth_stencil : nullptr,
 	};
 	cmd->render_pass = wgpuCommandEncoderBeginRenderPass(cmd->encoder, &d);
+	cmd->pass_bindings = {};
+
+	// Group 2 must not bind what this pass renders to; only dedicated atlases can be attached while sampleable (see pass_bind_group2)
+	cmd->pass_attached.clear();
+	auto attached = [&](const GpuTexture* texture, uint32_t mip) {
+		if(!texture || !texture->range) return;
+		auto& bindings = cmd->queue->current_graphics_group2_bindings;
+		for(uint32_t binding = 0; binding < bindings.size(); ++binding)
+			if(bindings[binding].texture == texture->texture)
+				cmd->pass_attached.push_back({binding, mip});
+	};
+	for(auto& color: desc.colorAttachments) {
+		attached(color.texture, color.mipLevel);
+		attached(color.resolveTexture, color.mipLevel);
+	}
+	if(merged) attached(merged->texture, merged->mipLevel);
+	std::ranges::sort(cmd->pass_attached);
+	// The same atlas attached at two mips keeps only the lower one, the most that can still be sampled
+	auto duplicates = std::ranges::unique(cmd->pass_attached, {}, &std::pair<uint32_t, uint32_t>::first);
+	cmd->pass_attached.erase(duplicates.begin(), duplicates.end());
 
 	gpuSetViewportEXT(cmd, extent);
 	gpuSetScissorRectEXT(cmd, extent);
@@ -3193,7 +3376,7 @@ namespace GPU {
 }
 
 // WebGPU bakes the depth/stencil, blend and index state into the pipeline, so each variant records what it was built with.
-void update_render_pipeline(GpuQueue* queue, const GpuPipeline* pipeline, const std::optional<GpuDepthStencilDesc>& depth_stencil, const std::optional<GpuBlendDesc>& blend, INDEX_TYPE_EXT index_type) {
+void update_render_pipeline(GpuQueue* queue, const GpuPipeline* pipeline, const std::optional<GpuDepthStencilDesc>& depth_stencil, const std::optional<GpuBlendDesc>& blend, INDEX_TYPE_EXT index_type, const GpuQueue::SamplerSet* sampler_set) {
 	auto& cache = std::get<GpuPipeline::RenderCache>(pipeline->cache);
 	if(cache.pipeline) wgpuRenderPipelineRelease(cache.pipeline);
 
@@ -3261,14 +3444,26 @@ void update_render_pipeline(GpuQueue* queue, const GpuPipeline* pipeline, const 
 		.depthBiasClamp = state.depthBiasClamp,
 	};
 
-	auto vertex_module = create_shader_module(queue, cache.vertexIR, GPU::shaders::SHADER_STAGE::VERTEX);
-	auto fragment_module = cache.fragmentIR.empty() ? nullptr
-		: create_shader_module(queue, cache.fragmentIR, GPU::shaders::SHADER_STAGE::FRAGMENT, desc.supportDualSourceBlending);
+	// Recompiled only when the layout moved on; new state or a new sampler set reuses them
+	if(!cache.vertex_module || pipeline->reference_layout != queue->current_graphics_pipeline_layout) {
+		if(cache.vertex_module) wgpuShaderModuleRelease(cache.vertex_module);
+		if(cache.fragment_module) wgpuShaderModuleRelease(cache.fragment_module);
+		cache.vertex_module = create_shader_module(queue, cache.vertexIR, GPU::shaders::SHADER_STAGE::VERTEX, false, &cache.vertex_sampler_overrides);
+		cache.fragment_module = cache.fragmentIR.empty() ? nullptr
+			: create_shader_module(queue, cache.fragmentIR, GPU::shaders::SHADER_STAGE::FRAGMENT, desc.supportDualSourceBlending, &cache.fragment_sampler_overrides);
+	}
+	auto vertex_module = cache.vertex_module;
+	auto fragment_module = cache.fragment_module;
+	std::vector<std::string> vertex_keys, fragment_keys;
+	auto vertex_constants = GPU::detail::sampler_constants(sampler_set, cache.vertex_sampler_overrides, vertex_keys);
+	auto fragment_constants = GPU::detail::sampler_constants(sampler_set, cache.fragment_sampler_overrides, fragment_keys);
 
 	WGPUFragmentState fragment {
 		.module = fragment_module,
 		// Undefined rather than left alone: a zeroed WGPUStringView is the empty string, which Dawn then goes looking for as an entry point name
 		.entryPoint = WGPU_STRING_VIEW_INIT,
+		.constantCount = fragment_constants.size(),
+		.constants = fragment_constants.data(),
 		.targetCount = targets.size(),
 		.targets = targets.data(),
 	};
@@ -3278,6 +3473,8 @@ void update_render_pipeline(GpuQueue* queue, const GpuPipeline* pipeline, const 
 			.module = vertex_module,
 			// Undefined picks the module's only entry point for the stage, so one source can serve both stages.
 			.entryPoint = WGPU_STRING_VIEW_INIT,
+			.constantCount = vertex_constants.size(),
+			.constants = vertex_constants.data(),
 		},
 		.primitive = {
 			.topology = GPU::topology2wgpu(desc.topology),
@@ -3300,9 +3497,7 @@ void update_render_pipeline(GpuQueue* queue, const GpuPipeline* pipeline, const 
 	cache.depth_stencil = depth_stencil;
 	cache.blend = blend;
 	cache.index_type = index_type;
-
-	wgpuShaderModuleRelease(vertex_module);
-	if(fragment_module) wgpuShaderModuleRelease(fragment_module);
+	cache.sampler_set = sampler_set;
 }
 
 // Rebuilds the bound pipeline's variant when the state or layout has moved on, then sets it.
@@ -3313,14 +3508,16 @@ void bindRenderPipeline(GpuCommandBuffer* cmd) {
 
 	auto pipeline = cmd->bound_pipeline;
 	auto& cache = std::get<GpuPipeline::RenderCache>(pipeline->cache);
+	auto sampler_set = cmd->sampler_set ? cmd->sampler_set : cmd->queue->default_sampler_set;
 
 	if(!cache.pipeline
+	|| cache.sampler_set != sampler_set
 	|| pipeline->reference_layout != cmd->queue->current_graphics_pipeline_layout
 	|| !GPU::same(cache.depth_stencil, cmd->depth_stencil)
 	|| !GPU::same(cache.blend, cmd->blend)
 	// The index format is only baked into the pipeline when primitives are restarted by the indices
 	|| (cache.descriptor.topology == TOPOLOGY_TRIANGLE_STRIP && cache.index_type != cmd->index_type))
-		update_render_pipeline(cmd->queue, pipeline, cmd->depth_stencil, cmd->blend, cmd->index_type);
+		update_render_pipeline(cmd->queue, pipeline, cmd->depth_stencil, cmd->blend, cmd->index_type, sampler_set);
 
 	if(cmd->bound_render_pipeline != cache.pipeline) {
 		wgpuRenderPassEncoderSetPipeline(cmd->render_pass, cache.pipeline);
@@ -3331,13 +3528,6 @@ void bindRenderPipeline(GpuCommandBuffer* cmd) {
 	if(cmd->depth_stencil)
 		wgpuRenderPassEncoderSetStencilReference(cmd->render_pass, cmd->depth_stencil->stencilFront.reference);
 }
-
-struct GraphicsShaderData {
-	gpu* vertex;
-	gpu* fragment;
-	gpu* indices;
-	uint64_t _padding = 0;
-};
 
 void bindGraphicsGroups(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragment_data, gpu* index_data) {
 	GraphicsShaderData shader_data { .vertex = vertex_data, .fragment = fragment_data, .indices = index_data };
@@ -3357,8 +3547,15 @@ namespace GPU::detail {
 
 		// WebGPU rejects a bound size that isn't a whole number of indices.
 		auto size = ((range.end - start) / stride) * stride;
-		wgpuRenderPassEncoderSetIndexBuffer(cmd->render_pass, cmd->queue->monobuffers[range.buffer],
-			GPU::index2wgpu(index_type), start, size);
+		auto buffer = cmd->queue->monobuffers[range.buffer];
+		auto format = GPU::index2wgpu(index_type);
+		auto& bound = cmd->pass_bindings;
+		if(bound.index_buffer == buffer && bound.index_offset == start && bound.index_size == size && bound.index_format == format) return;
+		wgpuRenderPassEncoderSetIndexBuffer(cmd->render_pass, buffer, format, start, size);
+		bound.index_buffer = buffer;
+		bound.index_offset = start;
+		bound.index_size = size;
+		bound.index_format = format;
 	}
 }
 

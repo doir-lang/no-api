@@ -250,6 +250,7 @@ GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice dev
 	vkGetPhysicalDeviceProperties2(gpu, &properties);
 	out->minimum_descriptor_heap_size = heap_properties.minResourceHeapReservedRange;
 	out->sampler_size = heap_properties.samplerDescriptorSize;
+	out->max_sampler_heap_size = heap_properties.maxSamplerHeapSize;
 	out->image_size = heap_properties.imageDescriptorSize;
 	out->descriptor_heap_alignment = heap_properties.resourceHeapAlignment;
 
@@ -645,7 +646,9 @@ namespace GPU::detail {
 		const bool cube = descriptor.type == TEXTURE_CUBE || descriptor.type == TEXTURE_CUBE_ARRAY;
 		return VkImageCreateInfo{
 			.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-			.flags = VkImageCreateFlags(VK_IMAGE_CREATE_ALIAS_BIT | (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0)),
+			// No VK_IMAGE_CREATE_ALIAS_BIT: it only matters for two images sharing memory, which gpuCreateTexture refuses, and it isn't free:
+			// on Mesa's Intel driver (RPL-U) it added a fixed ~40 us to every render pass, consistent with the image losing its fast clears.
+			.flags = VkImageCreateFlags(cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0),
 			.imageType = type2vulkan(descriptor.type),
 			.format = GPU::detail::format2vulkan(descriptor.format),
 			.extent = VkExtent3D{descriptor.dimensions.x, descriptor.dimensions.y, descriptor.dimensions.z},
@@ -792,7 +795,6 @@ module noapi_backend;
 // Matches ComputePipelinePushConstants
 public struct GpuPushConstants {
 	public uint64_t compute_data;
-	public uint64_t sampler_map;
 }
 #else
 // Matches GraphicsPipelinePushConstants
@@ -800,7 +802,6 @@ public struct GpuPushConstants {
 	public uint64_t vertex_data;
 	public uint64_t fragment_data;
 	public uint64_t index_data;
-	public uint64_t sampler_map;
 }
 #endif
 
@@ -810,8 +811,11 @@ public struct GpuPushConstants {
 static uint64_t gpuBackendAddress(uint2 address) { return (uint64_t(address.y) << 32) | uint64_t(address.x); }
 static uint2 gpuBackendWords(uint64_t address) { return uint2(uint(address), uint(address >> 32)); }
 
-public uint gpuBackendLoadU32(uint2 address) { return *((uint*)gpuBackendAddress(address)); }
-public void gpuBackendStoreU32(uint2 address, uint value) { *((uint*)gpuBackendAddress(address)) = value; }
+public uint2 gpuBackendOffset(uint2 address, int bytes) { return gpuBackendWords(gpuBackendAddress(address) + uint64_t(int64_t(bytes))); }
+
+// Indexed off the untouched base, so fields of one struct become neighbouring accesses the compiler can merge into one load
+public uint gpuBackendLoadU32(uint2 base, int bytes) { return ((uint*)gpuBackendAddress(base))[bytes >> 2]; }
+public void gpuBackendStoreU32(uint2 base, int bytes, uint value) { ((uint*)gpuBackendAddress(base))[bytes >> 2] = value; }
 
 #if GPU_COMPUTE
 public uint2 gpuBackendRootCompute() { return gpuBackendWords(gpu_pc.compute_data); }
@@ -821,12 +825,8 @@ public uint2 gpuBackendRootFragment() { return gpuBackendWords(gpu_pc.fragment_d
 public uint2 gpuBackendRootIndex() { return gpuBackendWords(gpu_pc.index_data); }
 #endif
 
-// The table ensure_sampler_set built: each packed GpuSamplerDesc's slot, or 0 (the default sampler) when it was never enabled.
-public uint gpuBackendSamplerSlot(uint packed) {
-	if(gpu_pc.sampler_map == 0) return 0u;
-	if(packed > 0x1ffu) return 0u;
-	return *((uint*)(gpu_pc.sampler_map + uint64_t(packed) * 4u));
-}
+// ensure_sampler_set puts every packed description at its own slot, so a constant description folds to a constant slot.
+public uint gpuBackendSamplerSlot(uint packed) { return packed & 0x1ffu; }
 
 // 2D only, and `layer` is ignored: a heap entry is opaque hardware bits, so there is no dimensionality to switch on.
 public float4 gpuBackendSample(uint heap_index, uint slot, float3 uv, uint layer, float mip) {
@@ -947,7 +947,7 @@ namespace GPU::detail {
 		return {closest_buffer(queue, addrA), closest_buffer(queue, addrB)};
 	}
 
-	// Slot 0 is always the default sampler, as on WebGPU, so an unenabled description still resolves to something valid.
+	// The heap holds a sampler for every packed description, so a shader's slot is the packed value itself and a constant description needs no lookup; unenabled ones hold the default.
 	static VkDeviceAddress ensure_sampler_set(GpuQueue* queue, std::span<const GpuSamplerDesc> requested) {
 		constexpr static auto address2vulkan = [](ADDRESS_MODE mode) {
 			switch (mode) {
@@ -978,29 +978,35 @@ namespace GPU::detail {
 		if(auto found = queue->sampler_cache.find(enabled_samplers); found != queue->sampler_cache.end())
 			return found->second;
 
-		// The map is indexed by packed description, so it needs one word per value up to the largest
-		constexpr static auto sampler_lookup_size = gpuSamplerDescMaxPackedEXT() + 1;
-		uint32_t* sampler_mapping_cpu = gpuMalloc<uint32_t>(queue, sampler_lookup_size);
-		if(!sampler_mapping_cpu) return 0;
-		std::memset(sampler_mapping_cpu, 0, sampler_lookup_size * sizeof(uint32_t));
-		for(size_t i = 0; i < enabled_samplers.size(); ++i)
-			sampler_mapping_cpu[gpuSamplerDescPackEXT(enabled_samplers[i])] = i;
+		// Names the set: descriptor_heaps is keyed by allocation, as user heaps are
+		auto key_cpu = gpuMalloc<uint32_t>(queue, 1);
+		if(!key_cpu) return 0;
 		// Kept in a local until the heap below is built: gpuMalloc can rehash sampler_cache, which would leave a reference into it dangling
-		auto sampler_mapping = (VkDeviceAddress)gpuHostToDevicePointer(queue, sampler_mapping_cpu);
+		auto sampler_set = (VkDeviceAddress)gpuHostToDevicePointer(queue, key_cpu);
 
-		auto size = std::max<VkDeviceSize>(queue->sampler_size * enabled_samplers.size(), queue->minimum_descriptor_heap_size);
+		constexpr static uint32_t slot_count = gpuSamplerDescMaxPackedEXT() + 1;
+		std::vector<GpuSamplerDesc> slots(slot_count, GpuSamplerDesc{});
+		for(auto& desc: enabled_samplers)
+			slots[gpuSamplerDescPackEXT(desc)] = desc;
+		// Packings with an address mode past the last one name no description; they keep the default.
+		for(uint32_t packed = 0; packed < slot_count; ++packed)
+			for(auto shift: {0u, 2u, 4u})
+				if(((packed >> shift) & 0b11u) > ADDRESS_MODE_REPEAT) slots[packed] = GpuSamplerDesc{};
+
+		auto size = std::max<VkDeviceSize>(queue->sampler_size * slot_count, queue->minimum_descriptor_heap_size);
+		assert(size <= queue->max_sampler_heap_size && "The device's sampler heap can't hold a sampler for every packed description");
 		auto tmp = gpuMalloc(queue, size);
 
-		std::vector<VkSamplerCreateInfo> sampler_infos; sampler_infos.reserve(enabled_samplers.size());
-		for(size_t i = 0; i < enabled_samplers.size(); ++i)
+		std::vector<VkSamplerCreateInfo> sampler_infos; sampler_infos.reserve(slot_count);
+		for(auto& desc: slots)
 			sampler_infos.emplace_back(VkSamplerCreateInfo{
 				.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-				.magFilter = filter2vulkan(enabled_samplers[i].mag_filter),
-				.minFilter = filter2vulkan(enabled_samplers[i].min_filter),
-				.mipmapMode = filter2vulkan_mip(enabled_samplers[i].mip_filter),
-				.addressModeU = address2vulkan(enabled_samplers[i].address_mode_u),
-				.addressModeV = address2vulkan(enabled_samplers[i].address_mode_v),
-				.addressModeW = address2vulkan(enabled_samplers[i].address_mode_w),
+				.magFilter = filter2vulkan(desc.mag_filter),
+				.minFilter = filter2vulkan(desc.min_filter),
+				.mipmapMode = filter2vulkan_mip(desc.mip_filter),
+				.addressModeU = address2vulkan(desc.address_mode_u),
+				.addressModeV = address2vulkan(desc.address_mode_v),
+				.addressModeW = address2vulkan(desc.address_mode_w),
 				.maxLod = VK_LOD_CLAMP_NONE
 			});
 		// One range per sampler: pDescriptors parallels pSamplers, and a single range left every slot past the first unwritten.
@@ -1022,7 +1028,7 @@ namespace GPU::detail {
 			.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
 		};
 
-		auto& [buffer, allocation, heap_size, heap_address] = queue->descriptor_heaps[sampler_mapping];
+		auto& [buffer, allocation, heap_size, heap_address] = queue->descriptor_heaps[sampler_set];
 		heap_size = size;
 		VK_CHECK(vmaCreateBuffer(queue->gpu_allocator, &buffer_info, &alloc_info, &buffer, &allocation, nullptr), 0);
 
@@ -1066,16 +1072,15 @@ namespace GPU::detail {
 
 		gpuFree(queue, tmp);
 
-		queue->sampler_cache[enabled_samplers] = sampler_mapping;
-		return sampler_mapping;
+		queue->sampler_cache[enabled_samplers] = sampler_set;
+		return sampler_set;
 	}
 
 	// Points a command buffer at a sampler set built by ensure_sampler_set
-	static void bind_sampler_set(GpuCommandBuffer* cmd, VkDeviceAddress sampler_map) {
-		if(!sampler_map) return;
+	static void bind_sampler_set(GpuCommandBuffer* cmd, VkDeviceAddress sampler_set) {
+		if(!sampler_set) return;
 
-		cmd->sampler_map = sampler_map;
-		auto& [_buffer, _allocation, heap_size, heap_address] = cmd->queue->descriptor_heaps[sampler_map];
+		auto& [_buffer, _allocation, heap_size, heap_address] = cmd->queue->descriptor_heaps[sampler_set];
 		VkBindHeapInfoEXT heap_info {
 			.sType = VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT,
 			.heapRange = {
@@ -1249,7 +1254,7 @@ GpuCommandBuffer* gpuStartCommandRecording(GpuQueue* queue) {
 	};
 	VK_CHECK(vkBeginCommandBuffer(out->command_buffer, &begin), nullptr);
 
-	// Without a sampler set, sampler_map is null and gpuGetSamplerIndex dereferences it as soon as a shader asks for an unenabled sampler.
+	// Without a sampler heap bound, a shader asking for any sampler reads an unbound heap.
 	GPU::detail::bind_sampler_set(out, GPU::detail::ensure_sampler_set(queue, {}));
 
 	// Depth and stencil are dynamic state, which a draw cannot proceed without; the default is no test, no write and no stencil.
@@ -2343,13 +2348,11 @@ void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline) {
 
 struct ComputePipelinePushConstants {
 	gpu* data;
-	gpu* sampler_map;
 };
 
 void gpuDispatch(GpuCommandBuffer* cmd, gpu* dataGpu, uvec3 gridDimensions) {
 	ComputePipelinePushConstants data {
-		.data = dataGpu,
-		.sampler_map = (gpu*)cmd->sampler_map
+		.data = dataGpu
 	};
 	VkPushDataInfoEXT info {
 		.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
@@ -2936,7 +2939,6 @@ struct GraphicsPipelinePushConstants {
 	gpu* vertex;
 	gpu* fragment;
 	gpu* index;
-	gpu* sampler_map;
 };
 
 namespace GPU::detail {
@@ -2977,8 +2979,7 @@ void gpuDrawIndexedInstanced(GpuCommandBuffer* cmd, gpu* vertex_data, gpu* fragm
 	GraphicsPipelinePushConstants data {
 		.vertex = vertex_data,
 		.fragment = fragment_data,
-		.index = indices,
-		.sampler_map = (gpu*)cmd->sampler_map
+		.index = indices
 	};
 	VkPushDataInfoEXT info {
 		.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
@@ -2998,8 +2999,7 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer* cmd, gpu* vertex_data, gp
 	GraphicsPipelinePushConstants data {
 		.vertex = vertex_data,
 		.fragment = fragment_data,
-		.index = indices,
-		.sampler_map = (gpu*)cmd->sampler_map
+		.index = indices
 	};
 	VkPushDataInfoEXT info {
 		.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
@@ -3034,8 +3034,7 @@ void gpuDrawMeshlets(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* fragment_dat
 	GraphicsPipelinePushConstants data {
 		.vertex = meshlet_data,
 		.fragment = fragment_data,
-		.index = nullptr,
-		.sampler_map = (gpu*)cmd->sampler_map
+		.index = nullptr
 	};
 	VkPushDataInfoEXT info {
 		.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
@@ -3060,8 +3059,7 @@ void gpuDrawMeshletsIndirect(GpuCommandBuffer* cmd, gpu* meshlet_data, gpu* frag
 	GraphicsPipelinePushConstants data {
 		.vertex = meshlet_data,
 		.fragment = fragment_data,
-		.index = nullptr,
-		.sampler_map = (gpu*)cmd->sampler_map
+		.index = nullptr
 	};
 	VkPushDataInfoEXT info {
 		.sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,

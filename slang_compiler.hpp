@@ -51,34 +51,37 @@ import noapi_backend;
  *
  * What those bits mean is the backend's business — a device address on Vulkan, a tagged
  * {offset, monobuffer} pair on WebGPU — and this module only ever does two things with
- * them: hand them to the backend's load and store, and add a byte count, which every
- * encoding has to leave as ordinary 64 bit arithmetic.
+ * them: hand them to the backend's load and store, and add a byte count.
+ *
+ * The byte count is kept apart from the pointer it was added to, so every field of a struct
+ * is addressed off the one base its pointer was loaded as. That is what lets a compiler see
+ * the fields as neighbours and merge their loads: reassembling the 64 bits after every step
+ * hides it, as Intel parts with no 64 bit integer add do once they split the add in two.
  *
  * A shader works in GpuPtr<T> instead and only meets this when it describes a layout of
  * its own, which is what IGpuLoadable's two methods are handed.
  */
 public struct GpuAddress {
-	/// The address's raw 64 bits, low word first.
-	public uint2 bits;
+	/// The pointer this address was reached from, as memory stores it: low word first.
+	public uint2 base;
+	/// How many bytes past `base` this address is.
+	public int delta;
 
-	public __init(uint2 raw) { bits = raw; }
+	public __init(uint2 raw) { base = raw; delta = 0; }
+	public __init(uint2 from, int bytes) { base = from; delta = bytes; }
+
+	/// The address's raw 64 bits, low word first.
+	public property uint2 bits { get { return gpuBackendOffset(base, delta); } }
 
 	/// Steps forward by `bytes`, or back for a negative count.
-	public GpuAddress offset(int bytes) {
-		let low = bits.x + uint(bytes);
-		// The high word takes the sign extension of `bytes` plus the carry out of the low word,
-		// which is a full 64 bit add either way. Vulkan needs that: a device address really is
-		// a 64 bit number. On WebGPU the low word is an offset inside one monobuffer, which
-		// cannot reach 4GiB, so nothing ever carries into the tag the high word holds.
-		return GpuAddress(uint2(low, bits.y + (bytes < 0 ? 0xFFFFFFFFu : 0u) + (low < bits.x ? 1u : 0u)));
-	}
+	public GpuAddress offset(int bytes) { return GpuAddress(base, delta + bytes); }
 
 	/// The one load every backend provides: the 32 bit word at this address.
-	public uint loadU32() { return gpuBackendLoadU32(bits); }
+	public uint loadU32() { return gpuBackendLoadU32(base, delta); }
 
 #if GPU_STORES
 	/// The one store every backend provides.
-	public void storeU32(uint value) { gpuBackendStoreU32(bits, value); }
+	public void storeU32(uint value) { gpuBackendStoreU32(base, delta, value); }
 #endif
 }
 
@@ -435,8 +438,12 @@ public GpuSamplerDesc gpuDefaultSampler() {
 }
 
 /**
- * gpuGetSamplerIndex – The slot holding `desc`, or slot 0 (the default sampler) when that
+ * gpuGetSamplerIndex – The slot holding `desc`, or the default sampler's when that
  * description was never handed to gpuSetEnabledSamplersEXT.
+ *
+ * A constant `desc` costs nothing at run time: Vulkan's sampler heap holds every description
+ * at its packed value, and WebGPU bakes the enabled set into the pipeline as override
+ * constants, rebuilding the pipeline (not the shader) when a draw or dispatch uses another set.
  */
 public uint gpuGetSamplerIndex(GpuSamplerDesc desc) { return gpuBackendSamplerSlot(gpuPackSamplerDesc(desc)); }
 

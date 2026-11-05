@@ -648,6 +648,8 @@ void gpuSetScissorRectEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin NOAP
  *
  * Does NOT insert an automatic barrier before the pass. If a previous pass wrote to any of these targets via compute shaders, the user must call gpuBarrier with appropriate HAZARD_DEPTH_STENCIL or HAZARD_DESCRIPTORS flags beforehand.
  *
+ * An attachment may be a texture created with USAGE_SAMPLED too, so ping-pong post-processing can render into one such texture while sampling another; the pass must not sample the attached subresource itself.
+ *
  * @code{.cpp}
  * GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = USAGE_COLOR_ATTACHMENT};
  * auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
@@ -664,6 +666,7 @@ void gpuSetScissorRectEXT(GpuCommandBuffer* cmd, uvec2 extent, ivec2 origin NOAP
  *
  * @param cmd Command buffer to record into.
  * @param desc Render target attachments and their load/store behavior.
+ * @note On WebGPU, which refuses to record a pass that can sample what it renders to, each sampleable attachment gets a monotexture of its own, and the pass reads it as only the mips below the attached one, or as a 1x1 stand in when attached at mip 0.
  */
 void gpuBeginRenderPass(GpuCommandBuffer* cmd, NOAPI_CONST_REF(GpuRenderPassDesc) desc);
 

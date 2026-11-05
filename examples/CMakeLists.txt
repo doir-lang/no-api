@@ -118,12 +118,13 @@ noapi_add_example(3_meshlet)
 noapi_add_example(4_pbr ASSETS)
 noapi_add_example(5_msaa_stencil_outline ASSETS)
 noapi_add_example(6_raytrace)
+noapi_add_example(7_postprocess)
 
 if(EMSCRIPTEN)
 	add_custom_target(serve
 		COMMAND ${CMAKE_COMMAND} -E chdir ${CMAKE_BINARY_DIR} python3 -m http.server 8080
 		COMMENT "Web server has started on port 8080, press ctrl+c when you are finished"
-		DEPENDS 0_basic 1_texture 2_compute_texture 3_meshlet 4_pbr 5_msaa_stencil_outline 6_raytrace
+		DEPENDS 0_basic 1_texture 2_compute_texture 3_meshlet 4_pbr 5_msaa_stencil_outline 6_raytrace 7_postprocess
 		BYPRODUCTS ${CMAKE_BINARY_DIR}/server_started
 	)
 endif()
