@@ -10,6 +10,7 @@
  * This header, like the API headers it includes, parses as both C and C++, so a C program can drive the whole backend. noapi.hpp includes it and adds the C++ only conveniences (the std::expected returning setup helper, the overloads that take a GpuVulkanDefault directly) plus the definitions of the backend's internal objects.
  */
 
+#include "../ablations.h"
 #include "../allocator.h"
 #include "../samplers.h"
 #include "../shaders.h"

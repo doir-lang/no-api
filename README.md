@@ -158,6 +158,7 @@ cmake --build build-em --target serve   # serves the examples at http://localhos
 | `NOAPI_ENABLE_LTO` | `ON` when top level | Link-time optimization for the optimized configurations |
 | `NOAPI_BUILD_DOCTESTS` | `ON` when top level (`OFF` under Emscripten) | Build `noapi-doctests`, the header examples |
 | `NOAPI_ENABLE_COVERAGE` | `OFF` | Instrument the backends for gcov (used by `tools/coverage.py`) |
+| `NOAPI_ENABLE_ABLATIONS` | `OFF` | Build in the design ablations of `ablations.h` (`gpuSetAblationsEXT`), for benchmarking |
 
 Slang is a large dependency. If it isn't installed and `NOAPI_SLANG_ROOT` isn't set, the
 `external/slang` submodule is built with everything this project doesn't use turned off. A

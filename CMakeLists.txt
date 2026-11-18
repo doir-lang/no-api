@@ -107,6 +107,15 @@ if(NOAPI_ENABLE_COVERAGE)
 	endforeach()
 endif()
 
+option(NOAPI_ENABLE_ABLATIONS "Build in the design ablations of ablations.h (gpuSetAblationsEXT), for benchmarking; without it the backends compile no ablation code" OFF)
+if(NOAPI_ENABLE_ABLATIONS)
+	foreach(backend noapi-vulkan noapi-webgpu)
+		if(TARGET ${backend})
+			target_compile_definitions(${backend} PUBLIC NOAPI_ABLATIONS=1)
+		endif()
+	endforeach()
+endif()
+
 # Alias the selected default backend as noapi::noapi
 if(NOAPI_DEFAULT_BACKEND STREQUAL "vulkan")
 	if(NOT NOAPI_ENABLE_VULKAN)

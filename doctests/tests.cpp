@@ -910,6 +910,103 @@ TEST_CASE("gpuFreeQueue frees the memory, textures and semaphores still left on 
 	noapi_doctest_end();
 }
 
+#ifdef NOAPI_ABLATIONS
+// Every ablation computes what the design it replaces does, so the same shaders give the same answers on a queue that has them all
+TEST_CASE("gpuSetAblationsEXT: a queue created with each ablation reads root data and samplers as one without") {
+	GpuDoctestBackend backend = noapi_doctest_backend();
+	noapi_doctest_begin();
+	auto all = (ABLATION_FLAGS_EXT)(ABLATION_ADDRESS_ADD | ABLATION_ROOT_DATA_BUFFERS | ABLATION_SAMPLER_LOOKUP);
+	for(auto ablations: {ABLATION_NONE, ABLATION_ADDRESS_ADD, ABLATION_ROOT_DATA_BUFFERS, ABLATION_SAMPLER_LOOKUP, all}) {
+		CAPTURE(ablations);
+		gpuSetAblationsEXT(ablations);
+		GpuQueue* queue = gpuCreateQueue(backend);
+		gpuSetAblationsEXT(ABLATION_NONE);
+		REQUIRE(queue);
+		CHECK(gpuGetQueueAblationsEXT(queue) == ablations);
+		CHECK(gpuGetQueueAblationsEXT(noapi_doctest_queue()) == ABLATION_NONE);
+
+		// Several dispatches, each with root data of its own, reading a struct whose fields sit at offsets from one pointer
+		struct Root { gpu* values; uint32_t scale; uint32_t bias; };
+		auto values = gpuMalloc<uint32_t>(queue, 64, MEMORY_READBACK);
+		auto roots = gpuMalloc<Root>(queue, 4);
+		auto values_gpu = gpuHostToDevicePointer(queue, values);
+		for(uint32_t i = 0; i < 4; ++i)
+			roots[i] = {values_gpu + 16 * i * sizeof(uint32_t), i + 1, 100 * i};
+		auto roots_gpu = gpuHostToDevicePointer(queue, roots);
+
+		auto fields = gpuCreateComputePipeline(queue, string_to_bytes(R"slang(
+			import noapi;
+			struct Root : IGpuLoadable {
+				GpuPtr<uint> values; uint scale; uint bias;
+				static const uint gpuStride = 16;
+				static Root gpuLoad(GpuAddress at) { var from = GpuReader(at); Root out; out.values = from.next<GpuPtr<uint> >(); out.scale = from.next<uint>(); out.bias = from.next<uint>(); return out; }
+			}
+			[shader("compute")] [numthreads(16, 1, 1)]
+			void main(uint3 thread : SV_DispatchThreadID) { let root = *gpuComputeData<Root>(); root.values[thread.x] = thread.x * root.scale + root.bias; }
+		)slang"));
+		REQUIRE(fields);
+
+		// As gpuSetEnabledSamplersEXT's test: past the right edge clamping and mirroring stay green, the default sampler repeats round to red
+		GpuTextureDesc desc = {.dimensions = {64, 64, 1}, .format = FORMAT_RGBA8_UNORM, .usage = TEXTURE_USAGE_FLAGS(USAGE_SAMPLED | USAGE_TRANSFER_DST)};
+		auto memory = (gpu*)gpuMalloc(queue, gpuTextureSizeAlign(queue, desc));
+		auto texture = gpuCreateTexture(queue, desc, memory);
+		auto texels = gpuMalloc<uint32_t>(queue, 64 * 64);
+		for(uint32_t i = 0; i < 64 * 64; ++i) texels[i] = i % 64 < 32 ? 0xff0000ff : 0xff00ff00;
+		auto texels_gpu = gpuHostToDevicePointer(queue, texels);
+		auto heap = gpuMalloc<GpuTextureDescriptor>(queue, 1, MEMORY_DESCRIPTOR_HEAP);
+		heap[0] = gpuTextureViewDescriptor(queue, texture, {});
+		auto heap_gpu = gpuHostToDevicePointer(queue, heap);
+		auto sampling = gpuCreateComputePipeline(queue, string_to_bytes(R"slang(
+			import noapi;
+			[shader("compute")] [numthreads(1, 1, 1)]
+			void main() {
+				let clamp = GpuSamplerDesc(ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, FILTER_NEAREST, FILTER_NEAREST, FILTER_NEAREST);
+				let mirror = GpuSamplerDesc(ADDRESS_MODE_MIRROR_REPEAT, ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, FILTER_NEAREST, FILTER_NEAREST, FILTER_NEAREST);
+				gpuComputeData<float4>()[0] = gpuSample2D(0, gpuGetSamplerIndex(clamp), float2(1.25, 0.5));
+				gpuComputeData<float4>()[1] = gpuSample2D(0, gpuGetSamplerIndex(mirror), float2(1.25, 0.5));
+			}
+		)slang"));
+		REQUIRE(sampling);
+		auto colors = gpuMalloc<float>(queue, 16, MEMORY_READBACK);
+		auto colors_gpu = gpuHostToDevicePointer(queue, colors);
+		GpuSamplerDesc clamp = {ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, FILTER_NEAREST, FILTER_NEAREST, FILTER_NEAREST};
+		GpuSamplerDesc mirror = {ADDRESS_MODE_MIRROR_REPEAT, ADDRESS_MODE_CLAMP, ADDRESS_MODE_CLAMP, FILTER_NEAREST, FILTER_NEAREST, FILTER_NEAREST};
+
+		auto cmd = gpuStartCommandRecording(queue);
+		gpuSyncMemoryEXT(cmd, roots_gpu);
+		gpuSyncMemoryEXT(cmd, texels_gpu);
+		gpuCopyToTexture(cmd, memory, texels_gpu, texture);
+		gpuSetPipeline(cmd, fields);
+		for(uint32_t i = 0; i < 4; ++i)
+			gpuDispatch(cmd, roots_gpu + i * sizeof(Root), {1, 1, 1});
+		gpuBarrier(cmd, STAGE_TRANSFER, STAGE_COMPUTE);
+		gpuSyncMemoryEXT(cmd, heap_gpu);
+		gpuSetActiveTextureHeapPtr(cmd, heap_gpu);
+		gpuSetPipeline(cmd, sampling);
+		gpuSetEnabledSamplersEXT(cmd, {&clamp, 1});
+		gpuDispatch(cmd, colors_gpu, {1, 1, 1});
+		gpuSetEnabledSamplersEXT(cmd, {&mirror, 1});
+		gpuDispatch(cmd, colors_gpu + 8 * sizeof(float), {1, 1, 1});
+		gpuSyncMemoryEXT(cmd, values_gpu);
+		gpuSyncMemoryEXT(cmd, colors_gpu);
+		gpuWaitSemaphore(queue, gpuGetSubmissionSemaphoreEXT(queue), gpuSubmit(queue, {&cmd, 1}));
+
+		for(uint32_t i = 0; i < 4; ++i)
+			for(uint32_t x = 0; x < 16; ++x)
+				CHECK(values[16 * i + x] == x * (i + 1) + 100 * i);
+		CHECK(colors[1] == 1.0f); // Clamp enabled: green
+		CHECK(colors[4] == 1.0f); // Mirror not enabled, so the default sampler: red
+		CHECK(colors[8] == 1.0f); // Clamp no longer enabled: red
+		CHECK(colors[13] == 1.0f); // Mirror enabled: green
+
+		gpuFreePipeline(queue, fields);
+		gpuFreePipeline(queue, sampling);
+		gpuFreeQueue(queue); // Frees what is still allocated on it
+	}
+	noapi_doctest_end();
+}
+#endif
+
 TEST_CASE("gpuFree through a GPU address forgets the allocation") {
 	GpuQueue* queue = noapi_doctest_queue();
 	GpuDoctestBackend backend = noapi_doctest_backend();

@@ -73,8 +73,17 @@ public struct GpuAddress {
 	/// The address's raw 64 bits, low word first.
 	public property uint2 bits { get { return gpuBackendOffset(base, delta); } }
 
+#if GPU_ABLATE_ADDRESS_ADD
+	// ABLATION_ADDRESS_ADD: the full 64 bit add, carry and sign extension included, so every field is loaded off a freshly reassembled pointer.
+	public GpuAddress offset(int bytes) {
+		let at = bits;
+		let low = at.x + uint(bytes);
+		return GpuAddress(uint2(low, at.y + (bytes < 0 ? 0xFFFFFFFFu : 0u) + (low < at.x ? 1u : 0u)));
+	}
+#else
 	/// Steps forward by `bytes`, or back for a negative count.
 	public GpuAddress offset(int bytes) { return GpuAddress(base, delta + bytes); }
+#endif
 
 	/// The one load every backend provides: the 32 bit word at this address.
 	public uint loadU32() { return gpuBackendLoadU32(base, delta); }

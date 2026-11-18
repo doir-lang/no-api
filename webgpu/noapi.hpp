@@ -84,6 +84,9 @@ struct GpuQueue {
 	WGPUComputePipeline semaphore_set_max_pipeline = nullptr;
 
 	GpuCapabilities capabilities = {};
+#ifdef NOAPI_ABLATIONS
+	ABLATION_FLAGS_EXT ablations = ABLATION_NONE; // What gpuSetAblationsEXT chose when the queue was created
+#endif
 
 	// Messages are deduplicated because they fire per draw, and one report per draw would bury the first.
 	GpuDiagnosticCallbackEXT diagnostic_callback = nullptr;
@@ -218,6 +221,10 @@ struct GpuQueue {
 
 		// Each slot's packed GpuSamplerDesc, or ~0u for none, which pipelines bake in as override constants so a constant description folds to its slot.
 		std::array<uint32_t, gpu_sampler_slot_count> packed = {};
+#ifdef NOAPI_ABLATIONS
+		// ABLATION_SAMPLER_LOOKUP only: maps every packed GpuSamplerDesc to its slot, for shaders to read in place of the override constants.
+		WGPUBuffer lookup_buffer = nullptr;
+#endif
 	};
 	std::unordered_map<std::vector<GpuSamplerDesc>, SamplerSet, GpuSamplerDescListHash> sampler_cache;
 	SamplerSet* default_sampler_set = nullptr; // What a command buffer gets when it never enables any
@@ -293,6 +300,9 @@ struct GpuCommandBuffer {
 		WGPUBuffer texture_heap = nullptr;
 		size_t texture_heap_size = 0;
 		WGPUBuffer shader_data = nullptr;
+#ifdef NOAPI_ABLATIONS
+		WGPUBuffer sampler_lookup = nullptr; // ABLATION_SAMPLER_LOOKUP only
+#endif
 		bool operator==(const BufferGroupKey&) const = default;
 	};
 	struct BufferGroup {

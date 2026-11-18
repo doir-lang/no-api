@@ -2,6 +2,7 @@
 #include "../slang_compiler.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cassert>
 #include <chrono>
@@ -22,6 +23,13 @@
 #include <emscripten/emscripten.h>
 #endif
 
+
+// Whether `queue` swaps `flag`'s design decision for the conventional one (see ablations.h); a constant false, flag unexpanded, in a build without ablations.
+#ifdef NOAPI_ABLATIONS
+	#define NOAPI_ABLATED(queue, flag) (((queue)->ablations & (flag)) != 0)
+#else
+	#define NOAPI_ABLATED(queue, flag) false
+#endif
 
 namespace GPU {
 	inline bool operator==(const GpuStencil& a, const GpuStencil& b) {
@@ -386,6 +394,10 @@ fn cs_set_max() {
 namespace GPU::detail {
 	// Override constant ids of the sampler slots' descriptions; high, so they stay clear of any a shader declares itself.
 	constexpr static uint32_t sampler_override_id = 60000;
+#ifdef NOAPI_ABLATIONS
+	// Entries in an ABLATION_SAMPLER_LOOKUP lookup buffer: one per packed description
+	constexpr static uint32_t sampler_lookup_size = gpuSamplerDescMaxPackedEXT() + 1;
+#endif
 
 	constexpr static WGPUAddressMode address2wgpu(ADDRESS_MODE mode) {
 		switch (mode) {
@@ -457,6 +469,23 @@ namespace GPU::detail {
 		set.packed.fill(~0u);
 		for(size_t i = 1; i < enabled.size(); ++i)
 			set.packed[i] = gpuSamplerDescPackEXT(enabled[i]);
+
+#ifdef NOAPI_ABLATIONS
+		if(NOAPI_ABLATED(queue, ABLATION_SAMPLER_LOOKUP)) {
+			// Walked backwards so that the lowest slot wins if the same description was enabled twice
+			std::vector<uint32_t> lookup(sampler_lookup_size, 0);
+			for(size_t i = enabled.size(); i--; )
+				lookup[gpuSamplerDescPackEXT(enabled[i])] = static_cast<uint32_t>(i);
+
+			WGPUBufferDescriptor buffer {
+				.label = {"NoAPI Sampler Map (ablated)", WGPU_STRLEN},
+				.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+				.size = lookup.size() * sizeof(uint32_t),
+			};
+			set.lookup_buffer = wgpuDeviceCreateBuffer(queue->device, &buffer);
+			wgpuQueueWriteBuffer(queue->queue, set.lookup_buffer, 0, lookup.data(), buffer.size);
+		}
+#endif
 
 		return &set;
 	}
@@ -591,6 +620,17 @@ WGPUBindGroupLayout create_buffer_bind_group_layout(GpuQueue* queue, bool comput
 			.minBindingSize = 0,
 		}
 	});
+
+	if(NOAPI_ABLATED(queue, ABLATION_SAMPLER_LOOKUP))
+		group0.push_back({
+			.binding = binding++,
+			.visibility = visibility,
+			.buffer = {
+				.type = WGPUBufferBindingType_ReadOnlyStorage,
+				.hasDynamicOffset = false,
+				.minBindingSize = 0,
+			}
+		});
 
 	// The root data: each draw or dispatch reads its own slot of a shared chunk at a dynamic offset (see GpuQueue::ShaderDataChunk)
 	group0.push_back({
@@ -813,6 +853,13 @@ void update_pipeline_layouts(GpuQueue* queue) {
 		queue->current_graphics_bind_group_layout1, queue->current_graphics_bind_group_layout2);
 }
 
+#ifdef NOAPI_ABLATIONS
+namespace GPU::detail {
+	// Read by gpuCreateQueue; see gpuSetAblationsEXT
+	std::atomic<ABLATION_FLAGS_EXT> next_queue_ablations = ABLATION_NONE;
+}
+#endif
+
 GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limits, CpuAllocatorFunc allocator) {
 	auto out = (GpuQueue*)allocator(nullptr, sizeof(GpuQueue));
 	new(out) GpuQueue{
@@ -821,6 +868,9 @@ GpuQueue* gpuCreateQueue(WGPUAdapter adapter, WGPUDevice device, WGPULimits limi
 		.limits = limits,
 		.cpu_allocator = allocator,
 	};
+#ifdef NOAPI_ABLATIONS
+	out->ablations = GPU::detail::next_queue_ablations.load();
+#endif
 	assert(limits.maxSamplersPerShaderStage >= gpu_sampler_slot_count && "Device is below the sampler limit WebGPU guarantees");
 
 	out->queue = wgpuDeviceGetQueue(device);
@@ -882,6 +932,9 @@ namespace GPU {
 namespace GPU::detail {
 	inline void free_sampler_set(GpuQueue::SamplerSet& set) {
 		if(set.bind_group) wgpuBindGroupRelease(set.bind_group);
+#ifdef NOAPI_ABLATIONS
+		if(set.lookup_buffer) wgpuBufferRelease(set.lookup_buffer);
+#endif
 		for(auto sampler: set.samplers)
 			wgpuSamplerRelease(sampler);
 	}
@@ -963,6 +1016,20 @@ void gpuSetDiagnosticCallbackEXT(GpuQueue* queue, GpuDiagnosticCallbackEXT callb
 	// A new destination has not been told any of this yet, so let it hear each cause once too
 	queue->reported_diagnostics.clear();
 }
+
+#ifdef NOAPI_ABLATIONS
+void gpuSetAblationsEXT(ABLATION_FLAGS_EXT ablations) {
+	GPU::detail::next_queue_ablations = ablations;
+}
+
+ABLATION_FLAGS_EXT gpuGetAblationsEXT(void) {
+	return GPU::detail::next_queue_ablations.load();
+}
+
+ABLATION_FLAGS_EXT gpuGetQueueAblationsEXT(const GpuQueue* queue) {
+	return queue->ablations;
+}
+#endif
 
 namespace GPU::detail {
 	// Kept sorted by monobuffer and then start, which gpuMalloc relies on to join neighbouring holes
@@ -1662,6 +1729,9 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 	out += std::format("\n"
 		"[[vk::binding({}, 0)]] public StructuredBuffer<uint> texture_heap;\n\n", binding);
 	binding += 1;
+	auto sampler_lookup = NOAPI_ABLATED(queue, ABLATION_SAMPLER_LOOKUP);
+	if(sampler_lookup)
+		out += std::format("[[vk::binding({}, 0)]] public StructuredBuffer<uint> gpu_sampler_map;\n\n", binding++);
 
 	out += std::string(compute
 		? "public struct GpuShaderData {\n\tpublic uint2 compute;\n}\n"
@@ -1761,10 +1831,12 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 
 	// Each slot's description arrives as an override constant (see SamplerSet::packed), so for a constant description the compares fold away
 	std::string sampler_slots;
-	for (uint32_t i = 1; i < gpu_sampler_slot_count; ++i) {
+	if(sampler_lookup) sampler_slots = "\treturn gpu_sampler_map[packed];\n";
+	else for (uint32_t i = 1; i < gpu_sampler_slot_count; ++i) {
 		out += std::format("[vk::constant_id({})] const uint gpu_sampler_desc_{} = 0xFFFFFFFFu;\n", GPU::detail::sampler_override_id + i, i);
 		sampler_slots += std::format("\tif(packed == gpu_sampler_desc_{}) return {}u;\n", i, i);
 	}
+	if(!sampler_lookup) sampler_slots += "\treturn 0u;\n";
 
 	auto storage_count = static_cast<uint32_t>(queue->storage_monotextures.size());
 	auto sampled_count = static_cast<uint32_t>(queue->sampled_monotextures.size());
@@ -1779,7 +1851,6 @@ std::string generate_backend_module(GpuQueue* queue, bool compute) {
 		"// lowest slot wins when one was enabled twice\n"
 		"public uint gpuBackendSamplerSlot(uint packed) {{\n"
 		"{}"
-		"\treturn 0u;\n"
 		"}}\n"
 		"\n"
 		"static const uint GPU_MONOTEXTURE_STORAGE_BIT = 0x80000000u;\n"
@@ -1942,6 +2013,7 @@ WGPUShaderModule create_shader_module(GpuQueue* queue, std::string_view IR, GPU:
 		{"GPU_STORES", compute ? "1" : "0"},
 		// Storage textures are only bound for compute passes; see update_pipeline_layouts.
 		{"GPU_TEXTURE_STORES", compute ? "1" : "0"},
+		{"GPU_ABLATE_ADDRESS_ADD", NOAPI_ABLATED(queue, ABLATION_ADDRESS_ADD) ? "1" : "0"},
 	}, error);
 
 	if(!wgsl) {
@@ -1970,6 +2042,12 @@ WGPUShaderModule create_shader_module(GpuQueue* queue, std::string_view IR, GPU:
 }
 
 namespace GPU::detail {
+	// The set a pipeline is built for; under ABLATION_SAMPLER_LOOKUP none of it is baked in, so every set shares one pipeline.
+	inline const GpuQueue::SamplerSet* pipeline_sampler_set(const GpuCommandBuffer* cmd) {
+		if(NOAPI_ABLATED(cmd->queue, ABLATION_SAMPLER_LOOKUP)) return cmd->queue->default_sampler_set;
+		return cmd->sampler_set ? cmd->sampler_set : cmd->queue->default_sampler_set;
+	}
+
 	// The override constants holding `set`'s descriptions, for the slots `declared` has a bit for; `keys` backs the entries' names.
 	inline std::vector<WGPUConstantEntry> sampler_constants(const GpuQueue::SamplerSet* set, uint32_t declared, std::vector<std::string>& keys) {
 		keys.clear();
@@ -2108,7 +2186,7 @@ namespace GPU::detail {
 	}
 
 	// Group 0 for what is bound right now, reusing the last one built when none of it changed
-	inline WGPUBindGroup buffer_bind_group(GpuCommandBuffer* cmd, WGPUBuffer shader_data, size_t shader_data_size, bool compute) {
+	inline WGPUBindGroup buffer_bind_group(GpuCommandBuffer* cmd, WGPUBuffer shader_data, size_t shader_data_size, bool compute, bool uncached = false) {
 		auto queue = cmd->queue;
 		GpuCommandBuffer::BufferGroupKey key {
 			.monobuffers = queue->monobuffers,
@@ -2116,15 +2194,22 @@ namespace GPU::detail {
 			.texture_heap = cmd->active_texture_heap ? cmd->active_texture_heap : queue->empty_buffer,
 			.texture_heap_size = cmd->active_texture_heap ? cmd->active_texture_heap_size : 4,
 			.shader_data = shader_data,
+#ifdef NOAPI_ABLATIONS
+			.sampler_lookup = (cmd->sampler_set ? cmd->sampler_set : queue->default_sampler_set)->lookup_buffer,
+#endif
 		};
 		auto& cached = cmd->buffer_groups[compute];
-		if(cached.group && cached.key == key) return cached.group;
+		if(!uncached && cached.group && cached.key == key) return cached.group;
 
 		uint32_t binding = 0;
 		std::vector<WGPUBindGroupEntry> group0;
 		for(uint32_t i = 0; i < key.monobuffers.size(); ++i)
 			group0.push_back({.binding = binding++, .buffer = key.monobuffers[i], .offset = 0, .size = key.monobuffer_sizes[i]});
 		group0.push_back({.binding = binding++, .buffer = key.texture_heap, .offset = 0, .size = key.texture_heap_size});
+#ifdef NOAPI_ABLATIONS
+		if(key.sampler_lookup)
+			group0.push_back({.binding = binding++, .buffer = key.sampler_lookup, .offset = 0, .size = GPU::detail::sampler_lookup_size * sizeof(uint32_t)});
+#endif
 		group0.push_back({.binding = binding++, .buffer = shader_data, .offset = 0, .size = shader_data_size});
 
 		WGPUBindGroupDescriptor d {
@@ -2134,7 +2219,7 @@ namespace GPU::detail {
 		};
 		auto group = wgpuDeviceCreateBindGroup(queue->device, &d);
 		cmd->code_pending_submission_finished.emplace_back([group](bool) { wgpuBindGroupRelease(group); });
-		cached = {key, group};
+		if(!uncached) cached = {key, group};
 		return group;
 	}
 }
@@ -2924,7 +3009,7 @@ void gpuSetPipeline(GpuCommandBuffer* cmd, const GpuPipeline* pipeline) {
 	cmd->bound_pipeline = pipeline;
 
 	if(std::holds_alternative<GpuPipeline::ComputeCache>(pipeline->cache)) {
-		auto sampler_set = cmd->sampler_set ? cmd->sampler_set : cmd->queue->default_sampler_set;
+		auto sampler_set = GPU::detail::pipeline_sampler_set(cmd);
 		if(pipeline->reference_layout != cmd->queue->current_compute_pipeline_layout
 		|| std::get<GpuPipeline::ComputeCache>(pipeline->cache).sampler_set != sampler_set)
 			update_compute_pipeline(cmd->queue, pipeline, sampler_set);
@@ -3008,13 +3093,30 @@ namespace GPU::detail {
 
 // Binds every group needed by a dispatch or a draw (the texture groups are shared between the two); only what differs from what the pass already has is set.
 void bindGroups(GpuCommandBuffer* cmd, const void* shader_data, size_t shader_data_size, bool compute) {
-	auto chunk = GPU::detail::shader_data_chunk(cmd);
-	auto offset = (uint32_t)chunk->staging.size();
-	chunk->staging.resize(offset + GPU::detail::shader_data_stride(cmd->queue));
-	memcpy(chunk->staging.data() + offset, shader_data, shader_data_size);
+	WGPUBindGroup group0;
+	uint32_t offset = 0;
+	if(NOAPI_ABLATED(cmd->queue, ABLATION_ROOT_DATA_BUFFERS)) {
+		WGPUBufferDescriptor d {
+			.label = {"NoAPI ShaderData (ablated)", WGPU_STRLEN},
+			.usage = WGPUBufferUsage_Uniform,
+			.size = shader_data_size,
+			.mappedAtCreation = true,
+		};
+		auto buffer = wgpuDeviceCreateBuffer(cmd->queue->device, &d);
+		memcpy(wgpuBufferGetMappedRange(buffer, 0, d.size), shader_data, shader_data_size);
+		wgpuBufferUnmap(buffer);
+		cmd->code_pending_submission_finished.emplace_back([buffer](bool) { wgpuBufferRelease(buffer); });
+		group0 = GPU::detail::buffer_bind_group(cmd, buffer, shader_data_size, compute, true);
+	} else {
+		auto chunk = GPU::detail::shader_data_chunk(cmd);
+		offset = (uint32_t)chunk->staging.size();
+		chunk->staging.resize(offset + GPU::detail::shader_data_stride(cmd->queue));
+		memcpy(chunk->staging.data() + offset, shader_data, shader_data_size);
+		group0 = GPU::detail::buffer_bind_group(cmd, chunk->buffer, shader_data_size, compute);
+	}
 
 	std::array<WGPUBindGroup, 4> groups {
-		GPU::detail::buffer_bind_group(cmd, chunk->buffer, shader_data_size, compute),
+		group0,
 		compute ? cmd->queue->current_compute_bind_group1 : cmd->queue->current_graphics_bind_group1,
 		compute ? cmd->queue->current_compute_bind_group2 : GPU::detail::pass_bind_group2(cmd),
 		(cmd->sampler_set ? cmd->sampler_set : cmd->queue->default_sampler_set)->bind_group,
@@ -3039,7 +3141,7 @@ void bindComputeGroups(GpuCommandBuffer* cmd, gpu* data) {
 void gpuDispatch(GpuCommandBuffer* cmd, gpu* data, uvec3 grid_dimensions) {
 	assert(cmd->bound_pipeline);
 	// A copy or signal since gpuSetPipeline ended the pass, which Vulkan has no equivalent of, so it is reopened with the pipeline still bound; a sampler set enabled since then needs the pipeline rebuilt
-	auto sampler_set = cmd->sampler_set ? cmd->sampler_set : cmd->queue->default_sampler_set;
+	auto sampler_set = GPU::detail::pipeline_sampler_set(cmd);
 	if(!cmd->compute_pass || std::get<GpuPipeline::ComputeCache>(cmd->bound_pipeline->cache).sampler_set != sampler_set)
 		gpuSetPipeline(cmd, cmd->bound_pipeline);
 
@@ -3508,7 +3610,7 @@ void bindRenderPipeline(GpuCommandBuffer* cmd) {
 
 	auto pipeline = cmd->bound_pipeline;
 	auto& cache = std::get<GpuPipeline::RenderCache>(pipeline->cache);
-	auto sampler_set = cmd->sampler_set ? cmd->sampler_set : cmd->queue->default_sampler_set;
+	auto sampler_set = GPU::detail::pipeline_sampler_set(cmd);
 
 	if(!cache.pipeline
 	|| cache.sampler_set != sampler_set

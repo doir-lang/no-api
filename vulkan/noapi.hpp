@@ -124,6 +124,9 @@ struct GpuQueue {
 	std::vector<std::pair<VkImageView, uint64_t>> views_in_flight;
 
 	GpuCapabilities capabilities = {};
+#ifdef NOAPI_ABLATIONS
+	ABLATION_FLAGS_EXT ablations = ABLATION_NONE; // What gpuSetAblationsEXT chose when the queue was created
+#endif
 
 	// VK_KHR_swapchain_maintenance1: a present can carry a fence, so retired swapchains are freed exactly (see GpuSurface::RetiredSwapchain).
 	bool present_fences_supported = false;

@@ -14,6 +14,7 @@
 // gpuBlitTextureEXT compiles its (tiny, fixed) GLSL at runtime rather than shipping a SPIR-V blob
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <cstring>
@@ -26,6 +27,13 @@
 #include <sys/types.h>
 #include <utility>
 #include <vector>
+
+// Whether `queue` swaps `flag`'s design decision for the conventional one (see ablations.h); a constant false, flag unexpanded, in a build without ablations.
+#ifdef NOAPI_ABLATIONS
+	#define NOAPI_ABLATED(queue, flag) (((queue)->ablations & (flag)) != 0)
+#else
+	#define NOAPI_ABLATED(queue, flag) false
+#endif
 
 // Returns RETURN from the enclosing function, with the VkResult in errno, when a Vulkan call fails
 #define VK_CHECK(expr, RETURN) do {\
@@ -185,6 +193,13 @@ static std::optional<GpuSemaphore> gpuCreateSemaphoreImpl(GpuQueue* queue, uint6
 	return out;
 }
 
+#ifdef NOAPI_ABLATIONS
+namespace GPU::detail {
+	// Read by gpuCreateQueue; see gpuSetAblationsEXT
+	std::atomic<ABLATION_FLAGS_EXT> next_queue_ablations = ABLATION_NONE;
+}
+#endif
+
 GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, VkQueue queue, uint32_t queue_family, bool is_graphics_queue, CpuAllocatorFunc allocator, VkAllocationCallbacks* callbacks) {
 	// Instance level only, since volkLoadDevice would tie volk's entry points to one device; once per instance, so an entry point a program swapped stays swapped
 	if(volkGetLoadedInstance() != instance) {
@@ -222,6 +237,9 @@ GpuQueue* gpuCreateQueue(VkInstance instance, VkPhysicalDevice gpu, VkDevice dev
 		.is_graphics_queue = is_graphics_queue,
 		.callbacks = callbacks
 	};
+#ifdef NOAPI_ABLATIONS
+	out->ablations = GPU::detail::next_queue_ablations.load();
+#endif
 
 	// VMA
 	VmaVulkanFunctions functions = {
@@ -413,6 +431,20 @@ void gpuSetDiagnosticCallbackEXT(GpuQueue* queue, GpuDiagnosticCallbackEXT callb
 	// A new destination has not been told any of this yet, so let it hear each cause once too
 	queue->reported_diagnostics.clear();
 }
+
+#ifdef NOAPI_ABLATIONS
+void gpuSetAblationsEXT(ABLATION_FLAGS_EXT ablations) {
+	GPU::detail::next_queue_ablations = ablations;
+}
+
+ABLATION_FLAGS_EXT gpuGetAblationsEXT(void) {
+	return GPU::detail::next_queue_ablations.load();
+}
+
+ABLATION_FLAGS_EXT gpuGetQueueAblationsEXT(const GpuQueue* queue) {
+	return queue->ablations;
+}
+#endif
 
 void* gpuMalloc(GpuQueue* queue, size_t bytes, size_t align, MEMORY memory) {
 	// Memory has no declared purpose, so every buffer may hold indices or draw arguments; neither bit changes alignment or memory types on any driver checked.
@@ -856,6 +888,7 @@ static std::optional<std::string> compile_shader(GpuQueue* queue, GpuByteSpan ir
 			{"GPU_TEXTURE_STORES", "1"},
 			// A macro rather than a constant because it is device dependent, and the session cache keys on macros.
 			{"GPU_HEAP_STRIDE_RATIO", std::to_string(queue->heap_stride_ratio)},
+			{"GPU_ABLATE_ADDRESS_ADD", NOAPI_ABLATED(queue, ABLATION_ADDRESS_ADD) ? "1" : "0"},
 		}, error);
 
 	if(!code) {

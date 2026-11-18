@@ -11,10 +11,12 @@ Usage:
 import os, re, subprocess, sys
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-headers = ['allocator.h', 'compat.h', 'compute.h', 'graphics.h', 'samplers.h', 'shaders.h', 'surface.h', 'sync.h',
+headers = ['ablations.h', 'allocator.h', 'compat.h', 'compute.h', 'graphics.h', 'samplers.h', 'shaders.h', 'surface.h', 'sync.h',
 	'vulkan/noapi.h', 'vulkan/noapi.hpp', 'webgpu/noapi.h', 'webgpu/noapi.hpp']
 # Each backend's examples are compiled only against that backend; the shared headers' examples against either.
 backend_of = {'vulkan/noapi.h': 'vulkan', 'vulkan/noapi.hpp': 'vulkan', 'webgpu/noapi.h': 'webgpu', 'webgpu/noapi.hpp': 'webgpu'}
+# A header whose API only exists in some configurations has its examples compiled behind the same macro.
+guard_of = {'ablations.h': 'NOAPI_ABLATIONS'}
 
 
 def doc_blocks(lines):
@@ -139,6 +141,10 @@ def generate(out):
 			source = os.path.join(root, example['path']).replace('\\', '/')
 			where = f'{example["path"]}:{example["line"]} {example["name"]}'
 			body = [f'#line {example["line"]} "{source}"', *example['code'], f'#line {10000 + k} "doctest"']
+			guard = guard_of.get(example['path'])
+			if guard:
+				cpp.append(f'#ifdef {guard}')
+				c.append(f'#ifdef {guard}')
 			cpp += [f'#line {example["line"]} "{source}"', f'TEST_CASE("{where}") {{', '\tGpuQueue* queue = noapi_doctest_queue();', '\tGpuDoctestBackend backend = noapi_doctest_backend();', '\t(void)backend;', '\tnoapi_doctest_begin();', '\t{',
 				*body, '\t}', '\tnoapi_doctest_end();', '}', '']
 			if not example['cpp_only']:
@@ -146,6 +152,9 @@ def generate(out):
 					*body, '}', '']
 				cpp += [f'extern "C" void noapi_doctest_c_{k}(GpuQueue* queue);', f'#line {example["line"]} "{source}"', f'TEST_CASE("{where} (C)") {{', '\tnoapi_doctest_begin();',
 					f'\tnoapi_doctest_c_{k}(noapi_doctest_queue());', '\tnoapi_doctest_end();', '}', '']
+			if guard:
+				cpp.append('#endif')
+				c.append('#endif')
 		write(os.path.join(out, f'examples_{backend}.cpp'), '\n'.join(cpp) + '\n')
 		write(os.path.join(out, f'examples_{backend}.c'), '\n'.join(c) + '\n')
 
